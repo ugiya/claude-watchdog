@@ -34,6 +34,18 @@ dashboard checks:
 python3 scripts/check.py --integration
 ```
 
+With uv, the equivalent commands select Python explicitly without installing
+an enclosing project or its dependencies:
+
+```bash
+uv run --no-project --python 3.14 python scripts/check.py
+uv run --no-project --python 3.14 python scripts/check.py --integration
+uv run --no-project --python 3.14 python scripts/demo.py --no-delay
+```
+
+The integration command requires macOS. uv downloads the requested interpreter
+if needed; no third-party Python packages are required.
+
 The integration checks use isolated command shims and synthetic session data;
 automated tests must never invoke a real `pmset sleepnow`.
 

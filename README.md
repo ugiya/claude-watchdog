@@ -60,6 +60,33 @@ python3 scripts/install.py --prefix ~/.local --uninstall
 This project is distributed as a source executable; it is not a Python package
 and does not use `pip` for installation.
 
+### Using uv
+
+If you use [uv](https://docs.astral.sh/uv/getting-started/installation/),
+it can select or download Python and run this dependency-free source directly.
+After cloning the repository:
+
+```bash
+uv python install 3.14
+uv run --no-project --python 3.14 python claude-watchdog --help
+uv run --no-project --python 3.14 python claude-watchdog --dry-run
+```
+
+`--no-project` avoids loading an enclosing Python project's dependencies.
+To install or uninstall through the same interpreter:
+
+```bash
+uv run --no-project --python 3.14 python scripts/install.py --prefix ~/.local
+uv run --no-project --python 3.14 python ~/.local/bin/claude-watchdog --help
+uv run --no-project --python 3.14 python scripts/install.py --prefix ~/.local --uninstall
+```
+
+The installed executable still uses `python3` from `PATH` when invoked directly.
+Use the explicit `uv run ... python` form above if you rely on uv-managed Python.
+There is no package to install with `uv tool install`; use the source and installer.
+See [uv's script guide](https://docs.astral.sh/uv/guides/scripts/) for interpreter
+selection and script execution details.
+
 ## First run
 
 Start an agent session, then run the watchdog in dry-run mode:
