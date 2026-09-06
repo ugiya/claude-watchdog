@@ -8,7 +8,7 @@ Keep your Mac awake while local coding-agent sessions remain active, then let
 it sleep after the sessions and the user have both been quiet.
 
 `claude-watchdog` is an experimental, standard-library-only Python utility for
-Claude Code, compatible Claude wrappers, Codex CLI/App sessions, OMX logs, and
+Claude Code, configured Claude profiles, Codex CLI/App sessions, OMX logs, and
 OpenCode. Its terminal dashboard shows the sessions responsible for the wake
 assertion, including recorded parent/child relationships, current models, and
 quiet-time countdowns. When the dashboard closes, it leaves a plain terminal
@@ -147,9 +147,7 @@ remain in the watch set and continue to affect the sleep decision.
 
 | Source | Activity data | Scope |
 | --- | --- | --- |
-| Claude Code | JSONL under `~/.claude/projects` | Parent transcripts and native `subagents/agent-*.jsonl` children |
-| Claudex | JSONL in the Claude data tree beside the resolved `claudex` executable | Separate Claude-family guard |
-| Marjory | JSONL in the Marjory data tree beside the resolved `marjory` executable | Separate Claude-family guard |
+| Claude Code and profiles | JSONL under `~/.claude/projects` and configured profile directories | Parent transcripts and native `subagents/agent-*.jsonl` children |
 | Codex CLI/App | Rollout JSONL under `$CODEX_HOME/sessions` or `~/.codex/sessions` | Recursively discovered rollout files |
 | OMX | JSONL under `~/.omx/logs` | Only identities admitted from shared logs |
 | OpenCode | SQLite at `$OPENCODE_DB`, or the XDG OpenCode data directory | Admitted root sessions and their recursive descendants |
@@ -157,6 +155,58 @@ remain in the watch set and continue to affect the sleep decision.
 Provider formats are private implementation details that may change without
 notice. See [compatibility and schema evidence](docs/compatibility.md) before
 assuming a particular agent release is supported.
+
+### Claude profiles
+
+Use profiles when more than one Claude-compatible session tree exists on the
+same Mac. The default configuration path is
+`~/.config/claude-watchdog/profiles.json`:
+
+```json
+{
+  "version": 1,
+  "claude_profiles": [
+    {
+      "id": "work",
+      "label": "Work",
+      "projects_dir": "~/.work-claude/projects"
+    }
+  ]
+}
+```
+
+The file can define at most 32 profiles. Each `id` is a unique slug and
+`projects_dir` points directly to a Claude-compatible projects directory. The
+optional `label` controls the terminal label and defaults to the profile `id`.
+Labels are limited to 64 terminal cells and cannot contain control characters
+or line/paragraph separators. Profile roots must be unique after path
+resolution and cannot alias the built-in `~/.claude/projects` root. A
+configured directory may be absent until the corresponding tool creates it.
+
+Selecting `--source claude` or `--source auto` covers the built-in Claude tree
+and every configured profile. To read a different configuration file, use:
+
+```bash
+claude-watchdog --profiles-file /path/to/profiles.json --dry-run
+```
+
+The omitted default file may be absent, which means there are no custom
+profiles. An explicitly selected file must exist. An unreadable file, a file
+larger than 64 KiB, malformed JSON, an unsupported schema version, or an invalid
+profile aborts before `caffeinate` starts so an intended guard cannot be
+silently lost. Profile configuration is loaded only when the selected source
+is `auto` or `claude`; using `--profiles-file` with a non-Claude-only source is
+a command-line error.
+
+The watchdog freezes the validated profile configuration when it starts. With
+live session discovery, it can still admit newly active sessions that appear
+inside those frozen directories. Changes to the profile file take effect on
+the next watchdog run.
+
+A custom session's client label includes the profile label. The label identifies
+where the session was discovered; it never supplies or infers the session's
+model. Model information must come from transcript metadata and otherwise
+remains `unknown`.
 
 ## What “active” means
 
@@ -184,7 +234,7 @@ inherited parent record.
 
 Shell-launched cross-provider children do not necessarily record a native
 parent. An optional `~/.config/claude-watchdog/lineage.json` can declare an
-exact relationship for Claude-family and Codex sessions:
+exact relationship for Claude and Codex sessions:
 
 ```json
 {

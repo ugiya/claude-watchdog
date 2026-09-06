@@ -53,7 +53,7 @@ def inspect(root: Path) -> list[str]:
             findings.append(f"{relative}: credential file name")
         if (FORBIDDEN_PATHS.intersection(relative.parts)
                 or path.suffix in PRIVATE_SUFFIXES
-                or path.name == "lineage.json"):
+                or path.name in {"lineage.json", "profiles.json"}):
             findings.append(f"{relative}: private/runtime artifact path")
         if not path.is_file():
             findings.append(f"{relative}: missing or non-regular file")

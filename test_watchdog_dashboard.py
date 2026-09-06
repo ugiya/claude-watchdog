@@ -279,15 +279,38 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 },
             ]
             path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
-            for source in ("claude", "claudex", "marjory"):
-                with self.subTest(source=source):
-                    result = watchdog.jsonl_metadata(_item(str(path), source=source))
-                    self.assertEqual(result.client, "Claude Code")
+            for profile_id, profile_label, expected_client in (
+                (None, None, "Claude Code"),
+                ("work", "Work", "Claude Code [Work]"),
+            ):
+                with self.subTest(profile=profile_id):
+                    item = watchdog.ActivityFile(
+                        path, "claude", profile_id=profile_id, profile_label=profile_label
+                    )
+                    result = watchdog.jsonl_metadata(item)
+                    self.assertEqual(result.client, expected_client)
                     self.assertEqual(result.task, "Load average explanation")
                     self.assertEqual(result.model, "claude-opus-5")
                     self.assertEqual(result.effort, "high")
                     self.assertEqual(result.cwd, "/tmp/claude-project")
                     self.assertNotIn("SECRET", repr(result))
+
+    def test_profile_keeps_recorded_model_and_ignores_vanilla_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile" / "project" / "session.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({
+                "type": "assistant", "sessionId": "profile-session", "entrypoint": "sdk-cli",
+                "timestamp": "2026-09-05T00:02:00Z", "effort": "medium",
+                "message": {"model": "gpt-example", "content": []},
+            }) + "\n", encoding="utf-8")
+            item = watchdog.ActivityFile(path, "claude", profile_id="work", profile_label="Work")
+            with mock.patch.object(watchdog, "_claude_registry_name", side_effect=AssertionError("vanilla registry read")):
+                result = watchdog.jsonl_metadata(item)
+            self.assertEqual(result.client, "sdk-cli [Work]")
+            self.assertEqual(result.model, "gpt-example")
+            self.assertEqual(result.effort, "medium")
+            self.assertEqual(result.session_id, "profile-session")
 
     def test_claude_custom_title_overrides_later_generated_title_and_is_sanitized(self):
         with tempfile.TemporaryDirectory() as tmp:

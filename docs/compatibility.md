@@ -13,9 +13,7 @@ regression fixtures for the observed formats described below.
 
 | Source | Provider version exercised | Evidence in `v0.1.0` | Confidence |
 | --- | --- | --- | --- |
-| Claude Code | Unknown | Synthetic JSONL parsing, native child discovery, prompt/title metadata, and tree tests | Experimental |
-| Claudex | Unknown | Synthetic/path-scoping tests for a compatible Claude JSONL tree | Experimental |
-| Marjory | Unknown | Synthetic/path-scoping tests for a compatible Claude JSONL tree | Experimental |
+| Claude Code and configured profiles | Unknown | Synthetic JSONL parsing, profile scoping, native child discovery, prompt/title metadata, and tree tests | Experimental |
 | Codex CLI/App | Unknown | Synthetic rollout JSONL, optional state database metadata, inherited-identity, and tree tests | Experimental |
 | OMX | Unknown | Synthetic shared-log identity admission and timestamp attribution tests | Experimental |
 | OpenCode | Unknown | Synthetic SQLite root/descendant, activity, current-model, and tree tests | Experimental |
@@ -30,17 +28,54 @@ real sleep request.
 These are the exact layouts the current parser recognizes. Extra fields are
 ignored.
 
-### Claude Code and compatible wrappers
+### Claude Code and configured profiles
 
-Discovery looks under `~/.claude/projects` for parent JSONL files and native
-children at:
+The built-in Claude source looks under `~/.claude/projects` for parent JSONL
+files and native children at:
 
 ```text
 <project>/<parent-session-id>/subagents/agent-<child-id>.jsonl
 ```
 
-Claudex and Marjory resolve their own compatible data roots beside their
-executables. The parser recognizes top-level JSONL fields including:
+Additional Claude-compatible projects directories can be declared in
+`~/.config/claude-watchdog/profiles.json`:
+
+```json
+{
+  "version": 1,
+  "claude_profiles": [
+    {
+      "id": "work",
+      "label": "Work",
+      "projects_dir": "~/.work-claude/projects"
+    }
+  ]
+}
+```
+
+The schema version must be `1` and the file can contain at most 32 profiles.
+Each entry has a unique slug `id` and a `projects_dir`; `label` is optional and
+defaults to `id`. Labels have a 64-terminal-cell limit and reject control
+characters and line/paragraph separators. Entries allow no other keys. Roots
+must be unique after canonicalization and cannot alias the built-in root.
+Configured roots may be absent. The omitted default profile file means no
+custom profiles; a path supplied with
+`--profiles-file` must exist. Unreadable files, files larger than 64 KiB,
+malformed JSON, unsupported versions, and invalid entries abort before the wake
+assertion begins.
+
+Configuration is frozen once per watchdog run. Live discovery continues to
+find eligible sessions inside those frozen roots. `--source claude` and
+`--source auto` include the built-in root and configured profiles. Other source
+selections do not load the default registry and cannot be combined with an
+explicit `--profiles-file`.
+
+For a custom profile, the detected client has ` [<label>]` appended; an unknown
+client becomes `Claude Code [<label>]`. A profile label is never interpreted as
+a model. Custom profiles do not consult the built-in Claude session registry
+for missing titles.
+
+The parser recognizes top-level JSONL fields including:
 
 - `timestamp`, `sessionId`, `agentId`, `entrypoint`, `cwd`, and `effort`;
 - `type: "ai-title"` with `aiTitle`;

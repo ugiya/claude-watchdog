@@ -48,34 +48,6 @@ def _item(path: Path, source: str = "codex"):
     )
 
 
-def _install_claudex(root: Path) -> Path:
-    installed = root / "claudex-root"
-    launcher = installed / "bin" / "claudex"
-    launcher.parent.mkdir(parents=True)
-    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
-    launcher.chmod(0o700)
-    projects = installed / "claude" / "projects"
-    projects.mkdir(parents=True)
-    path_dir = root / "path"
-    path_dir.mkdir(exist_ok=True)
-    (path_dir / "claudex").symlink_to(launcher)
-    return projects
-
-
-def _install_marjory(root: Path) -> Path:
-    installed = root / "marjory-root"
-    launcher = installed / "bin" / "marjory"
-    launcher.parent.mkdir(parents=True)
-    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
-    launcher.chmod(0o700)
-    projects = installed / ".claude" / "projects"
-    projects.mkdir(parents=True)
-    path_dir = root / "path"
-    path_dir.mkdir(exist_ok=True)
-    (path_dir / "marjory").symlink_to(launcher)
-    return projects
-
-
 def _epoch_millis(value: datetime) -> int:
     return int(value.timestamp() * 1000)
 
@@ -94,6 +66,126 @@ def _open_opencode_fixture(path: Path) -> sqlite3.Connection:
     )
     database.commit()
     return database
+
+
+class ClaudeProfileTests(unittest.TestCase):
+    def _write_config(self, path: Path, profiles: list[dict[str, object]]) -> None:
+        path.write_text(
+            json.dumps({"version": 1, "claude_profiles": profiles}),
+            encoding="utf-8",
+        )
+
+    def test_loads_bounded_versioned_profile_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "profiles.json"
+            projects = root / "work" / "projects"
+            self._write_config(
+                path,
+                [{"id": "work", "label": "Work", "projects_dir": str(projects)}],
+            )
+            profiles = watchdog.load_claude_profiles(path, required=True)
+        self.assertEqual(
+            profiles,
+            (watchdog.ClaudeProfile("work", "Work", projects.resolve()),),
+        )
+
+    def test_profile_label_defaults_to_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "profiles.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "claude_profiles": [
+                            {"id": "work", "projects_dir": str(root / "projects")}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            profile = watchdog.load_claude_profiles(path, required=True)[0]
+        self.assertEqual(profile.label, "work")
+
+    def test_missing_default_is_empty_but_missing_explicit_path_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.json"
+            self.assertEqual(
+                watchdog.load_claude_profiles(missing, required=False), ()
+            )
+            with self.assertRaisesRegex(watchdog.ActivityReadError, "does not exist"):
+                watchdog.load_claude_profiles(missing, required=True)
+
+    def test_rejects_oversized_or_malformed_profile_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oversized = root / "oversized.json"
+            oversized.write_bytes(b" " * (watchdog.MAX_PROFILES_BYTES + 1))
+            with self.assertRaisesRegex(watchdog.ActivityReadError, "64 KiB"):
+                watchdog.load_claude_profiles(oversized, required=True)
+
+            malformed = root / "malformed.json"
+            malformed.write_text("{", encoding="utf-8")
+            with self.assertRaisesRegex(watchdog.ActivityReadError, "valid JSON"):
+                watchdog.load_claude_profiles(malformed, required=True)
+
+            boolean_version = root / "boolean-version.json"
+            boolean_version.write_text(
+                json.dumps({"version": True, "claude_profiles": []}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(watchdog.ActivityReadError, "version must be 1"):
+                watchdog.load_claude_profiles(boolean_version, required=True)
+
+    def test_rejects_duplicate_ids_roots_builtin_alias_and_invalid_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "profiles.json"
+            cases = (
+                [
+                    {"id": "work", "label": "Work", "projects_dir": str(root / "a")},
+                    {"id": "work", "label": "Other", "projects_dir": str(root / "b")},
+                ],
+                [
+                    {"id": "work", "label": "Work", "projects_dir": str(root / "a")},
+                    {"id": "other", "label": "Other", "projects_dir": str(root / "a" / ".." / "a")},
+                ],
+                [{"id": "not a slug", "label": "Work", "projects_dir": str(root / "a")}],
+                [{"id": "work", "label": "", "projects_dir": str(root / "a")}],
+                [{"id": "work", "label": "界" * 33, "projects_dir": str(root / "a")}],
+                [{"id": "work", "label": "Line\u2028Break", "projects_dir": str(root / "a")}],
+                [{"id": "work", "label": "Work", "projects_dir": "relative/projects"}],
+                [{"id": "work", "label": "Work", "projects_dir": "~watchdog-profile-user-does-not-exist/projects"}],
+            )
+            for profiles in cases:
+                with self.subTest(profiles=profiles):
+                    self._write_config(path, profiles)
+                    with self.assertRaises(watchdog.ActivityReadError):
+                        watchdog.load_claude_profiles(path, required=True)
+
+            builtin = root / "builtin"
+            self._write_config(
+                path,
+                [{"id": "work", "label": "Work", "projects_dir": str(builtin)}],
+            )
+            with mock.patch.object(watchdog, "claude_projects_dir", return_value=builtin):
+                with self.assertRaisesRegex(watchdog.ActivityReadError, "built-in"):
+                    watchdog.load_claude_profiles(path, required=True)
+
+    def test_rejects_more_than_32_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "profiles.json"
+            self._write_config(
+                path,
+                [
+                    {"id": f"p{index}", "label": f"P {index}", "projects_dir": str(root / f"p{index}")}
+                    for index in range(watchdog.MAX_CLAUDE_PROFILES + 1)
+                ],
+            )
+            with self.assertRaisesRegex(watchdog.ActivityReadError, "at most 32"):
+                watchdog.load_claude_profiles(path, required=True)
 
 
 class TimestampAndTailTests(unittest.TestCase):
@@ -188,14 +280,12 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             claude = root / "claude"
-            claudex = root / "claudex"
-            marjory = root / "marjory"
+            profile_root = root / "work-claude" / "projects"
             codex = root / "codex"
             omx = root / "omx"
             opencode = root / "opencode.db"
             _write_records(claude / "project" / "session.jsonl", {"timestamp": now})
-            _write_records(claudex / "project" / "session.jsonl", {"timestamp": now})
-            _write_records(marjory / "project" / "session.jsonl", {"timestamp": now})
+            _write_records(profile_root / "project" / "profile.jsonl", {"timestamp": now})
             _write_records(codex / "rollout-session.jsonl", {"timestamp": now})
             _write_records(
                 omx / "turns.jsonl",
@@ -205,25 +295,21 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
 
             with (
                 mock.patch.object(watchdog, "claude_projects_dir", return_value=claude),
-                mock.patch.object(watchdog, "claudex_projects_dir", return_value=claudex),
-                mock.patch.object(watchdog, "marjory_projects_dir", return_value=marjory),
                 mock.patch.object(watchdog, "codex_sessions_dir", return_value=codex),
                 mock.patch.object(watchdog, "omx_log_dirs", return_value=[omx]),
                 mock.patch.object(watchdog, "opencode_database_path", return_value=opencode),
             ):
-                auto = watchdog.activity_files("auto")
+                profiles = (watchdog.ClaudeProfile("work", "Work", profile_root),)
+                auto = watchdog.activity_files("auto", profiles)
                 self.assertEqual(
                     {item.source for item in auto},
-                    {"claude", "claudex", "marjory", "codex", "omx", "opencode"},
+                    {"claude", "codex", "omx", "opencode"},
                 )
-                self.assertEqual([item.source for item in watchdog.activity_files("claude")], ["claude"])
+                claude_files = watchdog.activity_files("claude", profiles)
+                self.assertEqual([item.source for item in claude_files], ["claude", "claude"])
                 self.assertEqual(
-                    [item.source for item in watchdog.activity_files("claudex")],
-                    ["claudex"],
-                )
-                self.assertEqual(
-                    [item.source for item in watchdog.activity_files("marjory")],
-                    ["marjory"],
+                    [(item.profile_id, item.profile_label) for item in claude_files],
+                    [(None, None), ("work", "Work")],
                 )
                 self.assertEqual([item.source for item in watchdog.activity_files("codex")], ["codex"])
                 self.assertEqual([item.source for item in watchdog.activity_files("omx")], ["omx"])
@@ -232,226 +318,145 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                     ["opencode"],
                 )
                 self.assertNotIn("claude", {item.source for item in watchdog.activity_files("codex-omx")})
-                self.assertNotIn("claudex", {item.source for item in watchdog.activity_files("claude")})
-                self.assertNotIn("marjory", {item.source for item in watchdog.activity_files("claude")})
                 self.assertTrue(all(item.snapshot_size is not None for item in auto))
 
-    def test_auto_selects_recent_claudex_transcript(self):
+    def test_auto_selects_recent_profile_transcript(self):
         now = datetime(2026, 8, 16, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             claude = root / "claude"
             claude.mkdir()
-            transcript = _install_claudex(root) / "project" / "session.jsonl"
+            projects = root / "work-claude" / "projects"
+            transcript = projects / "project" / "session.jsonl"
             _write_records(transcript, {"timestamp": now.isoformat()})
             with (
                 mock.patch.object(watchdog, "claude_projects_dir", return_value=claude),
                 mock.patch.object(watchdog, "codex_sessions_dir", return_value=root / "codex"),
                 mock.patch.object(watchdog, "omx_log_dirs", return_value=[root / "omx"]),
                 mock.patch.object(watchdog, "opencode_database_path", return_value=None),
-                mock.patch.dict(os.environ, {"PATH": str(root / "path")}),
             ):
                 selected = watchdog.select_watch_set(
-                    watchdog.Config(select_window_seconds=120, source="auto"),
+                    watchdog.Config(
+                        select_window_seconds=120,
+                        source="auto",
+                        claude_profiles=(watchdog.ClaudeProfile("work", "Work", projects),),
+                    ),
                     now=now,
                 )
             self.assertEqual(
-                [(item.source, item.path) for item in selected],
-                [("claudex", transcript.resolve())],
+                [(item.source, item.profile_id, item.path) for item in selected],
+                [("claude", "work", transcript)],
             )
 
-    def test_claudex_source_excludes_ordinary_claude_transcripts(self):
+    def test_profile_discovery_is_scoped_to_configured_root(self):
         now = datetime(2026, 8, 16, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             claude_transcript = root / "claude" / "project" / "session.jsonl"
             _write_records(claude_transcript, {"timestamp": now.isoformat()})
-            claudex_transcript = _install_claudex(root) / "project" / "session.jsonl"
-            _write_records(claudex_transcript, {"timestamp": now.isoformat()})
+            profile_root = root / "profile" / "projects"
+            profile_transcript = profile_root / "project" / "session.jsonl"
+            _write_records(profile_transcript, {"timestamp": now.isoformat()})
             with (
                 mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "claude"),
-                mock.patch.dict(os.environ, {"PATH": str(root / "path")}),
             ):
-                files = watchdog.activity_files("claudex")
-            self.assertEqual(
-                [(item.source, item.path) for item in files],
-                [("claudex", claudex_transcript.resolve())],
-            )
-
-    def test_claudex_projects_dir_follows_path_symlink(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects = _install_claudex(root)
-            with mock.patch.dict(os.environ, {"PATH": str(root / "path")}):
-                self.assertEqual(watchdog.claudex_projects_dir(), projects.resolve())
-
-    def test_missing_claudex_is_harmless_in_auto(self):
-        now = datetime(2026, 8, 16, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            empty_path = root / "empty-path"
-            empty_path.mkdir()
-            transcript = root / "claude" / "project" / "session.jsonl"
-            _write_records(transcript, {"timestamp": now.isoformat()})
-            with (
-                mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "claude"),
-                mock.patch.object(watchdog, "codex_sessions_dir", return_value=root / "codex"),
-                mock.patch.object(watchdog, "omx_log_dirs", return_value=[root / "omx"]),
-                mock.patch.object(watchdog, "opencode_database_path", return_value=None),
-                mock.patch.dict(os.environ, {"PATH": str(empty_path)}),
-            ):
-                selected = watchdog.select_watch_set(
-                    watchdog.Config(select_window_seconds=120, source="auto"),
-                    now=now,
+                files = watchdog.activity_files(
+                    "claude", (watchdog.ClaudeProfile("work", "Work", profile_root),)
                 )
             self.assertEqual(
-                [(item.source, item.path) for item in selected],
-                [("claude", transcript)],
+                [(item.profile_id, item.path) for item in files],
+                [(None, claude_transcript), ("work", profile_transcript)],
             )
 
-    def test_unstructured_claudex_path_hit_is_ignored(self):
+    def test_aliased_profile_transcript_is_not_a_duplicate_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path_dir = Path(tmp) / "path"
-            path_dir.mkdir()
-            fake = path_dir / "claudex"
-            fake.write_text("#!/bin/sh\n", encoding="utf-8")
-            fake.chmod(0o700)
-            with mock.patch.dict(os.environ, {"PATH": str(path_dir)}):
-                self.assertIsNone(watchdog.claudex_projects_dir())
-                self.assertEqual(watchdog.activity_files("claudex"), [])
+            root = Path(tmp)
+            actual = root / "actual"
+            transcript = actual / "project" / "session.jsonl"
+            _write_records(transcript, {"timestamp": "2026-08-16T00:00:00Z"})
+            alias = root / "alias"
+            alias.symlink_to(actual, target_is_directory=True)
+            with mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "vanilla"):
+                files = watchdog.activity_files(
+                    "claude",
+                    (
+                        watchdog.ClaudeProfile("first", "First", actual),
+                        watchdog.ClaudeProfile("second", "Second", alias),
+                    ),
+                )
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].path, transcript)
 
-    def test_claudex_selection_does_not_adopt_paths_created_after_launch(self):
+    def test_same_canonical_file_remains_distinct_across_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shared.jsonl"
+            _write_records(path, {"timestamp": "2026-08-16T00:00:00Z"})
+
+            def paths(source):
+                return [path] if source in {"claude", "codex"} else []
+
+            with mock.patch.object(watchdog, "_paths_for_source", side_effect=paths):
+                files = watchdog.activity_files("auto")
+            self.assertEqual(
+                [(item.source, item.path) for item in files],
+                [("claude", path), ("codex", path)],
+            )
+
+    def test_codex_alias_dedup_preserves_the_discovered_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            actual = root / "actual"
+            transcript = actual / "rollout-session.jsonl"
+            _write_records(transcript, {"timestamp": "2026-08-16T00:00:00Z"})
+            alias = root / "alias"
+            alias.symlink_to(actual, target_is_directory=True)
+            discovered = alias / transcript.name
+            with mock.patch.object(
+                watchdog, "_paths_for_source", return_value=[discovered, transcript]
+            ):
+                files = watchdog.activity_files("codex")
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].path, discovered)
+
+    def test_missing_profile_root_is_harmless(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "vanilla"):
+                self.assertEqual(
+                    watchdog.activity_files(
+                        "claude",
+                        (watchdog.ClaudeProfile("work", "Work", root / "missing"),),
+                    ),
+                    [],
+                )
+
+    def test_profile_selection_does_not_adopt_paths_created_after_snapshot(self):
         now = datetime(2026, 8, 16, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            projects = _install_claudex(root)
+            projects = root / "profile" / "projects"
             initial = projects / "project" / "session.jsonl"
             _write_records(
                 initial,
                 {"timestamp": (now - timedelta(seconds=10)).isoformat()},
             )
-            with mock.patch.dict(os.environ, {"PATH": str(root / "path")}):
-                snapshot = watchdog.activity_files("claudex")
+            with mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "vanilla"):
+                profile = watchdog.ClaudeProfile("work", "Work", projects)
+                snapshot = watchdog.activity_files("claude", (profile,))
                 later = projects / "other" / "later.jsonl"
                 _write_records(later, {"timestamp": now.isoformat()})
                 selected = watchdog.select_watch_set(
-                    watchdog.Config(select_window_seconds=120, source="claudex"),
+                    watchdog.Config(
+                        select_window_seconds=120,
+                        source="claude",
+                        claude_profiles=(profile,),
+                    ),
                     snapshot,
                     now=now,
                 )
             self.assertEqual(
                 [item.path for item in selected],
-                [initial.resolve()],
-            )
-
-    def test_auto_selects_recent_marjory_transcript(self):
-        now = datetime(2026, 8, 20, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            claude = root / "claude"
-            claude.mkdir()
-            transcript = _install_marjory(root) / "project" / "session.jsonl"
-            _write_records(transcript, {"timestamp": now.isoformat()})
-            with (
-                mock.patch.object(watchdog, "claude_projects_dir", return_value=claude),
-                mock.patch.object(watchdog, "claudex_projects_dir", return_value=None),
-                mock.patch.object(watchdog, "codex_sessions_dir", return_value=root / "codex"),
-                mock.patch.object(watchdog, "omx_log_dirs", return_value=[root / "omx"]),
-                mock.patch.object(watchdog, "opencode_database_path", return_value=None),
-                mock.patch.dict(os.environ, {"PATH": str(root / "path")}),
-            ):
-                selected = watchdog.select_watch_set(
-                    watchdog.Config(select_window_seconds=120, source="auto"),
-                    now=now,
-                )
-            self.assertEqual(
-                [(item.source, item.path) for item in selected],
-                [("marjory", transcript.resolve())],
-            )
-
-    def test_marjory_source_excludes_ordinary_claude_transcripts(self):
-        now = datetime(2026, 8, 20, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            claude_transcript = root / "claude" / "project" / "session.jsonl"
-            _write_records(claude_transcript, {"timestamp": now.isoformat()})
-            marjory_transcript = _install_marjory(root) / "project" / "session.jsonl"
-            _write_records(marjory_transcript, {"timestamp": now.isoformat()})
-            with (
-                mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "claude"),
-                mock.patch.dict(os.environ, {"PATH": str(root / "path")}),
-            ):
-                files = watchdog.activity_files("marjory")
-            self.assertEqual(
-                [(item.source, item.path) for item in files],
-                [("marjory", marjory_transcript.resolve())],
-            )
-
-    def test_marjory_projects_dir_follows_path_symlink(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects = _install_marjory(root)
-            with mock.patch.dict(os.environ, {"PATH": str(root / "path")}):
-                self.assertEqual(watchdog.marjory_projects_dir(), projects.resolve())
-
-    def test_missing_marjory_is_harmless_in_auto(self):
-        now = datetime(2026, 8, 20, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            empty_path = root / "empty-path"
-            empty_path.mkdir()
-            transcript = root / "claude" / "project" / "session.jsonl"
-            _write_records(transcript, {"timestamp": now.isoformat()})
-            with (
-                mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "claude"),
-                mock.patch.object(watchdog, "claudex_projects_dir", return_value=None),
-                mock.patch.object(watchdog, "codex_sessions_dir", return_value=root / "codex"),
-                mock.patch.object(watchdog, "omx_log_dirs", return_value=[root / "omx"]),
-                mock.patch.object(watchdog, "opencode_database_path", return_value=None),
-                mock.patch.dict(os.environ, {"PATH": str(empty_path)}),
-            ):
-                selected = watchdog.select_watch_set(
-                    watchdog.Config(select_window_seconds=120, source="auto"),
-                    now=now,
-                )
-            self.assertEqual(
-                [(item.source, item.path) for item in selected],
-                [("claude", transcript)],
-            )
-
-    def test_unstructured_marjory_path_hit_is_ignored(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path_dir = Path(tmp) / "path"
-            path_dir.mkdir()
-            fake = path_dir / "marjory"
-            fake.write_text("#!/bin/sh\n", encoding="utf-8")
-            fake.chmod(0o700)
-            with mock.patch.dict(os.environ, {"PATH": str(path_dir)}):
-                self.assertIsNone(watchdog.marjory_projects_dir())
-                self.assertEqual(watchdog.activity_files("marjory"), [])
-
-    def test_marjory_selection_does_not_adopt_paths_created_after_launch(self):
-        now = datetime(2026, 8, 20, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            projects = _install_marjory(root)
-            initial = projects / "project" / "session.jsonl"
-            _write_records(
-                initial,
-                {"timestamp": (now - timedelta(seconds=10)).isoformat()},
-            )
-            with mock.patch.dict(os.environ, {"PATH": str(root / "path")}):
-                snapshot = watchdog.activity_files("marjory")
-                later = projects / "other" / "later.jsonl"
-                _write_records(later, {"timestamp": now.isoformat()})
-                selected = watchdog.select_watch_set(
-                    watchdog.Config(select_window_seconds=120, source="marjory"),
-                    snapshot,
-                    now=now,
-                )
-            self.assertEqual(
-                [item.path for item in selected],
-                [initial.resolve()],
+                [initial],
             )
 
     def test_omx_scope_is_global_only(self):
@@ -1094,13 +1099,6 @@ class LiveSessionAdmissionTests(unittest.TestCase):
             ):
                 self.assertEqual(watchdog.activity_files("opencode"), [])
 
-        with (
-            mock.patch.object(watchdog.shutil, "which", return_value="/fake/bin/claudex"),
-            mock.patch.object(Path, "resolve", side_effect=PermissionError("denied")),
-        ):
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "claudex.*denied"):
-                watchdog.claudex_projects_dir()
-
     def test_opencode_stat_error_is_explicit(self):
         path = Path("/denied/opencode.db")
         with (
@@ -1167,9 +1165,11 @@ class QuietnessAndPowerTests(unittest.TestCase):
             "opencode=holding (last database activity 5s ago; 1 database)",
         )
 
-    def test_claudex_status_is_a_separate_jsonl_guard(self):
+    def test_profile_status_remains_part_of_the_claude_jsonl_guard(self):
         now = datetime(2026, 8, 16, tzinfo=timezone.utc)
-        item = watchdog.ActivityFile(Path("claudex.jsonl"), "claudex")
+        item = watchdog.ActivityFile(
+            Path("work.jsonl"), "claude", profile_id="work", profile_label="Work"
+        )
         status = watchdog._source_guard_status(
             now,
             30 * 60,
@@ -1178,21 +1178,7 @@ class QuietnessAndPowerTests(unittest.TestCase):
         )
         self.assertEqual(
             status,
-            "claudex=holding (last JSONL event 2s ago; 1 file)",
-        )
-
-    def test_marjory_status_is_a_separate_jsonl_guard(self):
-        now = datetime(2026, 8, 20, tzinfo=timezone.utc)
-        item = watchdog.ActivityFile(Path("marjory.jsonl"), "marjory")
-        status = watchdog._source_guard_status(
-            now,
-            30 * 60,
-            [item],
-            [(item, now - timedelta(seconds=2))],
-        )
-        self.assertEqual(
-            status,
-            "marjory=holding (last JSONL event 2s ago; 1 file)",
+            "claude=holding (last JSONL event 2s ago; 1 file)",
         )
 
     def test_source_status_reports_each_provider_as_a_guard_not_liveness(self):
@@ -1350,14 +1336,68 @@ class CliAndLifecycleTests(unittest.TestCase):
             watchdog.parse_args(["--source", "opencode"]).source,
             "opencode",
         )
-        self.assertEqual(
-            watchdog.parse_args(["--source", "claudex"]).source,
-            "claudex",
-        )
-        self.assertEqual(
-            watchdog.parse_args(["--source", "marjory"]).source,
-            "marjory",
-        )
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                watchdog.parse_args(["--source", "private-wrapper"])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_profiles_file_cli_loads_once_and_explicit_missing_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "profiles.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "claude_profiles": [
+                            {
+                                "id": "work",
+                                "label": "Work",
+                                "projects_dir": str(root / "projects"),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = watchdog.parse_args(["--profiles-file", str(path)])
+            self.assertEqual(cfg.profiles_file, path.resolve())
+            self.assertEqual(cfg.claude_profiles[0].id, "work")
+
+            with self.assertRaises(watchdog.ActivityReadError):
+                watchdog.parse_args(["--profiles-file", str(root / "missing.json")])
+
+    def test_non_claude_source_ignores_default_profiles_but_rejects_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            malformed = Path(tmp) / "profiles.json"
+            malformed.write_text("{", encoding="utf-8")
+            with mock.patch.object(
+                watchdog, "claude_profiles_path", return_value=malformed
+            ):
+                cfg = watchdog.parse_args(["--source", "codex"])
+            self.assertEqual(cfg.claude_profiles, ())
+
+            with mock.patch("sys.stderr", new=io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    watchdog.parse_args(
+                        ["--source", "codex", "--profiles-file", str(malformed)]
+                    )
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_invalid_profile_config_prevents_caffeinate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profiles.json"
+            path.write_text("{", encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(watchdog, "block_sleep") as block_sleep,
+                mock.patch("sys.stderr", new=stderr),
+            ):
+                self.assertEqual(
+                    watchdog.main(["--profiles-file", str(path)]), 1
+                )
+            block_sleep.assert_not_called()
+            self.assertIn("not valid JSON", stderr.getvalue())
 
     def test_cli_rejects_invalid_timing_values(self):
         invalid = (

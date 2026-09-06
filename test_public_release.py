@@ -34,12 +34,13 @@ class PublicReleaseTests(unittest.TestCase):
     def test_runtime_and_credential_named_files_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            for name in ("watchdog.log", "lineage.json", ".env", ".env.local"):
+            for name in ("watchdog.log", "lineage.json", "profiles.json", ".env", ".env.local"):
                 (root / name).write_text("synthetic\n", encoding="utf-8")
             findings = inspect(root)
         rendered = "\n".join(findings)
         self.assertIn("watchdog.log: private/runtime artifact path", rendered)
         self.assertIn("lineage.json: private/runtime artifact path", rendered)
+        self.assertIn("profiles.json: private/runtime artifact path", rendered)
         self.assertIn(".env: credential file name", rendered)
         self.assertIn(".env.local: credential file name", rendered)
 
