@@ -38,6 +38,15 @@ Build the release archive and checksum manifest:
 python3 scripts/build_release.py
 ```
 
+Maintainers using uv can run the same standard-library tools with an explicit
+interpreter, from the repository root:
+
+```bash
+uv run --no-project --python 3.14 python scripts/check_public.py
+uv run --no-project --python 3.14 python scripts/check.py
+uv run --no-project --python 3.14 python scripts/build_release.py
+```
+
 Inspect the generated `dist/` contents. The archive must contain only public
 source, tests, documentation, and release support files. It must not contain
 local caches, `.git`, `.omx`, session data, databases, logs, or generated test
