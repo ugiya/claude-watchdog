@@ -19,7 +19,7 @@ from unittest import mock
 
 
 def _load_target():
-    target = Path(__file__).with_name("claude-watchdog")
+    target = Path(__file__).resolve().parents[1] / "claude-watchdog"
     loader = importlib.machinery.SourceFileLoader("watchdog_dashboard_target", str(target))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)

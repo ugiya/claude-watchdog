@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("watchdog_demo", ROOT / "scripts" / "demo.py")
 demo = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(demo)

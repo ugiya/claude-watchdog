@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load(name: str, path: Path):
@@ -126,6 +126,7 @@ class InstallerTests(unittest.TestCase):
 class ReleaseBuilderTests(unittest.TestCase):
     def make_project(self, root: Path) -> None:
         (root / "scripts").mkdir(parents=True)
+        (root / "tests").mkdir()
         (root / "docs").mkdir()
         (root / ".github" / "workflows").mkdir(parents=True)
         (root / ".git").mkdir()
@@ -135,7 +136,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             "#!/usr/bin/env python3\nVERSION = '0.1.0'\n", encoding="utf-8"
         )
         (root / "README.md").write_text("public\n", encoding="utf-8")
-        (root / "test_release_tooling.py").write_text("pass\n", encoding="utf-8")
+        (root / "tests" / "test_release_tooling.py").write_text("pass\n", encoding="utf-8")
         (root / "scripts" / "install.py").write_text("pass\n", encoding="utf-8")
         (root / "scripts" / "check.py").write_text("pass\n", encoding="utf-8")
         (root / "docs" / "usage.md").write_text("public docs\n", encoding="utf-8")
@@ -165,7 +166,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertIn(prefix + "docs/usage.md", names)
             self.assertIn(prefix + ".github/workflows/ci.yml", names)
             self.assertIn(prefix + "scripts/check.py", names)
-            self.assertIn(prefix + "test_release_tooling.py", names)
+            self.assertIn(prefix + "tests/test_release_tooling.py", names)
             self.assertNotIn(prefix + ".git/config", names)
             self.assertNotIn(prefix + ".omx/session.json", names)
             self.assertNotIn(prefix + "private-notes.md", names)

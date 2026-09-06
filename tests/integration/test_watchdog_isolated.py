@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-TARGET = Path(__file__).resolve().parents[1] / "claude-watchdog"
+TARGET = Path(__file__).resolve().parents[2] / "claude-watchdog"
 IDLE_SECONDS = 1.5
 POLL_SECONDS = 0.1
 PROCESS_TIMEOUT = 8.0

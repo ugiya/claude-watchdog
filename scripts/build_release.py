@@ -39,17 +39,18 @@ SCRIPT_FILES = (
     "scripts/check_public.py",
     "scripts/demo.py",
     "scripts/install.py",
-    "scripts/test_watchdog_dashboard_pty.py",
-    "scripts/test_watchdog_isolated.py",
+    "tests/integration/test_watchdog_dashboard_pty.py",
+    "tests/integration/test_watchdog_isolated.py",
 )
 TEST_FILES = (
-    "test_claude_watchdog.py",
-    "test_public_release.py",
-    "test_release_tooling.py",
-    "test_watchdog_dashboard.py",
-    "test_watchdog_demo.py",
-    "test_watchdog_external_lineage.py",
-    "test_watchdog_tree.py",
+    "tests/test_repository_layout.py",
+    "tests/test_claude_watchdog.py",
+    "tests/test_public_release.py",
+    "tests/test_release_tooling.py",
+    "tests/test_watchdog_dashboard.py",
+    "tests/test_watchdog_demo.py",
+    "tests/test_watchdog_external_lineage.py",
+    "tests/test_watchdog_tree.py",
 )
 VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?\Z")
 

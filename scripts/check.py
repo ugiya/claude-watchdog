@@ -22,7 +22,7 @@ def _run(arguments: list[str], *, environment: dict[str, str] | None = None) -> 
 
 def _python_files() -> list[str]:
     paths = [PROJECT_ROOT / "claude-watchdog"]
-    paths.extend(sorted(PROJECT_ROOT.glob("test_*.py")))
+    paths.extend(sorted((PROJECT_ROOT / "tests").rglob("*.py")))
     paths.extend(sorted((PROJECT_ROOT / "scripts").glob("*.py")))
     return [str(path.relative_to(PROJECT_ROOT)) for path in paths]
 
@@ -31,7 +31,7 @@ def run_checks(*, integration: bool = False) -> None:
     python = sys.executable
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    _run([python, "-m", "unittest", "discover", "-p", "test_*.py"], environment=environment)
+    _run([python, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"], environment=environment)
     with tempfile.TemporaryDirectory(prefix="claude-watchdog-pycache-") as cache:
         compile_environment = environment.copy()
         compile_environment["PYTHONPYCACHEPREFIX"] = cache
@@ -48,8 +48,8 @@ def run_checks(*, integration: bool = False) -> None:
     if integration:
         if platform.system() != "Darwin":
             raise RuntimeError("--integration requires macOS")
-        _run([python, "scripts/test_watchdog_isolated.py"], environment=environment)
-        _run([python, "scripts/test_watchdog_dashboard_pty.py"], environment=environment)
+        _run([python, "tests/integration/test_watchdog_isolated.py"], environment=environment)
+        _run([python, "tests/integration/test_watchdog_dashboard_pty.py"], environment=environment)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

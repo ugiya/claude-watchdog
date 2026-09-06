@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Callable
 
 
-TARGET = Path(__file__).resolve().parents[1] / "claude-watchdog"
+TARGET = Path(__file__).resolve().parents[2] / "claude-watchdog"
 ARTIFACT_DIR = TARGET.parent / ".omx" / "artifacts" / "dashboard-pty"
 POLL_SECONDS = 0.2
 WAIT_SECONDS = 10.0

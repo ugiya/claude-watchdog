@@ -15,7 +15,7 @@ from unittest import mock
 
 
 def _load_target():
-    target = Path(__file__).with_name("claude-watchdog")
+    target = Path(__file__).resolve().parents[1] / "claude-watchdog"
     loader = importlib.machinery.SourceFileLoader(
         "watchdog_external_lineage_target", str(target)
     )
