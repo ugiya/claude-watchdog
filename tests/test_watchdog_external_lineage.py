@@ -3,10 +3,7 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -14,28 +11,19 @@ from pathlib import Path
 from unittest import mock
 
 
-def _load_target():
-    target = Path(__file__).resolve().parents[1] / "claude-watchdog"
-    loader = importlib.machinery.SourceFileLoader(
-        "watchdog_external_lineage_target", str(target)
-    )
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    loader.exec_module(module)
-    return module
-
-
-watchdog = _load_target()
+from claude_watchdog import models as wd_models
+from claude_watchdog import text as wd_text
+from claude_watchdog import metadata as wd_metadata
+from claude_watchdog import dashboard as wd_dashboard
 NOW = datetime(2026, 9, 7, tzinfo=timezone.utc)
 
 
 def _item(path: str, source: str):
-    return watchdog.ActivityFile(Path(path), source)
+    return wd_models.ActivityFile(Path(path), source)
 
 
 def _metadata(session_id: str, task: str, parent_session_id: str = "unknown"):
-    return watchdog.SessionMetadata(
+    return wd_models.SessionMetadata(
         client="client", task=task, model="model", effort="high",
         provenance="fixture", session_id=session_id,
         parent_session_id=parent_session_id,
@@ -65,28 +53,28 @@ class ExternalLineageTests(unittest.TestCase):
             child = _item("/codex-child.jsonl", "codex")
             similar = _item("/similar.jsonl", "codex")
             metadata = {
-                watchdog.target_key(parent): _metadata("claude-parent", "Launch reviewer"),
-                watchdog.target_key(child): _metadata("codex-child", "Review patch"),
-                watchdog.target_key(similar): _metadata("other", "Launch reviewer"),
+                wd_metadata.target_key(parent): _metadata("claude-parent", "Launch reviewer"),
+                wd_metadata.target_key(child): _metadata("codex-child", "Review patch"),
+                wd_metadata.target_key(similar): _metadata("other", "Launch reviewer"),
             }
 
-            linked = watchdog.apply_external_lineage_registry(metadata, registry)
-            snapshot = watchdog.make_dashboard_snapshot(
-                NOW, watchdog.Config(), [similar, child, parent],
+            linked = wd_metadata.apply_external_lineage_registry(metadata, registry)
+            snapshot = wd_dashboard.make_dashboard_snapshot(
+                NOW, wd_models.Config(), [similar, child, parent],
                 [(similar, NOW), (child, NOW), (parent, NOW)], 0, 10, linked,
             )
 
-        visible = watchdog.visible_dashboard_rows(
-            snapshot.rows, watchdog.DashboardState(sort="title")
+        visible = wd_dashboard.visible_dashboard_rows(
+            snapshot.rows, wd_models.DashboardState(sort="title")
         )
         self.assertEqual(
             [row.task for row in visible],
             ["Launch reviewer", "Review patch", "Launch reviewer"],
         )
-        self.assertEqual(visible[1].external_parent_key, watchdog.target_key(parent))
+        self.assertEqual(visible[1].external_parent_key, wd_metadata.target_key(parent))
         self.assertIsNone(visible[2].external_parent_key)
         self.assertEqual(
-            list(watchdog.dashboard_tree_prefixes(visible).values()),
+            list(wd_dashboard.dashboard_tree_prefixes(visible).values()),
             ["", "└─ ", ""],
         )
         self.assertTrue(any("verified launch" in line for line in visible[1].details))
@@ -117,7 +105,7 @@ class ExternalLineageTests(unittest.TestCase):
                 ),
             }
 
-            linked = watchdog.apply_external_lineage_registry(values, registry)
+            linked = wd_metadata.apply_external_lineage_registry(values, registry)
 
         for key in values:
             self.assertIsNone(linked[key].external_parent_key)
@@ -137,20 +125,20 @@ class ExternalLineageTests(unittest.TestCase):
             cases["malformed"].write_text("{", encoding="utf-8")
             cases["deeply-nested"].write_bytes(b"[" * 10_000 + b"]" * 10_000)
             cases["oversized"].write_bytes(
-                b" " * (watchdog.MAX_EXTERNAL_LINEAGE_BYTES + 1)
+                b" " * (wd_models.MAX_EXTERNAL_LINEAGE_BYTES + 1)
             )
             _write_registry(
                 cases["too-many"],
                 [
                     _link("codex", f"child-{index}", "claude", "parent")
-                    for index in range(watchdog.MAX_EXTERNAL_LINEAGE_LINKS + 1)
+                    for index in range(wd_models.MAX_EXTERNAL_LINEAGE_LINKS + 1)
                 ],
             )
 
             for name, path in cases.items():
                 with self.subTest(name=name):
                     self.assertEqual(
-                        watchdog.apply_external_lineage_registry(values, path), values
+                        wd_metadata.apply_external_lineage_registry(values, path), values
                     )
 
     def test_filtering_out_external_parent_leaves_child_as_safe_root(self):
@@ -161,20 +149,20 @@ class ExternalLineageTests(unittest.TestCase):
             ])
             parent = _item("/parent", "claude")
             child = _item("/child", "codex")
-            metadata = watchdog.apply_external_lineage_registry({
-                watchdog.target_key(parent): _metadata("parent", "Orchestrator"),
-                watchdog.target_key(child): _metadata("child", "Needle task"),
+            metadata = wd_metadata.apply_external_lineage_registry({
+                wd_metadata.target_key(parent): _metadata("parent", "Orchestrator"),
+                wd_metadata.target_key(child): _metadata("child", "Needle task"),
             }, registry)
-            snapshot = watchdog.make_dashboard_snapshot(
-                NOW, watchdog.Config(), [parent, child], [(parent, NOW), (child, NOW)],
+            snapshot = wd_dashboard.make_dashboard_snapshot(
+                NOW, wd_models.Config(), [parent, child], [(parent, NOW), (child, NOW)],
                 0, 10, metadata,
             )
 
-        visible = watchdog.visible_dashboard_rows(
-            snapshot.rows, watchdog.DashboardState(query="needle")
+        visible = wd_dashboard.visible_dashboard_rows(
+            snapshot.rows, wd_models.DashboardState(query="needle")
         )
         self.assertEqual([row.task for row in visible], ["Needle task"])
-        self.assertEqual(watchdog.dashboard_tree_prefixes(visible), {
+        self.assertEqual(wd_dashboard.dashboard_tree_prefixes(visible), {
             visible[0].key: "",
         })
 
@@ -185,28 +173,26 @@ class ExternalLineageTests(unittest.TestCase):
                 _link("claude", "child", "claude", "parent"),
             ])
             parent = _item("/parent", "claude")
-            child = watchdog.ActivityFile(
+            child = wd_models.ActivityFile(
                 Path("/work/child"), "claude", profile_id="work", profile_label="Work"
             )
             loaded = {
-                watchdog.target_key(parent): _metadata("parent", "Parent"),
-                watchdog.target_key(child): _metadata("child", "Child"),
+                wd_metadata.target_key(parent): _metadata("parent", "Parent"),
+                wd_metadata.target_key(child): _metadata("child", "Child"),
             }
 
             with (
-                mock.patch.object(
-                    watchdog, "load_session_metadata",
-                    side_effect=lambda item, task_label="prompt": loaded[watchdog.target_key(item)],
+                mock.patch.object(wd_metadata, "load_session_metadata",
+                    side_effect=lambda item, task_label="prompt": loaded[wd_metadata.target_key(item)],
                 ),
-                mock.patch.object(
-                    watchdog, "external_lineage_registry_path", return_value=registry
+                mock.patch.object(wd_metadata, "external_lineage_registry_path", return_value=registry
                 ),
             ):
-                result = watchdog.load_dashboard_metadata([parent, child])
+                result = wd_metadata.load_dashboard_metadata([parent, child])
 
         self.assertEqual(
-            result[watchdog.target_key(child)].external_parent_key,
-            watchdog.target_key(parent),
+            result[wd_metadata.target_key(child)].external_parent_key,
+            wd_metadata.target_key(parent),
         )
 
     def test_profile_native_trees_keep_reused_ids_separate(self):
@@ -223,36 +209,36 @@ class ExternalLineageTests(unittest.TestCase):
                         "type": "assistant", "sessionId": session_id,
                         "timestamp": NOW.isoformat(), "message": {"model": "example-model"},
                     }) + "\n", encoding="utf-8")
-                targets.extend(watchdog.ActivityFile(
+                targets.extend(wd_models.ActivityFile(
                     path, "claude", profile_id=profile, profile_label=profile.title()
                 ) for path in (parent, child))
-            metadata = {watchdog.target_key(item): watchdog.jsonl_metadata(item) for item in targets}
-            snapshot = watchdog.make_dashboard_snapshot(
-                NOW, watchdog.Config(), targets, [(item, NOW) for item in targets], 0, 10, metadata
+            metadata = {wd_metadata.target_key(item): wd_metadata.jsonl_metadata(item) for item in targets}
+            snapshot = wd_dashboard.make_dashboard_snapshot(
+                NOW, wd_models.Config(), targets, [(item, NOW) for item in targets], 0, 10, metadata
             )
-            parents = watchdog._dashboard_parent_keys(snapshot.rows)
+            parents = wd_dashboard._dashboard_parent_keys(snapshot.rows)
             self.assertEqual(parents, {
-                watchdog.target_key(targets[1]): watchdog.target_key(targets[0]),
-                watchdog.target_key(targets[3]): watchdog.target_key(targets[2]),
+                wd_metadata.target_key(targets[1]): wd_metadata.target_key(targets[0]),
+                wd_metadata.target_key(targets[3]): wd_metadata.target_key(targets[2]),
             })
 
     def test_external_parent_is_not_guessed_between_profiles_with_reused_ids(self):
         with tempfile.TemporaryDirectory() as tmp:
             registry = Path(tmp) / "lineage.json"
             _write_registry(registry, [_link("codex", "reviewer", "claude", "shared-parent")])
-            parents = [watchdog.ActivityFile(
+            parents = [wd_models.ActivityFile(
                 Path(tmp) / profile / "parent.jsonl", "claude",
                 profile_id=profile, profile_label=profile.title(),
             ) for profile in ("work", "personal")]
             child = _item(str(Path(tmp) / "reviewer.jsonl"), "codex")
-            metadata = {watchdog.target_key(item): _metadata("shared-parent", "Parent") for item in parents}
-            metadata[watchdog.target_key(child)] = _metadata("reviewer", "Review")
+            metadata = {wd_metadata.target_key(item): _metadata("shared-parent", "Parent") for item in parents}
+            metadata[wd_metadata.target_key(child)] = _metadata("reviewer", "Review")
             with (
-                mock.patch.object(watchdog, "external_lineage_registry_path", return_value=registry),
-                mock.patch.object(watchdog, "load_session_metadata", side_effect=lambda item, **kw: metadata[watchdog.target_key(item)]),
+                mock.patch.object(wd_metadata, "external_lineage_registry_path", return_value=registry),
+                mock.patch.object(wd_metadata, "load_session_metadata", side_effect=lambda item, **kw: metadata[wd_metadata.target_key(item)]),
             ):
-                result = watchdog.load_dashboard_metadata([*parents, child])
-            self.assertIsNone(result[watchdog.target_key(child)].external_parent_key)
+                result = wd_metadata.load_dashboard_metadata([*parents, child])
+            self.assertIsNone(result[wd_metadata.target_key(child)].external_parent_key)
 
     def test_evidence_is_sanitized_and_bounded_only_for_display(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,7 +251,7 @@ class ExternalLineageTests(unittest.TestCase):
             ])
             child_key = ("codex", "/child")
             parent_key = ("claude", "/parent")
-            linked = watchdog.apply_external_lineage_registry({
+            linked = wd_metadata.apply_external_lineage_registry({
                 child_key: _metadata("child", "Child"),
                 parent_key: _metadata("parent", "Parent"),
             }, registry)
@@ -274,7 +260,7 @@ class ExternalLineageTests(unittest.TestCase):
         self.assertEqual(linked[child_key].external_parent_key, parent_key)
         self.assertNotIn("\n", detail)
         self.assertNotIn("\x1b", detail)
-        self.assertLessEqual(watchdog.text_cells(detail), 512)
+        self.assertLessEqual(wd_text.text_cells(detail), 512)
 
     def test_json_decoder_recursion_failure_is_a_noop(self):
         values = {("codex", "/child"): _metadata("child", "Child")}
@@ -282,9 +268,9 @@ class ExternalLineageTests(unittest.TestCase):
             registry = Path(tmp) / "lineage.json"
             registry.write_text("{}", encoding="utf-8")
             with mock.patch.object(
-                watchdog.json, "loads", side_effect=RecursionError("too deep")
+                wd_metadata.json, "loads", side_effect=RecursionError("too deep")
             ):
-                result = watchdog.apply_external_lineage_registry(values, registry)
+                result = wd_metadata.apply_external_lineage_registry(values, registry)
         self.assertEqual(result, values)
 
 

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import gzip
 import hashlib
 import io
@@ -15,6 +14,18 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path, PurePosixPath
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from runtime_bundle import (
+    BundleError,
+    REQUIRED_RUNTIME_FILES,
+    required_runtime_paths,
+    runtime_version,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -39,14 +50,17 @@ SCRIPT_FILES = (
     "scripts/check_public.py",
     "scripts/demo.py",
     "scripts/install.py",
-    "tests/integration/test_watchdog_dashboard_pty.py",
-    "tests/integration/test_watchdog_isolated.py",
+    "scripts/runtime_bundle.py",
 )
 TEST_FILES = (
+    "tests/integration/test_watchdog_dashboard_pty.py",
+    "tests/integration/test_watchdog_isolated.py",
     "tests/test_repository_layout.py",
     "tests/test_claude_watchdog.py",
     "tests/test_public_release.py",
     "tests/test_release_tooling.py",
+    "tests/test_runtime_bundle.py",
+    "tests/test_module_boundaries.py",
     "tests/test_watchdog_dashboard.py",
     "tests/test_watchdog_demo.py",
     "tests/test_watchdog_external_lineage.py",
@@ -70,7 +84,12 @@ def _version(project_root: Path) -> str:
 
 
 def release_paths(project_root: Path) -> list[Path]:
+    try:
+        required_runtime_paths(project_root)
+    except BundleError as error:
+        raise ReleaseError(str(error)) from error
     candidates = [project_root / name for name in ROOT_FILES]
+    candidates.extend(project_root / name for name in REQUIRED_RUNTIME_FILES)
     candidates.extend(project_root / name for name in TEST_FILES)
     candidates.extend(project_root / name for name in SCRIPT_FILES)
     for directory_name in ("docs", ".github"):
@@ -92,7 +111,13 @@ def release_paths(project_root: Path) -> list[Path]:
         if path.is_symlink() or not path.is_file():
             raise ReleaseError(f"release entries must be regular files: {relative}")
         selected[posix.as_posix()] = path
-    required = ("VERSION", "claude-watchdog", "scripts/install.py")
+    required = (
+        "VERSION",
+        "claude-watchdog",
+        "scripts/install.py",
+        "scripts/runtime_bundle.py",
+        *REQUIRED_RUNTIME_FILES,
+    )
     missing = [name for name in required if name not in selected]
     if missing:
         raise ReleaseError(f"missing required release files: {', '.join(missing)}")
@@ -100,22 +125,10 @@ def release_paths(project_root: Path) -> list[Path]:
 
 
 def _runtime_version(project_root: Path) -> str:
-    runtime = project_root / "claude-watchdog"
     try:
-        tree = ast.parse(runtime.read_text(encoding="utf-8"), filename=str(runtime))
-    except (OSError, UnicodeError, SyntaxError) as error:
-        raise ReleaseError(f"cannot inspect runtime version: {error}") from error
-    for node in tree.body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(isinstance(target, ast.Name) and target.id == "VERSION" for target in targets):
-            continue
-        value = node.value
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            return value.value
-        raise ReleaseError("runtime VERSION must be a literal string")
-    raise ReleaseError("runtime does not declare VERSION")
+        return runtime_version(project_root)
+    except BundleError as error:
+        raise ReleaseError(str(error)) from error
 
 
 def _archive_bytes(project_root: Path, version: str) -> bytes:

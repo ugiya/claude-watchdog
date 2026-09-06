@@ -13,6 +13,13 @@ import tempfile
 from pathlib import Path
 
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from runtime_bundle import BundleError, build_runtime_bundle
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_NAME = "claude-watchdog"
 MANIFEST_SCHEMA = 1
@@ -120,15 +127,11 @@ def _assert_replaceable(
 
 def install(prefix: Path, *, force: bool = False, project_root: Path = PROJECT_ROOT) -> Path:
     destination, manifest_path = _paths(prefix)
-    source = project_root / RUNTIME_NAME
-    version_path = project_root / "VERSION"
     try:
-        runtime = source.read_bytes()
-        version = version_path.read_text(encoding="utf-8").strip()
-    except OSError as error:
+        runtime = build_runtime_bundle(project_root)
+        version = (project_root / "VERSION").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError, BundleError) as error:
         raise InstallError(f"cannot read release files: {error}") from error
-    if not runtime or not version:
-        raise InstallError("release runtime or VERSION is empty")
     _assert_replaceable(destination, manifest_path, force=force)
     digest = _sha256_bytes(runtime)
     manifest = {

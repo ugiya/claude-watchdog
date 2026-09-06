@@ -22,6 +22,7 @@ class RepositoryLayoutTests(unittest.TestCase):
             "tests/test_release_tooling.py", "tests/test_watchdog_dashboard.py",
             "tests/test_watchdog_demo.py", "tests/test_watchdog_external_lineage.py",
             "tests/test_watchdog_tree.py", "tests/test_repository_layout.py",
+            "tests/test_module_boundaries.py", "tests/test_runtime_bundle.py",
             "tests/integration/test_watchdog_isolated.py",
             "tests/integration/test_watchdog_dashboard_pty.py",
         }
@@ -31,3 +32,25 @@ class RepositoryLayoutTests(unittest.TestCase):
         self.assertLessEqual(expected, checked)
         self.assertLessEqual(expected, packaged)
         self.assertFalse(list((ROOT / "scripts").glob("test_*.py")))
+
+    def test_checker_runs_both_source_and_installed_integration_targets(self):
+        from unittest import mock
+        checker = load_script("check")
+        calls = []
+        with mock.patch.object(checker.platform, "system", return_value="Darwin"), \
+             mock.patch.object(checker, "_run", side_effect=lambda args, **kw: calls.append((args, kw["environment"]))):
+            checker.run_checks(integration=True)
+        runners = [(args, env) for args, env in calls if len(args) > 1 and args[1].startswith("tests/integration/")]
+        self.assertEqual(len(runners), 4)
+        targets = [env["WATCHDOG_TEST_TARGET"] for _, env in runners]
+        self.assertEqual(targets.count(str(ROOT / "claude-watchdog")), 2)
+        installed = [target for target in targets if target != str(ROOT / "claude-watchdog")]
+        self.assertEqual(len(set(installed)), 1)
+        self.assertTrue(installed[0].endswith("/bin/claude-watchdog"))
+
+    def test_portable_checker_never_invokes_integration_runners(self):
+        from unittest import mock
+        checker = load_script("check")
+        with mock.patch.object(checker, "_run") as run:
+            checker.run_checks()
+        self.assertFalse(any(len(call.args[0]) > 1 and call.args[0][1].startswith("tests/integration/") for call in run.call_args_list))

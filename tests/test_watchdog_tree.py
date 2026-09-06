@@ -3,35 +3,24 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import sqlite3
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-def _load_target():
-    target = Path(__file__).resolve().parents[1] / "claude-watchdog"
-    loader = importlib.machinery.SourceFileLoader("watchdog_tree_target", str(target))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    loader.exec_module(module)
-    return module
-
-
-watchdog = _load_target()
+from claude_watchdog import models as wd_models
+from claude_watchdog import metadata as wd_metadata
+from claude_watchdog import dashboard as wd_dashboard
 
 
 def _row(
     name: str, session_id: str, parent_session_id: str = "unknown",
     lineage_namespace: str = "unknown",
 ):
-    return watchdog.SessionRow(
+    return wd_models.SessionRow(
         key=("codex", f"/{name}.jsonl"), source="codex", client="codex_exec",
         task=name, model="gpt", effort="high", started=None,
         last_event=datetime(2026, 9, 6, tzinfo=timezone.utc), quiet_remaining=60,
@@ -70,7 +59,7 @@ class AncestryMetadataTests(unittest.TestCase):
                 {"type": "turn_context", "payload": {"model": "current-model", "reasoning_effort": "medium"}},
             ]
             path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
-            result = watchdog.jsonl_metadata(watchdog.ActivityFile(path, "codex"))
+            result = wd_metadata.jsonl_metadata(wd_models.ActivityFile(path, "codex"))
         self.assertEqual(result.session_id, "child")
         self.assertEqual(result.parent_session_id, "root")
         self.assertEqual(result.agent, "Singer")
@@ -96,17 +85,17 @@ class AncestryMetadataTests(unittest.TestCase):
                 },
             }) + "\n")
 
-            claude_item = watchdog.ActivityFile(claude_path, "claude")
-            codex_item = watchdog.ActivityFile(codex_path, "codex")
-            claude = watchdog.jsonl_metadata(claude_item)
-            codex = watchdog.jsonl_metadata(codex_item)
+            claude_item = wd_models.ActivityFile(claude_path, "claude")
+            codex_item = wd_models.ActivityFile(codex_path, "codex")
+            claude = wd_metadata.jsonl_metadata(claude_item)
+            codex = wd_metadata.jsonl_metadata(codex_item)
             now = datetime(2026, 9, 6, tzinfo=timezone.utc)
-            snapshot = watchdog.make_dashboard_snapshot(
-                now, watchdog.Config(), [claude_item, codex_item],
+            snapshot = wd_dashboard.make_dashboard_snapshot(
+                now, wd_models.Config(), [claude_item, codex_item],
                 [(claude_item, now), (codex_item, now)], 0, 10,
                 {
-                    watchdog.target_key(claude_item): claude,
-                    watchdog.target_key(codex_item): codex,
+                    wd_metadata.target_key(claude_item): claude,
+                    wd_metadata.target_key(codex_item): codex,
                 },
             )
 
@@ -141,16 +130,16 @@ class AncestryMetadataTests(unittest.TestCase):
                     ],
                 )
             database.close()
-            item = watchdog.ActivityFile(database_path, "opencode", identities=frozenset({"root"}))
-            metadata = watchdog.opencode_metadata(item)
+            item = wd_models.ActivityFile(database_path, "opencode", identities=frozenset({"root"}))
+            metadata = wd_metadata.opencode_metadata(item)
             now = datetime(2026, 9, 6, tzinfo=timezone.utc)
-            snapshot = watchdog.make_dashboard_snapshot(
-                now, watchdog.Config(), [item], [(item, now - timedelta(seconds=5))],
-                0, 10, {watchdog.target_key(item): metadata},
+            snapshot = wd_dashboard.make_dashboard_snapshot(
+                now, wd_models.Config(), [item], [(item, now - timedelta(seconds=5))],
+                0, 10, {wd_metadata.target_key(item): metadata},
             )
 
-        visible = watchdog.visible_dashboard_rows(
-            snapshot.rows, watchdog.DashboardState(sort="title")
+        visible = wd_dashboard.visible_dashboard_rows(
+            snapshot.rows, wd_models.DashboardState(sort="title")
         )
         self.assertEqual(snapshot.watched_count, 1)
         self.assertEqual([row.task for row in visible], [metadata.task, "Build UI", "Review UI"])
@@ -162,7 +151,7 @@ class AncestryMetadataTests(unittest.TestCase):
         self.assertEqual([row.last_event for row in visible[1:]], [None, None])
         self.assertNotIn("Unrelated", [row.task for row in visible])
         self.assertEqual(
-            list(watchdog.dashboard_tree_prefixes(visible).values()),
+            list(wd_dashboard.dashboard_tree_prefixes(visible).values()),
             ["", "└─ ", "   └─ "],
         )
 
@@ -176,10 +165,10 @@ class TreePresentationTests(unittest.TestCase):
             _row("Child", "child", "root"),
             _row("Root", "root"),
         ]
-        state = watchdog.DashboardState(sort="title")
+        state = wd_models.DashboardState(sort="title")
 
-        visible = watchdog.visible_dashboard_rows(rows, state)
-        prefixes = watchdog.dashboard_tree_prefixes(visible)
+        visible = wd_dashboard.visible_dashboard_rows(rows, state)
+        prefixes = wd_dashboard.dashboard_tree_prefixes(visible)
 
         self.assertEqual(
             [row.task for row in visible],
@@ -197,30 +186,30 @@ class TreePresentationTests(unittest.TestCase):
         orphan = _row("Orphan", "orphan", "filtered-parent")
         cycle_a = _row("Cycle A", "a", "b")
         cycle_b = _row("Cycle B", "b", "a")
-        state = watchdog.DashboardState(sort="title")
+        state = wd_models.DashboardState(sort="title")
 
-        visible = watchdog.visible_dashboard_rows([cycle_b, orphan, cycle_a], state)
+        visible = wd_dashboard.visible_dashboard_rows([cycle_b, orphan, cycle_a], state)
 
         self.assertEqual([row.task for row in visible], ["Cycle A", "Cycle B", "Orphan"])
         self.assertEqual(
-            watchdog.dashboard_tree_prefixes(visible),
+            wd_dashboard.dashboard_tree_prefixes(visible),
             {cycle_a.key: "", cycle_b.key: "", orphan.key: ""},
         )
 
     def test_t_toggles_between_tree_and_flat_sort(self):
         child = _row("Alpha child", "child", "parent")
         parent = _row("Zulu parent", "parent")
-        state = watchdog.DashboardState(sort="title")
+        state = wd_models.DashboardState(sort="title")
         self.assertEqual(
-            [row.task for row in watchdog.visible_dashboard_rows([parent, child], state)],
+            [row.task for row in wd_dashboard.visible_dashboard_rows([parent, child], state)],
             ["Zulu parent", "Alpha child"],
         )
 
-        watchdog.handle_dashboard_key(state, "t", 2)
+        wd_dashboard.handle_dashboard_key(state, "t", 2)
 
         self.assertFalse(state.tree)
         self.assertEqual(
-            [row.task for row in watchdog.visible_dashboard_rows([parent, child], state)],
+            [row.task for row in wd_dashboard.visible_dashboard_rows([parent, child], state)],
             ["Alpha child", "Zulu parent"],
         )
 
@@ -228,13 +217,13 @@ class TreePresentationTests(unittest.TestCase):
         parent = _row("Parent A", "shared", lineage_namespace="database-a")
         child = _row("Child B", "child", "shared", lineage_namespace="database-b")
 
-        visible = watchdog.visible_dashboard_rows(
-            [child, parent], watchdog.DashboardState(sort="title")
+        visible = wd_dashboard.visible_dashboard_rows(
+            [child, parent], wd_models.DashboardState(sort="title")
         )
 
         self.assertEqual([row.task for row in visible], ["Child B", "Parent A"])
         self.assertEqual(
-            watchdog.dashboard_tree_prefixes(visible),
+            wd_dashboard.dashboard_tree_prefixes(visible),
             {child.key: "", parent.key: ""},
         )
 
@@ -247,8 +236,8 @@ class TreePresentationTests(unittest.TestCase):
             for index in range(1100)
         ]
 
-        visible = watchdog.visible_dashboard_rows(
-            reversed(rows), watchdog.DashboardState(sort="title")
+        visible = wd_dashboard.visible_dashboard_rows(
+            reversed(rows), wd_models.DashboardState(sort="title")
         )
 
         self.assertEqual(len(visible), 1100)
@@ -258,28 +247,28 @@ class TreePresentationTests(unittest.TestCase):
 
 class TreeFrameTests(unittest.TestCase):
     def test_nested_prefix_spacing_and_group_timing_survive_full_frame_render(self):
-        root = watchdog.SessionChildMetadata(
+        root = wd_models.SessionChildMetadata(
             "root", task="Build UI", model="muse", effort="high", agent="build"
         )
-        child = watchdog.SessionChildMetadata(
+        child = wd_models.SessionChildMetadata(
             "child", "root", "Review UI", "muse", "medium", "explore"
         )
-        item = watchdog.ActivityFile(Path("/tmp/opencode.db"), "opencode",
+        item = wd_models.ActivityFile(Path("/tmp/opencode.db"), "opencode",
                                      identities=frozenset({"root"}))
         now = datetime(2026, 9, 6, tzinfo=timezone.utc)
-        metadata = watchdog.SessionMetadata(
+        metadata = wd_models.SessionMetadata(
             client="OpenCode", task="2 sessions", model="mixed", effort="mixed",
             provenance="opencode-state", lineage_namespace=str(item.path),
             children=(root, child),
         )
-        snapshot = watchdog.make_dashboard_snapshot(
-            now, watchdog.Config(), [item], [(item, now - timedelta(seconds=5))],
-            0, 10, {watchdog.target_key(item): metadata},
+        snapshot = wd_dashboard.make_dashboard_snapshot(
+            now, wd_models.Config(), [item], [(item, now - timedelta(seconds=5))],
+            0, 10, {wd_metadata.target_key(item): metadata},
         )
         screen = FakeScreen()
 
-        watchdog.TerminalDashboard(
-            screen, watchdog.Config(no_color=True)
+        wd_dashboard.TerminalDashboard(
+            screen, wd_models.Config(no_color=True)
         ).update(snapshot)
 
         self.assertIn("└─ Build UI", screen.lines[4])

@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import argparse
 import html
-import importlib.machinery
-import importlib.util
 import json
 import os
 import sys
@@ -23,7 +21,11 @@ from typing import TextIO
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET = ROOT / "claude-watchdog"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from claude_watchdog import dashboard, models, reporting
+
 BASE_TIME = datetime(2026, 1, 15, 22, 0, tzinfo=timezone.utc)
 FRAME_OFFSETS = (8, 18, 32, 48, 62, 70)
 FRAME_DELAYS = (0.0, 4.0, 4.0, 4.0, 4.0, 4.0)
@@ -35,17 +37,7 @@ HIDE_CURSOR = "\x1b[?25l"
 SHOW_CURSOR = "\x1b[?25h"
 
 
-def load_watchdog():
-    """Load the extensionless runtime without invoking its CLI entry point."""
-    loader = importlib.machinery.SourceFileLoader("watchdog_demo_runtime", str(TARGET))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    loader.exec_module(module)
-    return module
 
-
-watchdog = load_watchdog()
 
 
 def _row(
@@ -63,7 +55,7 @@ def _row(
     namespace: str | None = None,
 ) -> object:
     event = BASE_TIME + timedelta(seconds=event_offset)
-    return watchdog.SessionRow(
+    return models.SessionRow(
         key=(source, f"/demo/{source}/{session_id}.jsonl"),
         source=source,
         client=client,
@@ -103,17 +95,17 @@ def build_snapshots() -> tuple[object, ...]:
             rows.append(_row("codex", "Codex", "Verify install and rollback", "gpt-example", "medium", "codex-child", 5, now,
                              parent="codex-root", agent="verifier"))
             open_children = (
-                watchdog.SessionChildMetadata(
+                models.SessionChildMetadata(
                     "open-root", task="Design a searchable activity view", model="opencode-example",
                     effort="high", agent="build", started=BASE_TIME - timedelta(minutes=2),
                 ),
-                watchdog.SessionChildMetadata(
+                models.SessionChildMetadata(
                     "open-child", "open-root", "Inspect the query planner", "opencode-example",
                     "medium", "explore", BASE_TIME - timedelta(minutes=1),
                 ),
             )
             open_event = BASE_TIME + timedelta(seconds=8)
-            rows.append(watchdog.SessionRow(
+            rows.append(models.SessionRow(
                 key=("opencode", "/demo/opencode/activity.db"),
                 source="opencode", client="OpenCode",
                 task="Design a searchable activity view | Inspect the query planner",
@@ -129,7 +121,7 @@ def build_snapshots() -> tuple[object, ...]:
                 notice = "admitted 2 new targets (Codex subagent + OpenCode group)"
         holding = sum(row.holding for row in rows)
         watched = len(rows)
-        snapshots.append(watchdog.DashboardSnapshot(
+        snapshots.append(models.DashboardSnapshot(
             now=now,
             rows=tuple(rows),
             watched_count=watched,
@@ -182,8 +174,8 @@ def colorize(line: str) -> str:
 
 
 def dashboard_frame(snapshot: object, *, ansi: bool = True) -> str:
-    state = watchdog.DashboardState(sort="recent", tree=True)
-    lines = watchdog.dashboard_lines(snapshot, state, width=WIDTH, height=HEIGHT)
+    state = models.DashboardState(sort="recent", tree=True)
+    lines = dashboard.dashboard_lines(snapshot, state, width=WIDTH, height=HEIGHT)
     if ansi:
         lines = [colorize(line) for line in lines]
     return "\n".join(lines).rstrip() + "\n"
@@ -191,12 +183,12 @@ def dashboard_frame(snapshot: object, *, ansi: bool = True) -> str:
 
 def final_report(snapshots: tuple[object, ...], *, ansi: bool = True) -> str:
     with _utc_timezone():
-        history = watchdog.WatchHistory()
+        history = reporting.WatchHistory()
         for snapshot in snapshots:
             history.observe(snapshot)
-        config = watchdog.Config(idle_minutes=1, user_idle_minutes=5, dry_run=True)
-        lines = watchdog.exit_report_lines(history, config, 0, "synthetic demo complete", color=False)
-    local_log = str(watchdog.LOG_FILE)
+        config = models.Config(idle_minutes=1, user_idle_minutes=5, dry_run=True)
+        lines = reporting.exit_report_lines(history, config, 0, "synthetic demo complete", color=False)
+    local_log = str(models.LOG_FILE)
     lines = [line.replace(local_log, "/demo/claude-watchdog.log") for line in lines]
     if ansi:
         lines = [colorize(line) for line in lines]
@@ -264,7 +256,7 @@ def _svg_segments(line: str):
 
 
 def svg_asset(snapshot: object) -> str:
-    lines = watchdog.dashboard_lines(snapshot, watchdog.DashboardState(tree=True), width=100, height=HEIGHT)
+    lines = dashboard.dashboard_lines(snapshot, models.DashboardState(tree=True), width=100, height=HEIGHT)
     text = [
         '<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="460" viewBox="0 0 1040 460">',
         '  <rect width="1040" height="460" rx="16" fill="#11151b"/>',
