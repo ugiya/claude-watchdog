@@ -57,8 +57,18 @@ pass `--force`. To remove the installed executable:
 python3 scripts/install.py --prefix ~/.local --uninstall
 ```
 
-This project is distributed as a source executable; it is not a Python package
-and does not use `pip` for installation.
+The source checkout contains a small `claude-watchdog` launcher and the internal
+`claude_watchdog/` Python package. Run the launcher from the checkout, or use the
+installer above. **Copying only the source launcher is not an installation.**
+
+The installer builds a deterministic, self-contained
+[Python ZIP application](https://docs.python.org/3.10/library/zipapp.html)
+from an explicit list of runtime modules. The installed command is still one
+executable file, requires Python 3.10+ on `PATH`, and works without the source
+checkout. Its ownership manifest still protects modified or unrelated files;
+an owned older single-file installation can be upgraded with the same installer.
+No third-party packages, virtual environment, or `pip` installation are needed.
+The internal source package is not a published pip distribution.
 
 ### Using uv
 
