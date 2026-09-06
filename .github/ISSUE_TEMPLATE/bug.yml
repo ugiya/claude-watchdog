@@ -1,0 +1,65 @@
+name: Bug report
+description: Report incorrect watchdog behavior using redacted, synthetic evidence.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach raw transcripts or session databases. Redact prompts, task titles, usernames, paths, session IDs, repository names, credentials, and proprietary details.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "Example: 15.6"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "Output of: python3 --version"
+    validations:
+      required: true
+  - type: input
+    id: watchdog
+    attributes:
+      label: Watchdog version or commit
+      placeholder: "Example: v0.1.0 or commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command and display mode
+      description: Remove sensitive arguments. State whether --dry-run was enabled.
+      placeholder: "claude-watchdog --source codex --display dashboard --dry-run"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Prefer synthetic records with placeholder values.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted output
+      description: Paste only the smallest relevant excerpt after redacting all private data.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed raw transcripts, prompts, private paths, session IDs, credentials, and project names.
+          required: true

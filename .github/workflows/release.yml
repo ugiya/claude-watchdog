@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Verify version matches tag
+        run: |
+          test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
+      - run: python scripts/check_public.py
+      - run: python scripts/build_release.py
+      - name: Publish tested prerelease archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --verify-tag --prerelease
+          --title "claude-watchdog $GITHUB_REF_NAME (prerelease)"
+          --notes-file CHANGELOG.md

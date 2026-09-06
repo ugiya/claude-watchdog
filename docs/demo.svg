@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="460" viewBox="0 0 1040 460">
+  <rect width="1040" height="460" rx="16" fill="#11151b"/>
+  <circle cx="24" cy="21" r="6" fill="#ff5f57"/><circle cx="43" cy="21" r="6" fill="#febc2e"/><circle cx="62" cy="21" r="6" fill="#28c840"/>
+  <text x="820" y="25" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" fill="#858b98">synthetic data · safe demo</text>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5">
+    <text x="22" y="48" xml:space="preserve"><tspan fill="#ffd75f">CLAUDE</tspan><tspan fill="#d6d9df"> WATCHDOG  AWAKE · 3 holding / 5 targets   next scan 00:06   live · auto</tspan></text>
+    <text x="22" y="66" xml:space="preserve"><tspan fill="#d6d9df">session quiet 1m · user idle pending (checked after sessions quiet)</tspan></text>
+    <text x="22" y="84" xml:space="preserve"><tspan fill="#d6d9df">  SOURCE    CLIENT         TASK / AGENT TREE           MODEL / EFFORT               LAST   QUIET IN</tspan></text>
+    <text x="22" y="102" xml:space="preserve"><tspan fill="#d6d9df">▸ </tspan><tspan fill="#87d75f">OPENCODE</tspan><tspan fill="#d6d9df">  </tspan><tspan fill="#afff87">OpenCode</tspan><tspan fill="#d6d9df">       Design a searchable activi… </tspan><tspan fill="#ff8700">opencode-example</tspan><tspan fill="#d6d9df"> / high       54s      00:06</tspan></text>
+    <text x="22" y="120" xml:space="preserve"><tspan fill="#d6d9df">  </tspan><tspan fill="#87d75f">OPENCODE</tspan><tspan fill="#d6d9df">  </tspan><tspan fill="#afff87">OpenCode</tspan><tspan fill="#d6d9df">       └─ Design a searchable act… </tspan><tspan fill="#ff8700">opencode-example</tspan><tspan fill="#d6d9df"> / high     group      group</tspan></text>
+    <text x="22" y="138" xml:space="preserve"><tspan fill="#d6d9df">  </tspan><tspan fill="#87d75f">OPENCODE</tspan><tspan fill="#d6d9df">  </tspan><tspan fill="#afff87">OpenCode</tspan><tspan fill="#d6d9df">          └─ Inspect the query pl… </tspan><tspan fill="#ff8700">opencode-example</tspan><tspan fill="#d6d9df"> / medium   group      group</tspan></text>
+    <text x="22" y="156" xml:space="preserve"><tspan fill="#d6d9df">  </tspan><tspan fill="#00d7d7">CODEX</tspan><tspan fill="#d6d9df">     </tspan><tspan fill="#5fd7ff">Codex</tspan><tspan fill="#d6d9df">          Prepare the public release  </tspan><tspan fill="#5fd7ff">gpt-example</tspan><tspan fill="#d6d9df"> / high            59s      00:01</tspan></text>
+    <text x="22" y="174" xml:space="preserve"><tspan fill="#d6d9df">  </tspan><tspan fill="#00d7d7">CODEX</tspan><tspan fill="#d6d9df">     </tspan><tspan fill="#5fd7ff">Codex</tspan><tspan fill="#d6d9df">          └─ Verify install and roll… </tspan><tspan fill="#5fd7ff">gpt-example</tspan><tspan fill="#d6d9df"> / medium          57s      00:03</tspan></text>
+    <text x="22" y="192" xml:space="preserve"><tspan fill="#d6d9df">  </tspan><tspan fill="#ffd75f">CLAUDE</tspan><tspan fill="#d6d9df">    </tspan><tspan fill="#ff87ff">Claude Code</tspan><tspan fill="#d6d9df">    Build the overnight report  </tspan><tspan fill="#d787ff">claude-example</tspan><tspan fill="#d6d9df"> / high       1m02s      quiet</tspan></text>
+    <text x="22" y="210" xml:space="preserve"><tspan fill="#d6d9df">  </tspan><tspan fill="#ffd75f">CLAUDE</tspan><tspan fill="#d6d9df">    </tspan><tspan fill="#ff87ff">Claude Code</tspan><tspan fill="#d6d9df">    └─ Review terminal hierarc… </tspan><tspan fill="#d787ff">claude-example</tspan><tspan fill="#d6d9df"> / medium     1m00s      quiet</tspan></text>
+    <text x="22" y="228" xml:space="preserve"></text>
+    <text x="22" y="246" xml:space="preserve"></text>
+    <text x="22" y="264" xml:space="preserve"></text>
+    <text x="22" y="282" xml:space="preserve"></text>
+    <text x="22" y="300" xml:space="preserve"></text>
+    <text x="22" y="318" xml:space="preserve"></text>
+    <text x="22" y="336" xml:space="preserve"></text>
+    <text x="22" y="354" xml:space="preserve"></text>
+    <text x="22" y="372" xml:space="preserve"></text>
+    <text x="22" y="390" xml:space="preserve"><tspan fill="#d6d9df">q exit safely  / filter  p/f provider  s sort  t tree/flat  ↑↓/jk move  Enter details  c clear</tspan></text>
+    <text x="22" y="408" xml:space="preserve"><tspan fill="#d6d9df">showing 7 rows · 5 watch targets · provider all · tree · sort recent · task prompt</tspan></text>
+    <text x="22" y="426" xml:space="preserve"><tspan fill="#d6d9df">persisted activity, not process liveness</tspan></text>
+  </g>
+</svg>

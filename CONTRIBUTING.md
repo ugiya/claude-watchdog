@@ -1,0 +1,75 @@
+# Contributing
+
+Thank you for helping make `claude-watchdog` safer and more compatible.
+
+## Before opening an issue
+
+Search existing issues first. For provider compatibility reports, include the
+exact agent application and version when available, macOS version, Python
+version, watchdog command, display mode, and whether `--dry-run` was enabled.
+
+Never post raw transcripts. Redact prompts, task titles, usernames, local paths,
+session identifiers, repository names, access tokens, and proprietary provider
+details from logs and screenshots.
+
+Use GitHub's private vulnerability reporting for security issues. See
+[SECURITY.md](SECURITY.md).
+
+## Development setup
+
+Fork and clone the repository. The project requires Python 3.10 or later and
+has no third-party runtime or test dependencies.
+
+Run the canonical validation command from the repository root:
+
+```bash
+python3 scripts/check.py
+```
+
+The default check runs the portable unit, syntax, indentation, command-help,
+and installer validations. On macOS, also run the isolated lifecycle and PTY
+dashboard checks:
+
+```bash
+python3 scripts/check.py --integration
+```
+
+The integration checks use isolated command shims and synthetic session data;
+automated tests must never invoke a real `pmset sleepnow`.
+
+To inspect a synthetic dashboard without reading your agent sessions:
+
+```bash
+python3 scripts/demo.py
+```
+
+## Change guidelines
+
+- Keep the runtime compatible with the Python standard library.
+- Preserve persisted content timestamps as the activity signal. Do not replace
+  them with filesystem modification times or process presence.
+- Keep dashboard metadata, filtering, sorting, and hierarchy observational.
+  They must not add or remove sleep guards.
+- Preserve launch-time JSONL path/size snapshots, OMX identity scoping, and
+  OpenCode lineage-root scoping unless a reviewed requirement changes them.
+- Add a regression test before changing parsing, session selection, quietness,
+  power commands, or status behavior.
+- Use synthetic, anonymized fixtures. Do not commit local session transcripts,
+  database copies, terminal captures, home-directory paths, or session IDs.
+- Do not add a dependency without explaining why the standard library cannot
+  meet the requirement.
+
+## Pull requests
+
+Keep changes focused and explain the user-visible behavior, safety implications,
+and validation performed. `python3 scripts/check.py` must pass before review.
+macOS contributors should also run `python3 scripts/check.py --integration`.
+If a check is not available on your platform, say which check was skipped and
+why.
+
+Changes to provider parsing should update [docs/compatibility.md](docs/compatibility.md)
+with the schema evidence and tested provider version. Write “unknown” when the
+version was not recorded; do not infer a version from file layout alone.
+
+By contributing, you agree that your contribution is licensed under the MIT
+License in this repository.

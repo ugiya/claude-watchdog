@@ -1,0 +1,2800 @@
+#!/usr/bin/env python3
+"""Keep the Mac awake while Claude, Claudex, Marjory, Codex, OMX, or OpenCode sessions work.
+
+Activity is measured from persisted content timestamps, never from file mtimes
+or process presence. New recent sessions are admitted while the watchdog runs;
+OpenCode descendants join only an admitted seed's watched lineage.
+
+Usage:
+    claude-watchdog [IDLE_MINUTES] [--source auto|claude|claudex|marjory|codex|omx|opencode|codex-omx]
+                    [--user-idle-minutes N] [--select-window SECONDS]
+                    [--session-discovery live|frozen] [--poll SECONDS] [--dry-run]
+                    [--display auto|dashboard|log] [--task-label metadata|prompt] [--no-color]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import re
+import signal
+import shutil
+import sqlite3
+import stat
+import subprocess
+import sys
+import textwrap
+import time
+import unicodedata
+from collections import deque
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+LOG_FILE = Path.home() / "claude-watchdog.log"
+VERSION = "0.1.0"
+READ_CHUNK_BYTES = 64 * 1024
+MAX_METADATA_BYTES = 256 * 1024
+MAX_CLAUDE_REGISTRY_FILES = 512
+MAX_EXTERNAL_LINEAGE_BYTES = 256 * 1024
+MAX_EXTERNAL_LINEAGE_LINKS = 256
+EXTERNAL_LINEAGE_SOURCES = ("claude", "claudex", "marjory", "codex")
+MAX_FUTURE_SKEW_SECONDS = 300
+SOURCE_CHOICES = (
+    "auto",
+    "claude",
+    "claudex",
+    "marjory",
+    "codex",
+    "omx",
+    "opencode",
+    "codex-omx",
+)
+ALL_SOURCES = ("claude", "claudex", "marjory", "codex", "omx", "opencode")
+OMX_ID_FIELDS = ("session_id", "native_session_id", "thread_id")
+DISPLAY_CHOICES = ("auto", "dashboard", "log")
+TASK_LABEL_CHOICES = ("metadata", "prompt")
+SORT_CHOICES = ("recent", "title", "source")
+UNKNOWN = "unknown"
+
+log = logging.getLogger("claude-watchdog")
+
+
+class WatchdogError(RuntimeError):
+    """An operational error that must prevent a forced sleep."""
+
+
+class ActivityReadError(WatchdogError):
+    """Persisted activity could not be read safely."""
+
+
+class PresenceCheckError(WatchdogError):
+    """The macOS user-idle state could not be determined."""
+
+
+class PowerCommandError(WatchdogError):
+    """A macOS power command failed."""
+
+
+class TerminalRestoreError(WatchdogError):
+    """Terminal cleanup failed; falling back to log mode is unsafe."""
+
+
+class OpenCodeDatabaseError(WatchdogError):
+    """The OpenCode activity database could not be read safely."""
+
+
+@dataclass(frozen=True)
+class ActivityFile:
+    path: Path
+    source: str
+    snapshot_size: int | None = None
+    identities: frozenset[str] = frozenset()
+
+    @property
+    def label(self) -> str:
+        return f"{self.source}:{self.path}"
+
+
+@dataclass
+class Config:
+    idle_minutes: float = 30.0
+    user_idle_minutes: float = 5.0  # 0 disables the user-idle gate.
+    select_window_seconds: float = 900.0
+    poll_seconds: float = 60.0
+    source: str = "auto"
+    session_discovery: str = "live"
+    dry_run: bool = False
+    display: str = "auto"
+    no_color: bool = False
+    task_label: str = "prompt"
+
+    @property
+    def idle_seconds(self) -> float:
+        return self.idle_minutes * 60
+
+    @property
+    def user_idle_seconds(self) -> float:
+        return self.user_idle_minutes * 60
+
+
+@dataclass(frozen=True)
+class SessionChildMetadata:
+    session_id: str
+    parent_session_id: str = UNKNOWN
+    task: str = UNKNOWN
+    model: str = UNKNOWN
+    effort: str = UNKNOWN
+    agent: str = UNKNOWN
+    started: datetime | None = None
+
+
+@dataclass(frozen=True)
+class SessionMetadata:
+    client: str = UNKNOWN
+    task: str = UNKNOWN
+    model: str = UNKNOWN
+    effort: str = UNKNOWN
+    started: datetime | None = None
+    cwd: str = UNKNOWN
+    provenance: str = UNKNOWN
+    agent: str = UNKNOWN
+    details: tuple[str, ...] = ()
+    session_id: str = UNKNOWN
+    parent_session_id: str = UNKNOWN
+    lineage_namespace: str = UNKNOWN
+    children: tuple[SessionChildMetadata, ...] = ()
+    external_parent_key: tuple[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class SessionRow:
+    key: tuple[str, str]
+    source: str
+    client: str
+    task: str
+    model: str
+    effort: str
+    started: datetime | None
+    last_event: datetime | None
+    quiet_remaining: float
+    path: str
+    identity_count: int
+    provenance: str
+    holding: bool
+    agent: str = UNKNOWN
+    details: tuple[str, ...] = ()
+    session_id: str = UNKNOWN
+    parent_session_id: str = UNKNOWN
+    lineage_namespace: str = UNKNOWN
+    children: tuple[SessionChildMetadata, ...] = ()
+    display_only: bool = False
+    external_parent_key: tuple[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class DashboardSnapshot:
+    now: datetime
+    rows: tuple[SessionRow, ...]
+    watched_count: int
+    holding_count: int
+    session_quiet: bool
+    user_idle: float | None
+    user_idle_required: float
+    next_poll_seconds: float
+    source: str
+    discovery: str
+    idle_seconds: float
+    admission_notice: str = ""
+
+
+@dataclass
+class DashboardState:
+    query: str = ""
+    source_filter: str | None = None
+    sort: str = "recent"
+    selected: int = 0
+    selected_key: tuple[str, str] | None = None
+    scroll: int = 0
+    details: bool = False
+    filter_input: bool = False
+    query_before_edit: str = ""
+    tree: bool = True
+
+
+# --- source discovery and activity signal -----------------------------------
+
+
+def claude_projects_dir() -> Path:
+    return Path.home() / ".claude" / "projects"
+
+
+def claude_sessions_dir() -> Path:
+    return Path.home() / ".claude" / "sessions"
+
+
+def claudex_projects_dir() -> Path | None:
+    found = shutil.which("claudex")
+    if found is None:
+        return None
+    try:
+        resolved = Path(found).resolve(strict=True)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ActivityReadError(f"unable to resolve claudex executable {found}: {exc}") from exc
+    if resolved.name != "claudex" or resolved.parent.name != "bin":
+        return None
+    projects = resolved.parent.parent / "claude" / "projects"
+    try:
+        mode = projects.stat().st_mode
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ActivityReadError(f"unable to inspect claudex projects {projects}: {exc}") from exc
+    return projects if stat.S_ISDIR(mode) else None
+
+
+def marjory_projects_dir() -> Path | None:
+    found = shutil.which("marjory")
+    if found is None:
+        return None
+    try:
+        resolved = Path(found).resolve(strict=True)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ActivityReadError(f"unable to resolve marjory executable {found}: {exc}") from exc
+    if resolved.name != "marjory" or resolved.parent.name != "bin":
+        return None
+    projects = resolved.parent.parent / ".claude" / "projects"
+    try:
+        mode = projects.stat().st_mode
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ActivityReadError(f"unable to inspect marjory projects {projects}: {exc}") from exc
+    return projects if stat.S_ISDIR(mode) else None
+
+
+def codex_sessions_dir() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    return codex_home / "sessions"
+
+
+def omx_log_dirs() -> list[Path]:
+    """Return the global OMX JSONL directory from the agreed source scope."""
+    return [Path.home() / ".omx" / "logs"]
+
+
+def opencode_database_path() -> Path | None:
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    data_home = (
+        Path(xdg_data_home).expanduser()
+        if xdg_data_home
+        else Path.home() / ".local" / "share"
+    )
+    data_dir = data_home / "opencode"
+    override = os.environ.get("OPENCODE_DB")
+    if override == ":memory:":
+        return None
+    if override:
+        path = Path(override).expanduser()
+        return path if path.is_absolute() else data_dir / path
+    return data_dir / "opencode.db"
+
+
+def _source_names(source: str) -> tuple[str, ...]:
+    normalized = source.strip().lower()
+    if normalized == "auto":
+        return ALL_SOURCES
+    if normalized == "codex-omx":
+        return ("codex", "omx")
+    if normalized in ALL_SOURCES:
+        return (normalized,)
+    raise ValueError(f"unsupported source: {source!r}")
+
+
+def _scandir(directory: Path, source: str) -> list[os.DirEntry[str]]:
+    try:
+        with os.scandir(directory) as entries:
+            return sorted(entries, key=lambda entry: entry.name)
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ActivityReadError(
+            f"unable to discover {source} activity under {directory}: {exc}"
+        ) from exc
+
+
+def _entry_is_dir(
+    entry: os.DirEntry[str], source: str, *, follow_symlinks: bool
+) -> bool:
+    try:
+        return entry.is_dir(follow_symlinks=follow_symlinks)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ActivityReadError(
+            f"unable to inspect {source} activity path {entry.path}: {exc}"
+        ) from exc
+
+
+def _entry_is_file(entry: os.DirEntry[str], source: str) -> bool:
+    try:
+        return entry.is_file(follow_symlinks=True)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ActivityReadError(
+            f"unable to inspect {source} activity path {entry.path}: {exc}"
+        ) from exc
+
+
+def _two_level_jsonl(directory: Path, source: str) -> list[Path]:
+    paths: list[Path] = []
+    for project in _scandir(directory, source):
+        if not _entry_is_dir(project, source, follow_symlinks=True):
+            continue
+        for entry in _scandir(Path(project.path), source):
+            if entry.name.endswith(".jsonl") and _entry_is_file(entry, source):
+                paths.append(Path(entry.path))
+            elif _entry_is_dir(entry, source, follow_symlinks=False):
+                # Claude stores child transcripts beside the parent's JSONL:
+                # project/session-id/subagents/agent-id.jsonl.
+                for child_dir in _scandir(Path(entry.path), source):
+                    if child_dir.name != "subagents" or not _entry_is_dir(
+                        child_dir, source, follow_symlinks=False
+                    ):
+                        continue
+                    for child in _scandir(Path(child_dir.path), source):
+                        if (child.name.startswith("agent-")
+                                and child.name.endswith(".jsonl")
+                                and _entry_is_file(child, source)):
+                            paths.append(Path(child.path))
+    return sorted(paths)
+
+
+def _recursive_codex_jsonl(directory: Path) -> list[Path]:
+    paths: list[Path] = []
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        for entry in _scandir(current, "codex"):
+            if _entry_is_dir(entry, "codex", follow_symlinks=False):
+                pending.append(Path(entry.path))
+            elif (
+                entry.name.startswith("rollout-")
+                and entry.name.endswith(".jsonl")
+                and _entry_is_file(entry, "codex")
+            ):
+                paths.append(Path(entry.path))
+    return sorted(paths)
+
+
+def _paths_for_source(source: str) -> list[Path]:
+    if source == "claude":
+        return _two_level_jsonl(claude_projects_dir(), source)
+    if source == "claudex":
+        directory = claudex_projects_dir()
+        return [] if directory is None else _two_level_jsonl(directory, source)
+    if source == "marjory":
+        directory = marjory_projects_dir()
+        return [] if directory is None else _two_level_jsonl(directory, source)
+    if source == "codex":
+        return _recursive_codex_jsonl(codex_sessions_dir())
+    if source == "omx":
+        paths: list[Path] = []
+        seen: set[str] = set()
+        for directory in omx_log_dirs():
+            for entry in _scandir(directory, source):
+                if not entry.name.endswith(".jsonl") or not _entry_is_file(entry, source):
+                    continue
+                path = Path(entry.path)
+                key = str(path)
+                if key not in seen:
+                    seen.add(key)
+                    paths.append(path)
+        return paths
+    if source == "opencode":
+        path = opencode_database_path()
+        if path is None:
+            return []
+        try:
+            mode = path.stat().st_mode
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise ActivityReadError(
+                f"unable to inspect OpenCode database {path}: {exc}"
+            ) from exc
+        return [path] if stat.S_ISREG(mode) else []
+    raise ValueError(f"unsupported source: {source!r}")
+
+
+def activity_files(source: str = "auto") -> list[ActivityFile]:
+    """Discover and size-snapshot paths for the requested source selection."""
+    files: list[ActivityFile] = []
+    seen: set[str] = set()
+    for source_name in _source_names(source):
+        try:
+            paths = _paths_for_source(source_name)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ActivityReadError(
+                f"unable to discover {source_name} activity: {exc}"
+            ) from exc
+        for path in paths:
+            key = str(path)
+            if key in seen:
+                continue
+            try:
+                snapshot_size = path.stat().st_size
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise ActivityReadError(
+                    f"unable to stat activity file {path}: {exc}"
+                ) from exc
+            seen.add(key)
+            files.append(
+                ActivityFile(path=path, source=source_name, snapshot_size=snapshot_size)
+            )
+    return files
+
+
+def transcripts() -> list[Path]:
+    """Backward-compatible Claude transcript listing."""
+    return [item.path for item in activity_files("claude")]
+
+
+def _parse_ts(value: str) -> datetime | None:
+    """Parse an ISO-8601 timestamp and normalize it to UTC."""
+    if not isinstance(value, str):
+        return None
+    try:
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _reverse_lines(
+    path: Path,
+    *,
+    end_offset: int | None = None,
+    chunk_bytes: int = READ_CHUNK_BYTES,
+) -> Iterator[str]:
+    """Yield complete lines newest-first, expanding across arbitrarily large lines."""
+    with path.open("rb") as fh:
+        fh.seek(0, 2)
+        size = fh.tell()
+        position = size if end_offset is None else min(size, max(0, end_offset))
+        carry = b""
+
+        while position > 0:
+            read_size = min(chunk_bytes, position)
+            position -= read_size
+            fh.seek(position)
+            data = fh.read(read_size) + carry
+            parts = data.split(b"\n")
+            carry = parts[0]
+            for raw_line in reversed(parts[1:]):
+                yield raw_line.decode("utf-8", errors="replace")
+
+        if carry:
+            yield carry.decode("utf-8", errors="replace")
+
+
+def _json_objects_reverse(
+    path: Path, *, end_offset: int | None = None
+) -> Iterator[dict[str, object]]:
+    for line in _reverse_lines(path, end_offset=end_offset):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def _record_identifiers(obj: dict[str, object]) -> frozenset[str]:
+    return frozenset(
+        value
+        for field in OMX_ID_FIELDS
+        if isinstance((value := obj.get(field)), str) and value
+    )
+
+
+def _record_timestamp(obj: dict[str, object], now: datetime) -> datetime | None:
+    value = obj.get("timestamp")
+    parsed = _parse_ts(value) if isinstance(value, str) else None
+    if parsed is None:
+        return None
+    if (parsed - now).total_seconds() > MAX_FUTURE_SKEW_SECONDS:
+        return None
+    return parsed
+
+
+def last_activity(
+    path: Path,
+    *,
+    now: datetime | None = None,
+    end_offset: int | None = None,
+    identities: frozenset[str] | None = None,
+) -> datetime | None:
+    """Return the newest attributable, sane top-level JSONL timestamp."""
+    now = now or datetime.now(timezone.utc)
+    freshest: datetime | None = None
+    try:
+        for obj in _json_objects_reverse(path, end_offset=end_offset):
+            if identities is not None and not (_record_identifiers(obj) & identities):
+                continue
+            timestamp = _record_timestamp(obj, now)
+            if timestamp is not None:
+                if identities is None:
+                    return timestamp
+                if freshest is None or timestamp > freshest:
+                    freshest = timestamp
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ActivityReadError(
+            f"unable to read activity file {path}: {exc}"
+        ) from exc
+    return freshest
+
+
+def _activity_age(now: datetime, timestamp: datetime) -> float | None:
+    age = (now - timestamp).total_seconds()
+    if age < -MAX_FUTURE_SKEW_SECONDS:
+        return None
+    return max(0.0, age)
+
+
+def _timestamp_from_epoch_millis(value: object) -> datetime | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        if not math.isfinite(value):
+            return None
+        return datetime.fromtimestamp(value / 1000, timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _opencode_activity(
+    path: Path,
+    now: datetime,
+    identities: frozenset[str] | None = None,
+) -> list[tuple[str, datetime]]:
+    upper_millis = int(
+        (now.timestamp() + MAX_FUTURE_SKEW_SECONDS) * 1000
+    )
+    lineage_cte = ""
+    identity_filter = ""
+    parameters: list[object] = [upper_millis]
+    if identities is not None:
+        if not identities:
+            return []
+        roots = sorted(identities)
+        seeds = ", ".join("(?)" for _ in roots)
+        lineage_cte = f"""
+            WITH RECURSIVE watched(session_id) AS (
+                VALUES {seeds}
+                UNION
+                SELECT child.id
+                FROM session AS child
+                JOIN watched AS parent ON child.parent_id = parent.session_id
+            )
+        """
+        identity_filter = " AND session_id IN (SELECT session_id FROM watched)"
+        parameters = [*roots, upper_millis]
+
+    query = f"""{lineage_cte}
+        SELECT session_id, MAX(time_updated)
+        FROM (
+            SELECT session_id, time_updated FROM message
+            UNION ALL
+            SELECT session_id, time_updated FROM part
+        )
+        WHERE time_updated <= ?{identity_filter}
+        GROUP BY session_id
+    """
+    try:
+        database = sqlite3.connect(
+            path.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        try:
+            database.execute("PRAGMA query_only = ON")
+            rows = database.execute(query, parameters).fetchall()
+        finally:
+            database.close()
+    except sqlite3.Error as exc:
+        raise OpenCodeDatabaseError(
+            f"unable to read OpenCode activity database {path}: {exc}"
+        ) from exc
+
+    activity: list[tuple[str, datetime]] = []
+    for identity, value in rows:
+        if not isinstance(identity, str) or not identity:
+            continue
+        timestamp = _timestamp_from_epoch_millis(value)
+        if timestamp is not None:
+            activity.append((identity, timestamp))
+    return activity
+
+
+def _freeze_opencode_item(
+    item: ActivityFile, cfg: Config, now: datetime
+) -> ActivityFile | None:
+    identities = {
+        identity
+        for identity, timestamp in _opencode_activity(item.path, now)
+        if (age := _activity_age(now, timestamp)) is not None
+        and age <= cfg.select_window_seconds
+    }
+    if not identities:
+        return None
+    _opencode_activity(item.path, now, frozenset(identities))
+    return ActivityFile(
+        path=item.path,
+        source=item.source,
+        snapshot_size=item.snapshot_size,
+        identities=frozenset(identities),
+    )
+
+
+def _freeze_omx_item(item: ActivityFile, cfg: Config, now: datetime) -> ActivityFile | None:
+    """Capture session identities already present in a shared OMX log at launch."""
+    identities: set[str] = set()
+    try:
+        for obj in _json_objects_reverse(item.path, end_offset=item.snapshot_size):
+            timestamp = _record_timestamp(obj, now)
+            if timestamp is None:
+                continue
+            age = _activity_age(now, timestamp)
+            if age is None:
+                continue
+            if age > cfg.select_window_seconds:
+                continue
+            identities.update(_record_identifiers(obj))
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ActivityReadError(
+            f"unable to read OMX activity file {item.path}: {exc}"
+        ) from exc
+
+    if not identities:
+        return None
+    return ActivityFile(
+        path=item.path,
+        source=item.source,
+        snapshot_size=item.snapshot_size,
+        identities=frozenset(identities),
+    )
+
+
+def select_watch_set(
+    cfg: Config,
+    candidates: Iterable[ActivityFile] | None = None,
+    *,
+    now: datetime | None = None,
+) -> list[ActivityFile]:
+    """Select active files from one launch-time path and size snapshot."""
+    now = now or datetime.now(timezone.utc)
+    candidates = activity_files(cfg.source) if candidates is None else candidates
+    watch: list[ActivityFile] = []
+
+    for item in candidates:
+        if item.source == "opencode":
+            frozen_item = _freeze_opencode_item(item, cfg, now)
+            if frozen_item is not None:
+                watch.append(frozen_item)
+            continue
+        if item.source == "omx":
+            frozen_item = _freeze_omx_item(item, cfg, now)
+            if frozen_item is not None:
+                watch.append(frozen_item)
+            continue
+
+        timestamp = last_activity(
+            item.path,
+            now=now,
+            end_offset=item.snapshot_size,
+        )
+        if timestamp is None:
+            continue
+        age = _activity_age(now, timestamp)
+        if age is not None and age <= cfg.select_window_seconds:
+            watch.append(item)
+
+    return watch
+
+
+def refresh_watch_set(
+    cfg: Config,
+    current: list[ActivityFile],
+    candidates: Iterable[ActivityFile] | None = None,
+    now: datetime | None = None,
+) -> list[ActivityFile]:
+    """Return an additive watch-set proposal from one complete discovery snapshot."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        snapshot = (
+            activity_files(cfg.source) if candidates is None else list(candidates)
+        )
+        allowed_sources = set(_source_names(cfg.source))
+        eligible = select_watch_set(
+            cfg,
+            (item for item in snapshot if item.source in allowed_sources),
+            now=now,
+        )
+    except WatchdogError:
+        raise
+    except Exception as exc:
+        raise WatchdogError(f"unable to refresh activity targets: {exc}") from exc
+
+    proposed = list(current)
+    index = {
+        (item.source, item.path): position
+        for position, item in enumerate(proposed)
+    }
+    for item in eligible:
+        key = (item.source, item.path)
+        position = index.get(key)
+        if position is None:
+            index[key] = len(proposed)
+            proposed.append(item)
+            continue
+        existing = proposed[position]
+        if item.source not in {"omx", "opencode"}:
+            continue
+        identities = existing.identities | item.identities
+        if identities != existing.identities:
+            proposed[position] = ActivityFile(
+                path=existing.path,
+                source=existing.source,
+                snapshot_size=existing.snapshot_size,
+                identities=identities,
+            )
+    return proposed
+
+
+def _last_activity_for(item: ActivityFile, now: datetime) -> datetime | None:
+    if item.source == "opencode":
+        activity = _opencode_activity(item.path, now, item.identities)
+        return max((timestamp for _, timestamp in activity), default=None)
+    if item.source == "omx":
+        if not item.identities:
+            return None
+        return last_activity(item.path, now=now, identities=item.identities)
+    return last_activity(item.path, now=now)
+
+
+# --- observational dashboard metadata ---------------------------------------
+
+
+def target_key(item: ActivityFile) -> tuple[str, str]:
+    """Stable display identity; it does not participate in activity decisions."""
+    return item.source, str(item.path)
+
+
+def _sanitize_terminal_chars(value: object, *, collapse_spacing: bool) -> str:
+    if not isinstance(value, str):
+        return UNKNOWN
+    text = unicodedata.normalize("NFC", value)
+    cleaned: list[str] = []
+    for char in text:
+        code = ord(char)
+        category = unicodedata.category(char)
+        if char in "\r\n\t":
+            cleaned.append(" ")
+        elif code < 32 or 127 <= code <= 159 or category in {"Cf", "Cs"}:
+            continue
+        else:
+            cleaned.append(char)
+    result = "".join(cleaned)
+    if collapse_spacing:
+        result = re.sub(r"\s+", " ", result).strip()
+    return result or UNKNOWN
+
+
+def sanitize_terminal_text(value: object) -> str:
+    """Make local metadata safe and compact enough for one terminal cell."""
+    return _sanitize_terminal_chars(value, collapse_spacing=True)
+
+
+def text_cells(value: str) -> int:
+    width = 0
+    for char in value:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def _clip_text_cells(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if text_cells(text) <= width:
+        return text
+    if width == 1:
+        return "…"
+    result: list[str] = []
+    used = 0
+    for char in text:
+        char_width = 0 if unicodedata.combining(char) else (
+            2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        )
+        if used + char_width > width - 1:
+            break
+        result.append(char)
+        used += char_width
+    return "".join(result) + "…"
+
+
+def clip_cells(value: object, width: int) -> str:
+    return _clip_text_cells(sanitize_terminal_text(value), width)
+
+
+def pad_cells(value: object, width: int) -> str:
+    """Clip and right-pad a metadata value to an exact terminal-cell width."""
+    clipped = clip_cells(value, width)
+    return clipped + " " * max(0, width - text_cells(clipped))
+
+
+def _safe_metadata_value(value: object) -> str:
+    return sanitize_terminal_text(value) if isinstance(value, str) and value.strip() else UNKNOWN
+
+
+def _metadata_time(value: object) -> datetime | None:
+    if isinstance(value, str):
+        return _parse_ts(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value / 1000 if value > 10_000_000_000 else value
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+    return None
+
+
+def _bounded_metadata_objects(
+    path: Path, max_records: int, *, spread: bool = False
+) -> list[dict[str, object]]:
+    """Sample byte-bounded transcript windows, skipping cut records."""
+    with path.open("rb") as handle:
+        size = handle.seek(0, 2)
+        if spread:
+            window_size = min(READ_CHUNK_BYTES, size)
+            window_count = min(
+                MAX_METADATA_BYTES // READ_CHUNK_BYTES,
+                max(1, math.ceil(size / READ_CHUNK_BYTES)),
+            )
+            span = size - window_size
+            if window_count == 1:
+                starts = (0,)
+            elif window_count == 2:
+                starts = (0, span)
+            elif window_count == 3:
+                starts = (0, round(span / 2), span)
+            else:
+                starts = (0, round(size / 4), round(size / 2), span)
+            chunks = []
+            for start in starts:
+                handle.seek(start)
+                chunks.append((handle.read(window_size), start > 0, start + window_size < size))
+            # Claude transcripts can pack hundreds of small events into one window.
+            # Scan every complete object inside the fixed byte budget so the actual
+            # newest title, prompt, model, and effort cannot sit beyond a line quota.
+            budgets = (None,) * len(chunks)
+        else:
+            head_size = min(READ_CHUNK_BYTES, size)
+            handle.seek(0)
+            head = handle.read(head_size)
+            tail_start = max(head_size, size - (MAX_METADATA_BYTES - head_size))
+            handle.seek(tail_start)
+            tail = handle.read(MAX_METADATA_BYTES - head_size)
+            chunks = [(head, False, head_size < size), (tail, tail_start > head_size, False)]
+            tail_present = bool(tail)
+            head_budget = max_records if not tail_present else max(1, max_records // 2)
+            budgets = (head_budget, max(0, max_records - head_budget))
+    objects: list[dict[str, object]] = []
+    for (data, cut_left, cut_right), budget in zip(chunks, budgets):
+        accepted = 0
+        lines = data.splitlines()
+        if cut_left and lines:
+            lines = lines[1:]
+        if cut_right and data and not data.endswith(b"\n") and lines:
+            lines = lines[:-1]
+        for raw in lines:
+            if len(raw) > READ_CHUNK_BYTES:
+                continue
+            try:
+                value = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                objects.append(value)
+                accepted += 1
+                if budget is not None and accepted >= budget:
+                    break
+    return objects
+
+
+def _has_omx_launch(session_id: object, cwd: object, started: object) -> bool:
+    """Correlate explicit OMX launch metadata; project configuration is not evidence."""
+    if not isinstance(session_id, str) or not session_id or not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        return False
+    root = Path(cwd) / ".omx"
+
+    def matches(value: object) -> bool:
+        return (isinstance(value, dict) and value.get("native_session_id") == session_id
+                and isinstance(value.get("session_id"), str) and value["session_id"].startswith("omx-"))
+
+    try:
+        with (root / "state/session.json").open("rb") as handle:
+            if matches(json.loads(handle.read(READ_CHUNK_BYTES))):
+                return True
+    except (OSError, ValueError):
+        pass
+    timestamp = _parse_ts(started) if isinstance(started, str) else None
+    if timestamp is None:
+        return False
+    # Launch and reconciliation can straddle midnight or use a local date.
+    for offset in (0, -1, 1):
+        try:
+            day = timestamp + timedelta(days=offset)
+            records = _bounded_metadata_objects(root / "logs" / day.strftime("omx-%Y-%m-%d.jsonl"), 200)
+        except (OSError, OverflowError):
+            continue
+        if any(record.get("event") == "session_start_reconciled" and matches(record) for record in records):
+            return True
+    return False
+
+
+def _claude_registry_name(session_id: str) -> str | None:
+    """Return the name from an exact bounded Claude session-registry match."""
+    try:
+        entries = []
+        with os.scandir(claude_sessions_dir()) as iterator:
+            for index, entry in enumerate(iterator):
+                if index >= MAX_CLAUDE_REGISTRY_FILES:
+                    break
+                if not entry.name.endswith(".json"):
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    entries.append((info.st_mtime_ns, entry.path))
+        budget = 2 * 1024 * 1024
+        for _, raw_path in sorted(entries, reverse=True):
+            if budget <= 0:
+                break
+            try:
+                with Path(raw_path).open("rb") as handle:
+                    data = handle.read(min(READ_CHUNK_BYTES, budget))
+                budget -= len(data)
+                value = json.loads(data)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(value, dict) or value.get("sessionId") != session_id:
+                continue
+            name = value.get("name")
+            return _safe_metadata_value(name) if isinstance(name, str) and name.strip() else None
+    except OSError:
+        pass
+    return None
+
+
+def _fallback_task_label(item: ActivityFile, cwd: str, identifier: str) -> str:
+    project = Path(cwd).name if cwd != UNKNOWN else item.path.parent.name
+    return sanitize_terminal_text(f"{project} · {identifier[:8]}")
+
+
+def jsonl_metadata(
+    item: ActivityFile,
+    max_records: int = 200,
+    task_label: str = "prompt",
+) -> SessionMetadata:
+    """Read bounded metadata and, when selected, Claude's designated prompt."""
+    client = task = model = effort = cwd = agent = UNKNOWN
+    generated_task: str | None = None
+    custom_task: str | None = None
+    prompt_task: str | None = None
+    started: datetime | None = None
+    provenance = UNKNOWN
+    claude_family = item.source in {"claude", "claudex", "marjory"}
+    omx_launch = False
+    session_id: str | None = None
+    parent_session_id: str | None = None
+    claude_agent_id: str | None = None
+    try:
+        records = _bounded_metadata_objects(item.path, max_records, spread=claude_family)
+    except OSError:
+        return SessionMetadata()
+
+    for obj in records:
+        timestamp = _parse_ts(obj.get("timestamp")) if isinstance(obj.get("timestamp"), str) else None
+        if timestamp is not None and (started is None or timestamp < started):
+            started = timestamp
+        kind = obj.get("type")
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        if kind == "session_meta":
+            # Forked transcripts include inherited parent session_meta records.
+            # The first valid identity belongs to this rollout, not its history.
+            if item.source == "codex" and session_id is not None:
+                continue
+            client = _safe_metadata_value(payload.get("originator") or payload.get("client") or client)
+            agent = _safe_metadata_value(payload.get("agent_nickname") or payload.get("agent_role") or agent)
+            cwd = _safe_metadata_value(payload.get("cwd") or cwd)
+            model = _safe_metadata_value(payload.get("model") or model)
+            effort = _safe_metadata_value(payload.get("reasoning_effort") or effort)
+            provenance = "jsonl"
+            if item.source == "codex":
+                record_id = payload.get("id")
+                if isinstance(record_id, str) and record_id:
+                    session_id = record_id
+                source = payload.get("source")
+                subagent = source.get("subagent") if isinstance(source, dict) else None
+                thread_spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+                parent_id = thread_spawn.get("parent_thread_id") if isinstance(thread_spawn, dict) else None
+                if isinstance(parent_id, str) and parent_id:
+                    parent_session_id = parent_id
+                omx_launch = omx_launch or _has_omx_launch(
+                    payload.get("session_id") or payload.get("id"),
+                    payload.get("cwd"), payload.get("timestamp") or obj.get("timestamp"),
+                )
+        elif kind == "turn_context":
+            model = _safe_metadata_value(payload.get("model") or model)
+            effort = _safe_metadata_value(payload.get("reasoning_effort") or effort)
+            cwd = _safe_metadata_value(payload.get("cwd") or cwd)
+            provenance = "jsonl"
+        elif kind in {"custom-title", "custom_title"}:
+            title = payload.get("title") or obj.get("title")
+            if isinstance(title, str) and title.strip():
+                custom_task = _safe_metadata_value(title)
+                provenance = "jsonl"
+        if claude_family:
+            candidate_session_id = obj.get("sessionId")
+            if isinstance(candidate_session_id, str) and candidate_session_id:
+                session_id = candidate_session_id
+            candidate_agent_id = obj.get("agentId")
+            if isinstance(candidate_agent_id, str) and candidate_agent_id:
+                claude_agent_id = candidate_agent_id
+            entrypoint = obj.get("entrypoint")
+            if isinstance(entrypoint, str) and entrypoint.strip():
+                client = "Claude Code" if entrypoint.strip().lower() == "cli" else _safe_metadata_value(entrypoint)
+                provenance = "jsonl"
+            top_level_cwd = obj.get("cwd")
+            if isinstance(top_level_cwd, str) and top_level_cwd.strip():
+                cwd = _safe_metadata_value(top_level_cwd)
+                provenance = "jsonl"
+            top_level_effort = obj.get("effort")
+            if isinstance(top_level_effort, str) and top_level_effort.strip():
+                effort = _safe_metadata_value(top_level_effort)
+                provenance = "jsonl"
+            if kind == "ai-title":
+                title = obj.get("aiTitle")
+                if isinstance(title, str) and title.strip():
+                    generated_task = _safe_metadata_value(title)
+                    provenance = "jsonl"
+            elif kind == "custom-title":
+                title = obj.get("customTitle")
+                if isinstance(title, str) and title.strip():
+                    custom_task = _safe_metadata_value(title)
+                    provenance = "jsonl"
+            elif kind == "last-prompt" and task_label == "prompt":
+                last_prompt = obj.get("lastPrompt")
+                if isinstance(last_prompt, str) and last_prompt.strip():
+                    prompt_task = clip_cells(last_prompt, 160)
+        message = obj.get("message")
+        if isinstance(message, dict) and isinstance(message.get("model"), str):
+            model = _safe_metadata_value(message["model"])
+            provenance = "jsonl"
+
+    task_session_id = session_id
+    lineage_namespace: str | None = None
+    if claude_family and item.path.parent.name == "subagents":
+        parent_session_id = item.path.parent.parent.name
+        lineage_namespace = str(item.path.parent.parent.parent)
+        session_id = claude_agent_id or item.path.stem.removeprefix("agent-")
+    elif claude_family and session_id is None:
+        session_id = item.path.stem
+        lineage_namespace = str(item.path.parent)
+    elif claude_family:
+        lineage_namespace = str(item.path.parent)
+    elif item.source == "codex":
+        lineage_namespace = "codex"
+
+    task = custom_task if custom_task is not None else generated_task or prompt_task or UNKNOWN
+    if custom_task is None and generated_task is None and prompt_task is not None:
+        provenance = "jsonl-prompt"
+    if claude_family and task == UNKNOWN and task_session_id is not None:
+        task = _claude_registry_name(task_session_id) or UNKNOWN
+    if claude_family and task == UNKNOWN and task_session_id is not None:
+        task = _fallback_task_label(item, cwd, task_session_id)
+    if omx_launch:
+        client = "OMX / Codex"
+    return SessionMetadata(
+        client, task, model, effort, started, cwd, provenance, agent,
+        session_id=_safe_metadata_value(session_id),
+        parent_session_id=_safe_metadata_value(parent_session_id),
+        lineage_namespace=_safe_metadata_value(lineage_namespace),
+    )
+
+
+def codex_state_database_path() -> Path:
+    return codex_sessions_dir().parent / "state_5.sqlite"
+
+
+def codex_sqlite_metadata_batch(
+    items: Iterable[ActivityFile], database_path: Path | None = None
+) -> dict[tuple[str, str], SessionMetadata]:
+    """Read exact Codex rollout matches through one bounded read-only connection."""
+    item_list = list(items)
+    results = {target_key(item): SessionMetadata() for item in item_list}
+    if not item_list:
+        return results
+    path = database_path or codex_state_database_path()
+    try:
+        database = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.15)
+        try:
+            database.execute("PRAGMA query_only = ON")
+            columns = {row[1] for row in database.execute("PRAGMA table_info(threads)")}
+            wanted = [name for name in (
+                "title", "name", "model", "reasoning_effort", "created_at_ms",
+                "created_at", "source", "thread_source", "agent_nickname",
+                "agent_role", "cwd",
+            ) if name in columns]
+            if "rollout_path" not in columns or not wanted:
+                return results
+            for item in item_list:
+                row = database.execute(
+                    f"SELECT {', '.join(wanted)} FROM threads WHERE rollout_path = ? LIMIT 1",
+                    (str(item.path),),
+                ).fetchone()
+                if row is None:
+                    continue
+                values = dict(zip(wanted, row))
+                task = values.get("title") or values.get("name")
+                client = values.get("thread_source") or values.get("source")
+                agent = values.get("agent_nickname") or values.get("agent_role")
+                started = _metadata_time(values.get("created_at_ms") or values.get("created_at"))
+                results[target_key(item)] = SessionMetadata(
+                    _safe_metadata_value(client), _safe_metadata_value(task),
+                    _safe_metadata_value(values.get("model")),
+                    _safe_metadata_value(values.get("reasoning_effort")), started,
+                    _safe_metadata_value(values.get("cwd")), "codex-state",
+                    _safe_metadata_value(agent),
+                )
+        finally:
+            database.close()
+    except (OSError, sqlite3.Error):
+        return results
+    return results
+
+
+def codex_sqlite_metadata(item: ActivityFile, database_path: Path | None = None) -> SessionMetadata:
+    return codex_sqlite_metadata_batch([item], database_path)[target_key(item)]
+
+
+def _merge_metadata(primary: SessionMetadata, fallback: SessionMetadata) -> SessionMetadata:
+    scalar_fields = (
+        "client", "task", "model", "effort", "started", "cwd", "provenance",
+        "agent", "session_id", "parent_session_id", "lineage_namespace",
+    )
+    values = {
+        field_name: (
+            getattr(primary, field_name)
+            if getattr(primary, field_name) not in {UNKNOWN, None}
+            else getattr(fallback, field_name)
+        )
+        for field_name in scalar_fields
+    }
+    values["details"] = primary.details or fallback.details
+    values["children"] = primary.children or fallback.children
+    return SessionMetadata(**values)
+
+
+def opencode_metadata(item: ActivityFile) -> SessionMetadata:
+    """Describe the watched database lineage using bounded, read-only metadata."""
+    fallback = SessionMetadata(client="OpenCode", task=f"{len(item.identities)} lineage seeds")
+    if not item.identities:
+        return fallback
+    try:
+        database = sqlite3.connect(item.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.15)
+        try:
+            deadline = time.monotonic() + 0.2
+            database.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+            database.execute("PRAGMA query_only = ON")
+            columns = {row[1] for row in database.execute("PRAGMA table_info(session)")}
+            if not {"id", "parent_id", "title", "time_created", "time_updated"} <= columns:
+                return fallback
+            optional = [f"substr({name},1,4096)" if name in columns else "NULL"
+                        for name in ("directory", "model", "agent")]
+            seeds = sorted(item.identities)
+            query = f"""WITH RECURSIVE watched(id) AS (
+                VALUES {','.join('(?)' for _ in seeds)}
+                UNION SELECT s.id FROM session s JOIN watched w ON s.parent_id=w.id
+            ) SELECT id, parent_id, substr(title,1,512), time_created, {','.join(optional)}
+              FROM session WHERE id IN (SELECT id FROM watched)
+              ORDER BY time_updated DESC, id LIMIT 33"""
+            sessions = database.execute(query, seeds).fetchall()
+            if not sessions:
+                return fallback
+            message_columns = {row[1] for row in database.execute("PRAGMA table_info(message)")}
+            messages_available = {"session_id", "time_created", "id", "data"} <= message_columns
+            labels, details, starts, children = [], [], [], []
+            for sid, parent_id, title, created, cwd, model_json, agent in sessions[:32]:
+                try:
+                    model_info = json.loads(model_json) if model_json else {}
+                except (ValueError, TypeError):
+                    model_info = {}
+                if not isinstance(model_info, dict):
+                    model_info = {}
+                model = _safe_metadata_value(model_info.get("id"))
+                effort = _safe_metadata_value(model_info.get("variant"))
+                agent = _safe_metadata_value(agent)
+                if messages_available:
+                    recent = database.execute(
+                        "SELECT substr(data,1,65536) FROM message WHERE session_id=? "
+                        "ORDER BY time_created DESC, id DESC LIMIT 8", (sid,)
+                    ).fetchall()
+                    for (raw,) in recent:
+                        try:
+                            message = json.loads(raw)
+                        except (ValueError, TypeError):
+                            continue
+                        if not isinstance(message, dict) or message.get("role") != "assistant":
+                            continue
+                        # The session selection reflects a model switch before
+                        # the next assistant message has been persisted.
+                        if model == UNKNOWN:
+                            model = _safe_metadata_value(message.get("modelID"))
+                            effort = _safe_metadata_value(message.get("variant"))
+                        agent = _safe_metadata_value(message.get("agent") or agent)
+                        break
+                label = _safe_metadata_value(title)
+                if label == UNKNOWN:
+                    label = _fallback_task_label(item, _safe_metadata_value(cwd), str(sid))
+                labels.append(label)
+                started = _timestamp_from_epoch_millis(created)
+                if started is not None:
+                    starts.append(started)
+                children.append(SessionChildMetadata(
+                    session_id=_safe_metadata_value(sid),
+                    parent_session_id=_safe_metadata_value(parent_id),
+                    task=label, model=model, effort=effort, agent=agent,
+                    started=started,
+                ))
+                details.append(clip_cells(f"{label} · {sid}", 512))
+                details.append(clip_cells(
+                    f"  {model} / {effort} · agent {agent} · started {_local_clock(started)}", 512
+                ))
+            if len(sessions) > 32:
+                details.append("More sessions in this lineage; showing 32 most recently updated.")
+
+            child_ids = {child.session_id for child in children}
+            current = next((child for child in children
+                            if child.parent_session_id not in child_ids), children[0])
+            return SessionMetadata(
+                client="OpenCode", task=" | ".join(labels), model=current.model,
+                effort=current.effort, agent=current.agent, started=min(starts, default=None),
+                provenance="opencode-state", details=tuple(details),
+                lineage_namespace=str(item.path), children=tuple(children),
+            )
+        finally:
+            database.close()
+    except (OSError, sqlite3.Error):
+        return fallback
+
+
+def load_session_metadata(item: ActivityFile, task_label: str = "prompt") -> SessionMetadata:
+    if item.source == "opencode":
+        return opencode_metadata(item)
+    fallback = (
+        jsonl_metadata(item, task_label=task_label)
+        if item.source not in {"opencode"} else SessionMetadata()
+    )
+    if item.source == "codex":
+        result = _merge_metadata(codex_sqlite_metadata(item), fallback)
+        if fallback.client != UNKNOWN:
+            result = replace(result, client=fallback.client)
+        if result.task == UNKNOWN:
+            short_id = item.path.stem.rsplit("-", 1)[-1][:8]
+            result = replace(result, task=_fallback_task_label(item, result.cwd, short_id))
+        return result
+    if item.source in {"omx", "opencode"} and item.identities:
+        label = f"{len(item.identities)} identities" if item.source == "omx" else f"{len(item.identities)} lineage seeds"
+        return _merge_metadata(fallback, SessionMetadata(client=item.source.upper(), task=label))
+    return fallback
+
+
+def external_lineage_registry_path() -> Path:
+    """Return the optional explicit cross-provider lineage registry path."""
+    return Path.home() / ".config" / "claude-watchdog" / "lineage.json"
+
+
+def apply_external_lineage_registry(
+    metadata: dict[tuple[str, str], SessionMetadata],
+    registry_path: Path | None = None,
+) -> dict[tuple[str, str], SessionMetadata]:
+    """Apply exact, bounded external parent declarations to loaded metadata."""
+    result = dict(metadata)
+    path = registry_path or external_lineage_registry_path()
+    try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            return result
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_EXTERNAL_LINEAGE_BYTES + 1)
+        if len(raw) > MAX_EXTERNAL_LINEAGE_BYTES:
+            return result
+        document = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return result
+    if not isinstance(document, dict) or document.get("version") != 1:
+        return result
+    links = document.get("links")
+    if not isinstance(links, list) or len(links) > MAX_EXTERNAL_LINEAGE_LINKS:
+        return result
+
+    identities: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for key, value in result.items():
+        if value.session_id != UNKNOWN:
+            identities.setdefault((key[0], value.session_id), []).append(key)
+
+    declarations: dict[
+        tuple[str, str], list[tuple[tuple[str, str], str]]
+    ] = {}
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        child, parent, evidence = (
+            link.get("child"), link.get("parent"), link.get("evidence")
+        )
+        if not isinstance(child, dict) or not isinstance(parent, dict):
+            continue
+        child_ref = (child.get("source"), child.get("session_id"))
+        parent_ref = (parent.get("source"), parent.get("session_id"))
+        if not all(
+            isinstance(source, str) and source in EXTERNAL_LINEAGE_SOURCES
+            and isinstance(session_id, str) and bool(session_id)
+            for source, session_id in (child_ref, parent_ref)
+        ):
+            continue
+        if not isinstance(evidence, str) or not evidence.strip():
+            continue
+        declarations.setdefault(child_ref, []).append((parent_ref, evidence))
+
+    for child_ref, declared in declarations.items():
+        parent_refs = {parent_ref for parent_ref, _ in declared}
+        if len(parent_refs) != 1:
+            continue
+        child_keys = identities.get(child_ref, [])
+        parent_keys = identities.get(next(iter(parent_refs)), [])
+        if len(child_keys) != 1 or len(parent_keys) != 1:
+            continue
+        child_key, parent_key = child_keys[0], parent_keys[0]
+        child_metadata = result[child_key]
+        if (
+            child_key == parent_key
+            or child_metadata.parent_session_id != UNKNOWN
+        ):
+            continue
+        evidence = sanitize_terminal_text(declared[0][1])
+        parent_source, parent_id = next(iter(parent_refs))
+        detail = clip_cells(
+            f"external parent {parent_source}:{parent_id} · evidence {evidence}",
+            512,
+        )
+        result[child_key] = replace(
+            child_metadata,
+            external_parent_key=parent_key,
+            details=(*child_metadata.details, detail),
+        )
+    return result
+
+
+def load_dashboard_metadata(
+    watch_set: Iterable[ActivityFile], task_label: str = "prompt"
+) -> dict[tuple[str, str], SessionMetadata]:
+    items = list(watch_set)
+    codex_items = [item for item in items if item.source == "codex"]
+    try:
+        codex_values = codex_sqlite_metadata_batch(codex_items)
+    except Exception:
+        codex_values = {}
+    values = {}
+    for item in items:
+        try:
+            if item.source == "codex":
+                fallback = jsonl_metadata(item, task_label=task_label)
+                value = _merge_metadata(
+                    codex_values.get(target_key(item), SessionMetadata()), fallback
+                )
+                if fallback.client != UNKNOWN:
+                    value = replace(value, client=fallback.client)
+                if value.task == UNKNOWN:
+                    short_id = item.path.stem.rsplit("-", 1)[-1][:8]
+                    value = replace(value, task=_fallback_task_label(item, value.cwd, short_id))
+                values[target_key(item)] = value
+            else:
+                values[target_key(item)] = load_session_metadata(item, task_label=task_label)
+        except Exception:
+            values[target_key(item)] = SessionMetadata()
+    return apply_external_lineage_registry(values)
+
+
+# --- dashboard presentation -------------------------------------------------
+
+
+def resolve_display(requested: str, stdin=None, stdout=None) -> str:
+    if requested != "auto":
+        return requested
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    term = os.environ.get("TERM", "")
+    try:
+        capable = stdin.isatty() and stdout.isatty() and bool(term) and term.lower() != "dumb"
+    except (AttributeError, OSError):
+        capable = False
+    return "dashboard" if capable else "log"
+
+
+def colors_enabled(cfg: Config) -> bool:
+    return not cfg.no_color and "NO_COLOR" not in os.environ
+
+
+def make_dashboard_snapshot(
+    now: datetime,
+    cfg: Config,
+    watch_set: list[ActivityFile],
+    activity: list[tuple[ActivityFile, datetime]],
+    user_idle: float,
+    next_poll_seconds: float,
+    metadata: dict[tuple[str, str], SessionMetadata],
+    admission_notice: str = "",
+) -> DashboardSnapshot:
+    timestamps = {target_key(item): timestamp for item, timestamp in activity}
+    rows = []
+    for item in watch_set:
+        key = target_key(item)
+        meta = metadata.get(key, SessionMetadata())
+        timestamp = timestamps.get(key)
+        age = _activity_age(now, timestamp) if timestamp else None
+        remaining = max(0.0, cfg.idle_seconds - age) if age is not None else 0.0
+        rows.append(SessionRow(
+            key, item.source, meta.client, meta.task, meta.model, meta.effort,
+            meta.started, timestamp, remaining, str(item.path), len(item.identities),
+            meta.provenance, age is not None and age < cfg.idle_seconds, meta.agent,
+            meta.details, meta.session_id, meta.parent_session_id,
+            meta.lineage_namespace, meta.children,
+            external_parent_key=meta.external_parent_key,
+        ))
+    holding = sum(row.holding for row in rows)
+    return DashboardSnapshot(
+        now, tuple(rows), len(watch_set), holding, holding == 0, user_idle,
+        cfg.user_idle_seconds, next_poll_seconds, cfg.source,
+        cfg.session_discovery, cfg.idle_seconds, admission_notice,
+    )
+
+
+def _dashboard_parent_keys(
+    rows: Iterable[SessionRow],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """Resolve safe, provider-local parent links for visible dashboard rows."""
+    row_list = list(rows)
+    row_keys: dict[tuple[str, str], list[SessionRow]] = {}
+    for row in row_list:
+        row_keys.setdefault(row.key, []).append(row)
+    identities: dict[tuple[str, str, str], list[SessionRow]] = {}
+    for row in row_list:
+        if row.session_id != UNKNOWN:
+            identities.setdefault(
+                (row.source, row.lineage_namespace, row.session_id), []
+            ).append(row)
+    parents = {}
+    for row in row_list:
+        matches = identities.get(
+            (row.source, row.lineage_namespace, row.parent_session_id), []
+        )
+        if len(matches) == 1 and matches[0].key != row.key:
+            parents[row.key] = matches[0].key
+        elif row.parent_session_id == UNKNOWN and row.external_parent_key is not None:
+            external_matches = row_keys.get(row.external_parent_key, [])
+            if len(external_matches) == 1 and external_matches[0].key != row.key:
+                parents[row.key] = external_matches[0].key
+
+    cyclic = set()
+    for row in row_list:
+        path, positions = [], {}
+        current = row.key
+        while current in parents and current not in positions:
+            positions[current] = len(path)
+            path.append(current)
+            current = parents[current]
+        if current in positions:
+            cyclic.update(path[positions[current]:])
+    for key in cyclic:
+        parents.pop(key, None)
+    return parents
+
+
+def _dashboard_sort_key(row: SessionRow, sort: str):
+    if sort == "title":
+        return (row.task.casefold(), row.source, row.path)
+    if sort == "source":
+        return (row.source, row.task.casefold(), row.path)
+    return (
+        row.last_event is None,
+        -(row.last_event.timestamp() if row.last_event else 0),
+        row.path,
+    )
+
+
+def _expanded_dashboard_rows(rows: Iterable[SessionRow]) -> list[SessionRow]:
+    """Expand grouped metadata into descriptive rows without adding activity guards."""
+    expanded = []
+    for row in rows:
+        if not row.children:
+            expanded.append(row)
+            continue
+        namespace = row.lineage_namespace if row.lineage_namespace != UNKNOWN else row.path
+        group_id = f"watchdog-group:{row.path}"
+        expanded.append(replace(row, session_id=group_id, lineage_namespace=namespace))
+        child_ids = {child.session_id for child in row.children}
+        for child in row.children:
+            parent_id = (
+                child.parent_session_id
+                if child.parent_session_id in child_ids else group_id
+            )
+            expanded.append(SessionRow(
+                key=(row.source, f"{row.path}#session={child.session_id}"),
+                source=row.source, client=row.client, task=child.task,
+                model=child.model, effort=child.effort, started=child.started,
+                last_event=None, quiet_remaining=0.0, path=row.path,
+                identity_count=0, provenance=row.provenance, holding=False,
+                agent=child.agent, session_id=child.session_id,
+                parent_session_id=parent_id, lineage_namespace=namespace,
+                display_only=True,
+            ))
+    return expanded
+
+
+def dashboard_tree_prefixes(
+    rows: Iterable[SessionRow],
+) -> dict[tuple[str, str], str]:
+    """Return pstree-style prefixes for already ordered visible rows."""
+    row_list = list(rows)
+    parents = _dashboard_parent_keys(row_list)
+    children: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for row in row_list:
+        parent = parents.get(row.key)
+        if parent is not None:
+            children.setdefault(parent, []).append(row.key)
+    prefixes = {}
+    for row in row_list:
+        if row.key not in parents:
+            prefixes[row.key] = ""
+            continue
+        lineage = []
+        current = row.key
+        while current in parents:
+            parent = parents[current]
+            siblings = children.get(parent, [])
+            lineage.append(current == siblings[-1] if siblings else True)
+            current = parent
+        lineage.reverse()
+        prefixes[row.key] = "".join(
+            ("   " if is_last else "│  ") if index < len(lineage) - 1
+            else ("└─ " if is_last else "├─ ")
+            for index, is_last in enumerate(lineage)
+        )
+    return prefixes
+
+
+def visible_dashboard_rows(rows: Iterable[SessionRow], state: DashboardState) -> list[SessionRow]:
+    query = state.query.casefold()
+    visible = [row for row in _expanded_dashboard_rows(rows) if (
+        state.source_filter is None or row.source == state.source_filter
+    ) and (
+        not query or query in " ".join((row.source, row.client, row.task, row.model, row.effort)).casefold()
+    )]
+    visible.sort(key=lambda row: _dashboard_sort_key(row, state.sort))
+    if not state.tree:
+        return visible
+
+    parents = _dashboard_parent_keys(visible)
+    children: dict[tuple[str, str], list[SessionRow]] = {}
+    for row in visible:
+        parent = parents.get(row.key)
+        if parent is not None:
+            children.setdefault(parent, []).append(row)
+    ordered, visited = [], set()
+
+    def append_subtree(root):
+        pending = [root]
+        while pending:
+            row = pending.pop()
+            if row.key in visited:
+                continue
+            visited.add(row.key)
+            ordered.append(row)
+            pending.extend(reversed(children.get(row.key, [])))
+
+    for row in visible:
+        if row.key not in parents:
+            append_subtree(row)
+    for row in visible:
+        append_subtree(row)
+    return ordered
+
+
+def retain_dashboard_selection(state: DashboardState, rows: list[SessionRow]) -> None:
+    if not rows:
+        state.selected = state.scroll = 0
+        state.selected_key = None
+        return
+    if state.selected_key is not None:
+        for index, row in enumerate(rows):
+            if row.key == state.selected_key:
+                state.selected = index
+                break
+    state.selected = min(max(0, state.selected), len(rows) - 1)
+    state.selected_key = rows[state.selected].key
+
+
+def handle_dashboard_key(state: DashboardState, key: int | str, row_count: int) -> str | None:
+    if key in {-1, None}:
+        return None
+    code = ord(key) if isinstance(key, str) and len(key) == 1 else key
+    if state.filter_input:
+        if code == 27:
+            state.query = state.query_before_edit
+            state.filter_input = False
+        elif code in {10, 13}:
+            state.filter_input = False
+        elif code in {8, 127, 263}:
+            state.query = state.query[:-1]
+        elif isinstance(key, str) and len(key) == 1 and key.isprintable():
+            state.query += key
+        elif isinstance(code, int) and 32 <= code < 256 and chr(code).isprintable():
+            state.query += chr(code)
+        return "filter"
+    if code in {ord("q"), 3}:
+        raise KeyboardInterrupt
+    if code == ord("/"):
+        state.query_before_edit = state.query
+        state.filter_input = True
+        return "filter"
+    if code in {ord("p"), ord("f")}:
+        choices = (None, *ALL_SOURCES)
+        try:
+            state.source_filter = choices[(choices.index(state.source_filter) + 1) % len(choices)]
+        except ValueError:
+            state.source_filter = None
+    elif code == ord("s"):
+        state.sort = SORT_CHOICES[(SORT_CHOICES.index(state.sort) + 1) % len(SORT_CHOICES)]
+    elif code == ord("t"):
+        state.tree = not state.tree
+    elif code == ord("c"):
+        state.query = ""
+        state.source_filter = None
+    elif code in {ord("j"), 258} and row_count:
+        state.selected = min(row_count - 1, state.selected + 1)
+        state.selected_key = None
+    elif code in {ord("k"), 259} and row_count:
+        state.selected = max(0, state.selected - 1)
+        state.selected_key = None
+    elif code in {10, 13}:
+        state.details = not state.details
+    return None
+
+
+def _relative_age(now: datetime, value: datetime | None) -> str:
+    if value is None:
+        return UNKNOWN
+    seconds = max(0, int((now - value).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def _duration(value: float) -> str:
+    seconds = max(0, int(value))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def _local_clock(value: datetime | None) -> str:
+    if value is None:
+        return UNKNOWN
+    try:
+        return value.astimezone().strftime("%H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return UNKNOWN
+
+
+def _report_clock(value: datetime | None) -> str:
+    if value is None:
+        return UNKNOWN
+    try:
+        return value.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except (OverflowError, OSError, ValueError):
+        return UNKNOWN
+
+
+def _quiet_deadline(value: datetime | None, idle_seconds: float) -> datetime | None:
+    try:
+        return value + timedelta(seconds=idle_seconds) if value is not None else None
+    except OverflowError:
+        return None
+
+
+def _report_duration(seconds: float) -> str:
+    hours, remainder = divmod(max(0, int(seconds)), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return " ".join(f"{value}{unit}" for value, unit in ((hours, "h"), (minutes, "m"), (seconds, "s")) if value) or "0s"
+
+
+class WatchHistory:
+    """Bounded observations from real polls, independent of UI repaint and filters."""
+    def __init__(self):
+        self.started: datetime | None = None
+        self.snapshot: DashboardSnapshot | None = None
+        self.events: deque[tuple[datetime, str]] = deque(maxlen=256)
+
+    @staticmethod
+    def user_ready(snapshot: DashboardSnapshot) -> bool:
+        return snapshot.user_idle_required == 0 or (
+            snapshot.user_idle is not None and snapshot.user_idle >= snapshot.user_idle_required
+        )
+
+    def observe(self, snapshot: DashboardSnapshot) -> None:
+        previous = self.snapshot
+        self.started = self.started or snapshot.now
+        self.snapshot = snapshot
+        messages = []
+        if previous is None:
+            messages.append(f"First observation: {snapshot.holding_count} holding / {snapshot.watched_count} targets")
+        elif snapshot.session_quiet and not previous.session_quiet:
+            messages.append("All session guards quiet; quiet countdown complete")
+        elif previous.session_quiet and not snapshot.session_quiet:
+            messages.append("Recorded activity resumed; quiet countdown reset")
+        elif snapshot.holding_count != previous.holding_count:
+            messages.append(f"{snapshot.holding_count} holding / {snapshot.watched_count} targets")
+        if snapshot.admission_notice:
+            messages.append(sanitize_terminal_text(snapshot.admission_notice))
+        if snapshot.session_quiet:
+            if (previous is not None and previous.session_quiet and
+                    previous.user_idle is not None and snapshot.user_idle is not None and
+                    snapshot.user_idle < previous.user_idle):
+                messages.append("User-idle timer reset by input")
+            if previous is None or not previous.session_quiet or self.user_ready(snapshot) != self.user_ready(previous):
+                if self.user_ready(snapshot):
+                    messages.append("User-idle gate satisfied; all guards ready")
+                else:
+                    remaining = max(0, snapshot.user_idle_required - (snapshot.user_idle or 0))
+                    messages.append(f"Waiting for user-idle gate: {_duration(remaining)} remaining if no input")
+        checkpoint = not self.events or (snapshot.now - self.events[-1][0]).total_seconds() >= 900
+        if messages or checkpoint:
+            newest = max((row.last_event for row in snapshot.rows if row.last_event is not None), default=None)
+            if not messages:
+                messages.append(f"Checkpoint: {snapshot.holding_count} holding / {snapshot.watched_count} targets")
+            if snapshot.session_quiet and snapshot.user_idle_required:
+                remaining = max(0, snapshot.user_idle_required - (snapshot.user_idle or 0))
+                messages.append(f"user {_report_duration(snapshot.user_idle or 0)} idle / "
+                                f"{_report_duration(snapshot.user_idle_required)} required; "
+                                f"{_report_duration(remaining)} remaining if no input")
+            if not snapshot.session_quiet and newest is not None:
+                remaining = max(0, snapshot.idle_seconds - (snapshot.now - newest).total_seconds())
+                messages.append(f"quiet in {_duration(remaining)} if no new activity; last event {_report_clock(newest)}")
+            self.events.append((snapshot.now, "; ".join(messages)))
+        cutoff = snapshot.now - timedelta(hours=6)
+        while self.events and self.events[0][0] < cutoff:
+            self.events.popleft()
+
+
+def exit_report_lines(
+    history: WatchHistory, cfg: Config, status: int, reason: str, *, color: bool = False,
+) -> list[str]:
+    """Normal-screen summary: printable text plus optional SGR, never cursor controls."""
+    def paint(value: str, code: int | None = None, bold: bool = False) -> str:
+        text = clip_cells(value, 512)
+        if not color:
+            return text
+        style = "1" if bold else (f"38;5;{code}" if code is not None and code >= 8 else str(30 + code) if code is not None else "0")
+        return f"\x1b[{style}m{text}\x1b[0m"
+
+    outcome = "STOPPED — sleep skipped" if status == 130 else "ERROR — sleep skipped" if status else (
+        "DRY RUN — no sleep request" if cfg.dry_run else "SLEEP READY — sleep request follows"
+    )
+    lines = ["", paint("CLAUDE WATCHDOG — RUN REPORT", bold=True), paint(outcome, bold=True)]
+    if status and reason:
+        lines.append(paint(reason))
+    snapshot = history.snapshot
+    if snapshot is None:
+        lines.append("No successful session observation was captured.")
+        lines.append(f"Detailed poll log: {paint(str(LOG_FILE))}")
+        return lines
+    lines.extend([
+        f"Observed run: {_report_clock(history.started)} → {_report_clock(snapshot.now)}",
+        f"Final poll: {snapshot.holding_count} holding / {snapshot.watched_count} targets; quiet threshold {cfg.idle_minutes:g}m",
+        "Recorded activity indicates recency, not task completion or process liveness.",
+        "",
+        paint("COUNTDOWN AND SLEEP GATES", bold=True),
+    ])
+    newest = max((row.last_event for row in snapshot.rows if row.last_event is not None), default=None)
+    if newest is None:
+        lines.append("No usable recorded activity timestamp at the final poll.")
+    else:
+        lines.extend([
+            f"Last recorded activity / countdown anchor: {_report_clock(newest)}",
+            f"Quiet deadline (if no newer activity): {_report_clock(_quiet_deadline(newest, snapshot.idle_seconds))}",
+        ])
+    lines.append(f"Session guards at final poll: {'QUIET' if snapshot.session_quiet else 'HOLDING'}")
+    user_gate = "disabled" if snapshot.user_idle_required == 0 else (
+        "not checked yet (sessions still holding)" if snapshot.user_idle is None else
+        f"{_report_duration(snapshot.user_idle)} idle / {_report_duration(snapshot.user_idle_required)} required — "
+        f"{'satisfied' if history.user_ready(snapshot) else 'waiting'}"
+    )
+    lines.extend([f"User-idle gate: {user_gate}", "", paint("RECENT TIMELINE — last 6 hours, up to 256 milestones", bold=True)])
+    for at, message in history.events:
+        lines.append(f"  {_report_clock(at)}")
+        lines.extend(textwrap.wrap(sanitize_terminal_text(message), width=100, initial_indent="    ", subsequent_indent="    "))
+    lines.extend(["", paint("FINAL SESSIONS — last successful poll, all targets", bold=True)])
+    palette = TerminalDashboard.LABEL_COLORS if "256color" in os.environ.get("TERM", "") else (6, 5, 2, 3, 4, 1)
+    clients: dict[str, int] = {}
+    models: dict[str, int] = {}
+    for row in snapshot.rows:
+        for value, mapping in ((row.client, clients), (row.model, models)):
+            if value != UNKNOWN and value not in mapping:
+                mapping[value] = palette[len(mapping) % len(palette)]
+    rows = sorted(snapshot.rows, key=lambda row: row.last_event or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    for index, row in enumerate(rows, 1):
+        source = paint(row.source.upper(), TerminalDashboard.SOURCE_COLORS.get(row.source))
+        client = paint(row.client, clients.get(row.client))
+        model = row.model if row.effort == UNKNOWN else f"{row.model} / {row.effort}"
+        label = row.task if row.task != UNKNOWN else Path(row.path).name
+        lines.extend([
+            f"  {index:02d}  {source} | {client} | {paint(label)}",
+            f"      {paint(model, models.get(row.model))}",
+            f"      Last event: {_report_clock(row.last_event)} | Quiet at: {_report_clock(_quiet_deadline(row.last_event, snapshot.idle_seconds))}",
+            f"      State: {'holding' if row.holding else 'quiet' if row.last_event else 'unavailable'} | Started: {_report_clock(row.started)}",
+            f"      agent {paint(row.agent)} | {row.identity_count} identities | metadata {paint(row.provenance)}",
+            f"      Path: {paint(row.path)}",
+        ])
+        lines.extend(f"      {paint(detail)}" for detail in row.details)
+    lines.extend(["", f"Detailed poll log: {sanitize_terminal_text(str(LOG_FILE))}", ""])
+    return lines
+
+
+def emit_exit_report(history: WatchHistory, cfg: Config, status: int, reason: str) -> None:
+    color = colors_enabled(cfg) and sys.stdout.isatty() and os.environ.get("TERM", "dumb").lower() != "dumb"
+    sys.stdout.write("\n".join(exit_report_lines(history, cfg, status, reason, color=color)) + "\n")
+    sys.stdout.flush()
+
+
+class TerminalDashboard:
+    SOURCE_COLORS = {"claude": 3, "codex": 6, "omx": 5, "opencode": 2, "claudex": 4, "marjory": 5}
+    LABEL_COLORS = (81, 213, 114, 221, 147, 208, 45, 177, 156, 204, 180, 117)
+
+    def __init__(self, screen, cfg: Config, curses_module=None):
+        self.screen = screen
+        self.cfg = cfg
+        self.curses = curses_module
+        self.state = DashboardState()
+        self.snapshot: DashboardSnapshot | None = None
+        self.history = WatchHistory()
+        self._color_pairs: dict[str, int] = {}
+        self._label_palette: list[int] = []
+        self._label_colors: dict[str, dict[str, int]] = {"client": {}, "model": {}}
+        self._configure_colors()
+
+    def _configure_colors(self) -> None:
+        if not colors_enabled(self.cfg) or self.curses is None:
+            return
+        try:
+            if not self.curses.has_colors():
+                return
+            self.curses.start_color()
+            background = -1
+            try:
+                self.curses.use_default_colors()
+            except Exception:
+                background = 0
+            palette = self.LABEL_COLORS if self.curses.COLORS >= 256 else (6, 5, 2, 3, 4, 1)
+            foregrounds = list(dict.fromkeys((*self.SOURCE_COLORS.values(), *palette)))
+            attributes = {}
+            for pair, color in enumerate(foregrounds[:max(0, self.curses.COLOR_PAIRS - 1)], 1):
+                self.curses.init_pair(pair, color, background)
+                attributes[color] = self.curses.color_pair(pair)
+            self._color_pairs = {source: attributes.get(color, 0) for source, color in self.SOURCE_COLORS.items()}
+            self._label_palette = [attributes[color] for color in palette if color in attributes]
+        except Exception:
+            self._color_pairs.clear()
+            self._label_palette.clear()
+
+    def _label_attr(self, category: str, value: str) -> int:
+        if value == UNKNOWN or not self._label_palette:
+            return 0
+        assigned = self._label_colors[category]
+        if value not in assigned:
+            assigned[value] = self._label_palette[len(assigned) % len(self._label_palette)]
+        return assigned[value]
+
+    def _put(self, y: int, text: str, *, attr=0, x=0) -> None:
+        height, width = self.screen.getmaxyx()
+        if not (0 <= y < height) or not (0 <= x < width - 1):
+            return
+        layout = _sanitize_terminal_chars(text, collapse_spacing=False)
+        safe = _clip_text_cells(layout, width - x - 1)
+        try:
+            self.screen.addnstr(y, x, safe, width - x - 1, attr)
+        except Exception:
+            pass
+
+    def update(self, snapshot: DashboardSnapshot) -> None:
+        self.snapshot = snapshot
+        # Assign before filtering so hiding a row cannot change another label's color.
+        for row in snapshot.rows:
+            self._label_attr("client", row.client)
+            self._label_attr("model", row.model)
+        rows = visible_dashboard_rows(snapshot.rows, self.state)
+        tree_prefixes = dashboard_tree_prefixes(rows) if self.state.tree else {}
+        retain_dashboard_selection(self.state, rows)
+        height, width = self.screen.getmaxyx()
+        try:
+            self.screen.erase()
+        except Exception:
+            return
+        state_word = "AWAKE" if snapshot.holding_count else "SESSIONS QUIET"
+        self._put(0, f"CLAUDE WATCHDOG  {state_word} · {snapshot.holding_count} holding / {snapshot.watched_count} targets   next scan {_duration(snapshot.next_poll_seconds)}   {snapshot.discovery} · {snapshot.source}")
+        gate = (
+            f"session quiet {int(snapshot.idle_seconds // 60)}m · user idle pending (checked after sessions quiet)"
+            if snapshot.holding_count else
+            f"sessions quiet · user idle {int(snapshot.user_idle or 0)}s / {int(snapshot.user_idle_required)}s"
+        )
+        self._put(1, gate)
+        body_start = 3
+        footer_lines = 3
+        # Reserve source, client, age, countdown and separators. Give model
+        # labels enough room before assigning the rest to task descriptions.
+        client_width = 14
+        model_width = 20
+        task_width = 35
+        if width >= 100:
+            desired_client = max(14, max((text_cells(row.client) for row in rows), default=14))
+            extra = max(0, width - 34 - 14 - 20 - 16)
+            client_width = 14 + min(extra, desired_client - 14)
+            extra -= client_width - 14
+            desired_model = max((text_cells(row.model if row.effort == UNKNOWN else
+                                           f"{row.model} / {row.effort}") for row in rows), default=20)
+            model_width = 20 + min(extra, max(0, desired_model - 20))
+            task_width = width - 34 - client_width - model_width
+        elif width >= 80:
+            task_width = width - 48
+        model_x = 14 + client_width + task_width if width >= 100 else 13 + task_width
+        if width >= 100:
+            self._put(2, f"  {pad_cells('SOURCE', 9)} {pad_cells('CLIENT', client_width)} "
+                      f"{pad_cells('TASK / AGENT TREE' if self.state.tree else 'TASK', task_width)} {pad_cells('MODEL / EFFORT', model_width)} "
+                      f"{'LAST':>7} {'QUIET IN':>10}")
+        elif width >= 80:
+            self._put(2, f"  {pad_cells('SOURCE', 9)} {pad_cells('TASK', task_width)} "
+                      f"{pad_cells('MODEL / EFFORT', model_width)} {'LAST':>6} {'QUIET':>6}")
+        else:
+            self._put(2, "  SOURCE · TASK                         LAST · QUIET")
+        detail_lines = []
+        if self.state.details and rows:
+            available = max(0, height - body_start - footer_lines - 3)
+            detail_lines = list(rows[self.state.selected].details[:min(8, available)])
+            if detail_lines and len(rows[self.state.selected].details) > len(detail_lines):
+                detail_lines[-1] = "More session details available in the final run report."
+        capacity = max(0, height - body_start - footer_lines - (2 if self.state.details else 0) - len(detail_lines))
+        if self.state.selected < self.state.scroll:
+            self.state.scroll = self.state.selected
+        if self.state.selected >= self.state.scroll + max(1, capacity):
+            self.state.scroll = self.state.selected - capacity + 1
+        shown = rows[self.state.scroll:self.state.scroll + capacity]
+        if not shown and capacity:
+            self._put(body_start, "No watched sessions match this filter")
+        for offset, row in enumerate(shown):
+            index = self.state.scroll + offset
+            marker = "▸" if index == self.state.selected else " "
+            last = _relative_age(snapshot.now, row.last_event)
+            current_age = (
+                max(0.0, (snapshot.now - row.last_event).total_seconds())
+                if row.last_event is not None else None
+            )
+            displayed_remaining = (
+                max(0.0, snapshot.idle_seconds - current_age)
+                if current_age is not None else 0.0
+            )
+            quiet = _duration(displayed_remaining) if row.holding else "quiet"
+            if row.display_only:
+                last = quiet = "group"
+            model = row.model if row.effort == UNKNOWN else f"{row.model} / {row.effort}"
+            task_text = tree_prefixes.get(row.key, "") + sanitize_terminal_text(row.task)
+            task_text = _clip_text_cells(task_text, task_width)
+            task_cell = task_text + " " * max(0, task_width - text_cells(task_text))
+            if width >= 100:
+                line = (
+                    f"{marker} {pad_cells(row.source.upper(), 9)} "
+                    f"{pad_cells(row.client, client_width)} {task_cell} "
+                    f"{pad_cells(model, model_width)} {last:>7} {quiet:>10}"
+                )
+            elif width >= 80:
+                line = (
+                    f"{marker} {pad_cells(row.source.upper(), 9)} "
+                    f"{task_cell} {pad_cells(model, 20)} "
+                    f"{last:>6} {quiet:>6}"
+                )
+            else:
+                fixed_width = text_cells(f"{marker} {row.source.upper()} ·    {last} · {quiet}")
+                task = _clip_text_cells(tree_prefixes.get(row.key, "") + sanitize_terminal_text(row.task),
+                                        max(4, width - fixed_width - 1))
+                line = f"{marker} {row.source.upper()} · {task}   {last} · {quiet}"
+            attr = 0
+            if index == self.state.selected and self.curses is not None:
+                attr |= getattr(self.curses, "A_REVERSE", 0)
+            self._put(body_start + offset, line, attr=attr)
+            if self._color_pairs:
+                self._put(body_start + offset, row.source.upper(), x=2,
+                          attr=attr | self._color_pairs.get(row.source, 0))
+                if width >= 100:
+                    self._put(body_start + offset, pad_cells(row.client, client_width), x=12,
+                              attr=attr | self._label_attr("client", row.client))
+                if width >= 80:
+                    self._put(body_start + offset, pad_cells(model, model_width), x=model_x,
+                              attr=attr | self._label_attr("model", row.model))
+        footer_y = max(body_start, height - footer_lines)
+        if self.state.details and rows and footer_y >= 2:
+            row = rows[self.state.selected]
+            started = _local_clock(row.started)
+            event = _local_clock(row.last_event)
+            agent = f" · agent {row.agent}" if row.agent != UNKNOWN else ""
+            self._put(footer_y - 2 - len(detail_lines), f"selected: started {started} · event {event} · {row.client}{agent} · {row.model} / {row.effort}")
+            parent = f" · parent {row.parent_session_id}" if row.parent_session_id != UNKNOWN else ""
+            identity = f" · session {row.session_id}" if row.session_id != UNKNOWN else ""
+            scope = " · timing belongs to database guard" if row.display_only else ""
+            self._put(footer_y - 1 - len(detail_lines), f"metadata {row.provenance}{identity}{parent}{scope} · path {row.path}")
+            for index, detail in enumerate(detail_lines):
+                self._put(footer_y - len(detail_lines) + index, detail)
+        prompt = (
+            f"filter: {self.state.query}_"
+            if self.state.filter_input else
+            "q exit safely  / filter  p/f provider  s sort  t tree/flat  ↑↓/jk move  Enter details  c clear"
+        )
+        self._put(footer_y, prompt)
+        provider = self.state.source_filter or "all"
+        notice = f" · + {snapshot.admission_notice}" if snapshot.admission_notice else ""
+        self._put(
+            footer_y + 1,
+            f"showing {len(rows)} rows · {snapshot.watched_count} watch targets · provider {provider} · "
+            f"{'tree' if self.state.tree else 'flat'} · sort {self.state.sort} · task {self.cfg.task_label}{notice}",
+        )
+        self._put(footer_y + 2, "persisted activity, not process liveness")
+        try:
+            self.screen.refresh()
+        except Exception:
+            pass
+
+    def process_input(self) -> None:
+        get_wch = getattr(self.screen, "get_wch", None)
+        try:
+            key = get_wch() if get_wch is not None else self.screen.getch()
+        except Exception as exc:
+            curses_error = getattr(self.curses, "error", None)
+            if isinstance(curses_error, type) and isinstance(exc, curses_error):
+                key = -1
+            else:
+                raise
+        rows = visible_dashboard_rows(self.snapshot.rows, self.state) if self.snapshot else []
+        handle_dashboard_key(self.state, key, len(rows))
+        if self.snapshot is not None and key != -1:
+            self.update(self.snapshot)
+
+    def wait(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        last_second = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self.process_input()
+            second = int(remaining)
+            if self.snapshot is not None and second != last_second:
+                self.update(replace(self.snapshot, next_poll_seconds=remaining, now=datetime.now(timezone.utc)))
+                last_second = second
+            time.sleep(min(0.1, remaining))
+
+
+def _import_curses():
+    import curses
+    return curses
+
+
+def _dashboard_sigterm(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+@contextmanager
+def dashboard_context(cfg: Config):
+    curses = None
+    screen = None
+    removed: list[tuple[int, logging.Handler]] = []
+    prior_sigterm = None
+    try:
+        curses = _import_curses()
+        if signal.getsignal(signal.SIGTERM) is not signal.SIG_IGN:
+            prior_sigterm = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, _dashboard_sigterm)
+        screen = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        screen.keypad(True)
+        screen.nodelay(True)
+        try:
+            curses.curs_set(0)
+        except Exception:
+            pass
+        for index, handler in reversed(list(enumerate(log.handlers))):
+            if getattr(handler, "stream", None) is sys.stdout:
+                removed.append((index, handler))
+                log.removeHandler(handler)
+        yield TerminalDashboard(screen, cfg, curses)
+    except KeyboardInterrupt:
+        raise
+    except WatchdogError:
+        raise
+    except Exception as exc:
+        raise WatchdogError(f"terminal dashboard unavailable: {exc}") from exc
+    finally:
+        cleanup_interrupt = None
+        cleanup_error = None
+        if screen is not None:
+            for cleanup in (
+                lambda: screen.keypad(False),
+                curses.nocbreak,
+                curses.echo,
+                curses.endwin,
+            ):
+                try:
+                    cleanup()
+                except KeyboardInterrupt as exc:
+                    cleanup_interrupt = cleanup_interrupt or exc
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
+        try:
+            for index, handler in sorted(removed):
+                log.handlers.insert(min(index, len(log.handlers)), handler)
+        except KeyboardInterrupt as exc:
+            cleanup_interrupt = cleanup_interrupt or exc
+        if prior_sigterm is not None:
+            while True:
+                try:
+                    signal.signal(signal.SIGTERM, prior_sigterm)
+                    break
+                except KeyboardInterrupt as exc:
+                    cleanup_interrupt = cleanup_interrupt or exc
+        if cleanup_interrupt is not None:
+            raise cleanup_interrupt
+        if cleanup_error is not None:
+            raise TerminalRestoreError(f"unable to restore terminal: {cleanup_error}") from cleanup_error
+
+
+def dashboard_lines(
+    snapshot: DashboardSnapshot,
+    state: DashboardState | None = None,
+    *,
+    width: int = 120,
+    height: int = 24,
+) -> list[str]:
+    """Render a deterministic, terminal-free frame for tests and visual review."""
+    class FrameScreen:
+        def __init__(self):
+            self.lines: dict[int, str] = {}
+
+        def getmaxyx(self):
+            return height, width
+
+        def erase(self):
+            self.lines.clear()
+
+        def addnstr(self, y, x, text, count, *attrs):
+            self.lines[y] = text[:count]
+
+        def refresh(self):
+            pass
+
+    screen = FrameScreen()
+    dashboard = TerminalDashboard(screen, Config(no_color=True))
+    dashboard.state = state or DashboardState()
+    dashboard.update(snapshot)
+    return [screen.lines.get(y, "") for y in range(height)]
+
+
+# --- macOS power + presence --------------------------------------------------
+
+
+def user_idle_seconds() -> float:
+    """Return HID idle seconds, or raise when macOS presence is unavailable."""
+    try:
+        output = subprocess.check_output(
+            ["ioreg", "-c", "IOHIDSystem"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise PresenceCheckError(f"unable to query HID idle time: {exc}") from exc
+
+    for line in output.splitlines():
+        if "HIDIdleTime" not in line:
+            continue
+        try:
+            value = int(line.rsplit("=", 1)[1].strip()) / 1_000_000_000
+        except (ValueError, IndexError) as exc:
+            raise PresenceCheckError("ioreg returned an invalid HIDIdleTime value") from exc
+        if value < 0:
+            raise PresenceCheckError("ioreg returned a negative HIDIdleTime value")
+        return value
+    raise PresenceCheckError("ioreg output did not contain HIDIdleTime")
+
+
+def block_sleep() -> subprocess.Popen:
+    """Hold the Mac awake (idle + system sleep) until this process exits."""
+    return subprocess.Popen(["caffeinate", "-is", "-w", str(os.getpid())])
+
+
+def _stop_caffeinate(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    except ProcessLookupError:
+        pass  # The owned child exited between poll() and terminate().
+
+
+def force_sleep(dry_run: bool) -> None:
+    """Force the Mac to sleep now, unless ``dry_run`` is enabled."""
+    if dry_run:
+        log.info("[dry-run] would run: pmset sleepnow")
+        return
+    try:
+        subprocess.run(
+            ["pmset", "sleepnow"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise PowerCommandError(f"unable to run pmset sleepnow: {exc}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        suffix = f": {detail[:300]}" if detail else ""
+        raise PowerCommandError(
+            f"pmset sleepnow failed with exit status {exc.returncode}{suffix}"
+        ) from exc
+
+
+# --- watch loop --------------------------------------------------------------
+
+
+def _source_guard_status(
+    now: datetime,
+    idle_seconds: float,
+    watch_set: list[ActivityFile],
+    activity: list[tuple[ActivityFile, datetime]],
+) -> str:
+    """Summarize how each provider affects the content-recency sleep guard."""
+    source_order = list(dict.fromkeys(item.source for item in watch_set))
+    freshest_by_source: dict[str, datetime] = {}
+    for item, timestamp in activity:
+        previous = freshest_by_source.get(item.source)
+        if previous is None or timestamp > previous:
+            freshest_by_source[item.source] = timestamp
+
+    parts: list[str] = []
+    for source in source_order:
+        count = sum(item.source == source for item in watch_set)
+        timestamp = freshest_by_source.get(source)
+        age = _activity_age(now, timestamp) if timestamp is not None else None
+        state = "holding" if age is not None and age < idle_seconds else "quiet"
+        event_age = "unavailable" if age is None else f"{int(age)}s ago"
+        if source == "opencode":
+            signal = "database activity"
+            noun = "database" if count == 1 else "databases"
+        else:
+            signal = "JSONL event"
+            noun = "file" if count == 1 else "files"
+        parts.append(
+            f"{source}={state} (last {signal} {event_age}; {count} {noun})"
+        )
+    return ", ".join(parts)
+
+
+def _log_admissions(
+    previous: list[ActivityFile], current: list[ActivityFile]
+) -> None:
+    previous_by_key = {(item.source, item.path): item for item in previous}
+    for item in current:
+        prior = previous_by_key.get((item.source, item.path))
+        if prior is None:
+            if item.source == "omx":
+                log.info(
+                    "admitted new activity target: %s (%d OMX identity/identities)",
+                    item.label,
+                    len(item.identities),
+                )
+            elif item.source == "opencode":
+                log.info(
+                    "admitted new activity target: %s (%d OpenCode lineage seed(s))",
+                    item.label,
+                    len(item.identities),
+                )
+            else:
+                log.info("admitted new activity target: %s", item.label)
+            continue
+        added = item.identities - prior.identities
+        if added and item.source == "omx":
+            log.info(
+                "admitted %d new OMX identity/identities for %s",
+                len(added),
+                item.label,
+            )
+        elif added and item.source == "opencode":
+            log.info(
+                "admitted %d new OpenCode lineage seed(s) for %s",
+                len(added),
+                item.label,
+            )
+
+
+def dashboard_admission_notice(
+    previous: list[ActivityFile], current: list[ActivityFile]
+) -> str:
+    """Describe additive target/identity changes without changing stable row keys."""
+    previous_by_key = {target_key(item): item for item in previous}
+    new_targets = 0
+    identity_counts: dict[str, int] = {}
+    for item in current:
+        prior = previous_by_key.get(target_key(item))
+        if prior is None:
+            new_targets += 1
+            continue
+        added = item.identities - prior.identities
+        if added:
+            identity_counts[item.source] = identity_counts.get(item.source, 0) + len(added)
+    parts = []
+    if new_targets:
+        noun = "target" if new_targets == 1 else "targets"
+        parts.append(f"admitted {new_targets} new {noun}")
+    for source, count in sorted(identity_counts.items()):
+        if source == "opencode":
+            noun = "lineage seed" if count == 1 else "lineage seeds"
+            parts.append(f"admitted {count} new OpenCode {noun}")
+        else:
+            noun = "identity" if count == 1 else "identities"
+            parts.append(f"admitted {count} new {source.upper()} {noun}")
+    return " · ".join(parts)
+
+
+def wait_until_quiet(
+    cfg: Config,
+    watch_set: list[ActivityFile],
+    dashboard: TerminalDashboard | None = None,
+) -> None:
+    """Wait for every watched session to be quiet and for the user to be idle."""
+    while True:
+        now = datetime.now(timezone.utc)
+        admission_notice = ""
+        if cfg.session_discovery == "live":
+            previous = watch_set
+            watch_set = refresh_watch_set(cfg, previous, now=now)
+            _log_admissions(previous, watch_set)
+            admission_notice = dashboard_admission_notice(previous, watch_set)
+        activity: list[tuple[ActivityFile, datetime]] = []
+        for item in watch_set:
+            timestamp = _last_activity_for(item, now)
+            if timestamp is not None:
+                activity.append((item, timestamp))
+
+        _, freshest = (
+            max(activity, key=lambda pair: pair[1]) if activity else (None, None)
+        )
+        age = _activity_age(now, freshest) if freshest else None
+        sessions_quiet = age is None or age >= cfg.idle_seconds
+        idle = (
+            user_idle_seconds()
+            if sessions_quiet and cfg.user_idle_seconds > 0
+            else (0.0 if cfg.user_idle_seconds == 0 else None)
+        )
+        user_quiet = cfg.user_idle_seconds == 0 or (
+            idle is not None and idle >= cfg.user_idle_seconds
+        )
+        source_status = _source_guard_status(
+            now,
+            cfg.idle_seconds,
+            watch_set,
+            activity,
+        )
+
+        if dashboard is not None:
+            metadata = load_dashboard_metadata(watch_set, cfg.task_label)
+            snapshot = make_dashboard_snapshot(
+                now, cfg, watch_set, activity, idle, cfg.poll_seconds, metadata,
+                admission_notice,
+            )
+            dashboard.history.observe(snapshot)
+            dashboard.update(snapshot)
+
+        if sessions_quiet and user_quiet:
+            log.info(
+                "all source guards quiet (%s), user idle %ds -> %s",
+                source_status,
+                int(idle or 0),
+                "dry-run sleep decision" if cfg.dry_run else "sleeping Mac",
+            )
+            return
+        if sessions_quiet:
+            log.info(
+                "all source guards quiet (%s) but user active (idle %ds); holding",
+                source_status,
+                int(idle or 0),
+            )
+        else:
+            log.info("source guards: %s; still awake", source_status)
+        if dashboard is None:
+            time.sleep(cfg.poll_seconds)
+        else:
+            dashboard.wait(cfg.poll_seconds)
+
+
+# --- entrypoint --------------------------------------------------------------
+
+
+def setup_logging() -> None:
+    if log.handlers:
+        return
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s [watchdog] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(LOG_FILE)):
+        handler.setFormatter(fmt)
+        log.addHandler(handler)
+
+
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a finite number greater than zero")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a finite non-negative number")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> Config:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Keep the Mac awake while Claude Code, Claudex, Marjory, Codex, OMX, or "
+            "OpenCode works, then sleep."
+        )
+    )
+    parser.add_argument("--version", action="version", version=f"claude-watchdog {VERSION}")
+    parser.add_argument(
+        "idle_minutes",
+        nargs="?",
+        type=_positive_float,
+        default=30.0,
+        help="idle threshold in minutes (default: 30)",
+    )
+    parser.add_argument(
+        "--source",
+        choices=SOURCE_CHOICES,
+        default="auto",
+        help=(
+            "activity sources: auto (all), claude, claudex, marjory, codex, omx, "
+            "opencode, or codex-omx (default: auto)"
+        ),
+    )
+    parser.add_argument(
+        "--user-idle-minutes",
+        type=_nonnegative_float,
+        default=5.0,
+        help="also require the user idle this long before sleeping; 0 disables (default: 5)",
+    )
+    parser.add_argument(
+        "--select-window",
+        type=_positive_float,
+        default=900.0,
+        help=(
+            "admit sessions active within this many seconds at launch and during "
+            "live discovery (default: 900)"
+        ),
+    )
+    parser.add_argument(
+        "--session-discovery",
+        choices=("live", "frozen"),
+        default="live",
+        help=(
+            "discover newly active sessions while running, or freeze at launch "
+            "(default: live)"
+        ),
+    )
+    parser.add_argument(
+        "--poll",
+        type=_positive_float,
+        default=60.0,
+        help="poll interval in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="log the sleep decision but do not sleep",
+    )
+    parser.add_argument(
+        "--display",
+        choices=DISPLAY_CHOICES,
+        default="auto",
+        help="output mode: auto selects a dashboard on capable terminals (default: auto)",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="disable dashboard colors (NO_COLOR is also honored)",
+    )
+    parser.add_argument(
+        "--task-label",
+        choices=TASK_LABEL_CHOICES,
+        default="prompt",
+        help=(
+            "task text source: explicit/derived metadata only, or allow Claude's "
+            "sanitized last-prompt fallback (default: prompt)"
+        ),
+    )
+    args = parser.parse_args(argv)
+    return Config(
+        idle_minutes=args.idle_minutes,
+        user_idle_minutes=args.user_idle_minutes,
+        select_window_seconds=args.select_window,
+        poll_seconds=args.poll,
+        source=args.source,
+        session_discovery=args.session_discovery,
+        dry_run=args.dry_run,
+        display=args.display,
+        no_color=args.no_color,
+        task_label=args.task_label,
+    )
+
+
+def _run_watch_phase(
+    cfg: Config,
+    watch_set: list[ActivityFile],
+    dashboard: TerminalDashboard | None,
+) -> tuple[subprocess.Popen | None, int, tuple[int, str, tuple[object, ...]]]:
+    """Start the wake assertion and run the loop without performing cleanup or logging."""
+    try:
+        process = block_sleep()
+    except KeyboardInterrupt:
+        return None, 130, (
+            logging.INFO,
+            "interrupted while starting caffeinate; exiting without sleeping",
+            (),
+        )
+    except OSError as exc:
+        return None, 1, (
+            logging.ERROR,
+            "unable to start caffeinate; exiting without sleeping: %s",
+            (exc,),
+        )
+
+    try:
+        if dashboard is None:
+            wait_until_quiet(cfg, watch_set)
+        else:
+            wait_until_quiet(cfg, watch_set, dashboard)
+    except KeyboardInterrupt:
+        return process, 130, (
+            logging.INFO,
+            "interrupted; wake assertion released without sleeping",
+            (),
+        )
+    except WatchdogError as exc:
+        return process, 1, (
+            logging.ERROR,
+            "watch aborted because activity state is uncertain; wake assertion "
+            "released and sleep skipped: %s",
+            (exc,),
+        )
+    except Exception as exc:
+        return process, 1, (
+            logging.ERROR,
+            "watch aborted after an unexpected display/runtime error; wake assertion "
+            "released and sleep skipped: %s",
+            (exc,),
+        )
+    return process, 0, (
+        logging.INFO,
+        "all guards satisfied; wake assertion released%s",
+        ("; dry-run sleep decision follows" if cfg.dry_run else "; sleeping Mac",),
+    )
+
+
+def _release_watch_process(
+    process: subprocess.Popen | None,
+    status: int,
+    record: tuple[int, str, tuple[object, ...]],
+) -> tuple[int, tuple[int, str, tuple[object, ...]]]:
+    """Release an owned wake assertion after terminal state has been restored."""
+    if process is None:
+        return status, record
+    try:
+        _stop_caffeinate(process)
+    except KeyboardInterrupt:
+        try:
+            _stop_caffeinate(process)
+        except BaseException:
+            pass
+        return 130, (
+            logging.INFO,
+            "interrupted while releasing caffeinate; exiting without sleeping",
+            (),
+        )
+    except Exception as exc:
+        return 1, (
+            logging.ERROR,
+            "unable to release caffeinate cleanly; exiting without sleeping: %s",
+            (exc,),
+        )
+    return status, record
+
+
+def _emit_outcome(record: tuple[int, str, tuple[object, ...]]) -> None:
+    level, message, arguments = record
+    log.log(level, message, *arguments)
+
+
+def main(argv: list[str] | None = None) -> int:
+    cfg = parse_args(argv)
+    setup_logging()
+    log.info(
+        "start: source=%s session-discovery=%s task-label=%s idle>=%gm, "
+        "user-idle gate %gm, poll %gs%s",
+        cfg.source,
+        cfg.session_discovery,
+        cfg.task_label,
+        cfg.idle_minutes,
+        cfg.user_idle_minutes,
+        cfg.poll_seconds,
+        " [dry-run]" if cfg.dry_run else "",
+    )
+
+    try:
+        candidates = activity_files(cfg.source)
+        launch_time = datetime.now(timezone.utc)
+        watch_set = select_watch_set(cfg, candidates, now=launch_time)
+    except KeyboardInterrupt:
+        log.info("interrupted before watch started; nothing will be put to sleep")
+        return 130
+    except WatchdogError as exc:
+        log.error("launch selection failed; exiting without sleeping: %s", exc)
+        return 1
+
+    if not watch_set:
+        log.error(
+            "no active %s session in the launch snapshot; exiting without sleeping",
+            cfg.source,
+        )
+        return 1
+
+    log.info("watching %d %s activity target(s):", len(watch_set), cfg.source)
+    for item in watch_set:
+        log.info("    - %s", item.label)
+    log.info(
+        "status is based on persisted activity timestamps, not process liveness; "
+        "holding means the source still prevents sleep"
+    )
+
+    display_mode = resolve_display(cfg.display)
+    finished_dashboard = None
+    process = None
+    status = 1
+    record: tuple[int, str, tuple[object, ...]] = (
+        logging.ERROR,
+        "watch did not start; exiting without sleeping",
+        (),
+    )
+    if display_mode == "dashboard":
+        try:
+            with dashboard_context(cfg) as dashboard:
+                finished_dashboard = dashboard
+                process, status, record = _run_watch_phase(cfg, watch_set, dashboard)
+        except KeyboardInterrupt:
+            status, record = 130, (
+                logging.INFO,
+                "interrupted while opening or restoring dashboard; exiting without sleeping",
+                (),
+            )
+        except WatchdogError as exc:
+            if cfg.display == "auto" and process is None and not isinstance(exc, TerminalRestoreError):
+                log.warning("%s; continuing with log display", exc)
+                process, status, record = _run_watch_phase(cfg, watch_set, None)
+            elif process is not None:
+                status, record = 1, (
+                    logging.ERROR,
+                    "dashboard teardown failed; wake assertion released and sleep skipped: %s",
+                    (exc,),
+                )
+            else:
+                log.error("%s; exiting without sleeping", exc)
+                return 1
+    else:
+        if cfg.display == "auto":
+            log.info("interactive dashboard unavailable on this terminal; using log display")
+        process, status, record = _run_watch_phase(cfg, watch_set, None)
+
+    status, record = _release_watch_process(process, status, record)
+    if finished_dashboard is not None:
+        try:
+            emit_exit_report(finished_dashboard.history, cfg, status, record[1] % record[2])
+        except KeyboardInterrupt:
+            log.info("interrupted while writing exit report; sleep skipped")
+            return 130
+        except Exception as exc:
+            log.error("unable to write exit report; sleep skipped: %s", exc)
+            return 1
+    _emit_outcome(record)
+    if status != 0:
+        return status
+
+    try:
+        force_sleep(cfg.dry_run)
+    except WatchdogError as exc:
+        log.error("sleep command failed: %s", exc)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
