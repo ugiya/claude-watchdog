@@ -190,11 +190,11 @@ def dashboard_frame(snapshot: object, *, ansi: bool = True) -> str:
 
 
 def final_report(snapshots: tuple[object, ...], *, ansi: bool = True) -> str:
-    history = watchdog.WatchHistory()
-    for snapshot in snapshots:
-        history.observe(snapshot)
-    config = watchdog.Config(idle_minutes=1, user_idle_minutes=5, dry_run=True)
     with _utc_timezone():
+        history = watchdog.WatchHistory()
+        for snapshot in snapshots:
+            history.observe(snapshot)
+        config = watchdog.Config(idle_minutes=1, user_idle_minutes=5, dry_run=True)
         lines = watchdog.exit_report_lines(history, config, 0, "synthetic demo complete", color=False)
     local_log = str(watchdog.LOG_FILE)
     lines = [line.replace(local_log, "/demo/claude-watchdog.log") for line in lines]

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +20,22 @@ SPEC.loader.exec_module(demo)
 
 
 class SyntheticDemoTests(unittest.TestCase):
+    def render_assets_in_timezone(self, zone):
+        previous = os.environ.get("TZ")
+        os.environ["TZ"] = zone
+        if hasattr(time, "tzset"):
+            time.tzset()
+        try:
+            snapshots = demo.build_snapshots()
+            return demo.svg_asset(snapshots[-2]), demo.cast_asset(snapshots)
+        finally:
+            if previous is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = previous
+            if hasattr(time, "tzset"):
+                time.tzset()
+
     def test_story_covers_trees_discovery_countdown_and_final_report(self):
         snapshots = demo.build_snapshots()
         first, discovered, final = snapshots[0], snapshots[2], snapshots[-1]
@@ -68,6 +86,17 @@ class SyntheticDemoTests(unittest.TestCase):
         self.assertIn("claude-example", assets)
         self.assertIn("gpt-example", assets)
         self.assertIn("└─", assets)
+
+    def test_assets_do_not_depend_on_process_timezone(self):
+        utc = self.render_assets_in_timezone("UTC")
+        jerusalem = self.render_assets_in_timezone("Asia/Jerusalem")
+        los_angeles = self.render_assets_in_timezone("America/Los_Angeles")
+
+        self.assertEqual(utc, jerusalem)
+        self.assertEqual(utc, los_angeles)
+        self.assertIn("2026-01-15 22:00:02 UTC", utc[1])
+        self.assertNotIn(" IST", utc[1])
+        self.assertNotIn(" PST", utc[1])
 
 
 if __name__ == "__main__":
