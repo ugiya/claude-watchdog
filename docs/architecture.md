@@ -5,7 +5,7 @@ separate data paths: a safety-critical activity path and an observational
 metadata path.
 
 ```text
-agent JSONL / OpenCode SQLite
+profile configuration + agent JSONL / OpenCode SQLite
              |
              v
   discover + admit watch targets -----> display metadata + lineage
@@ -22,15 +22,26 @@ agent JSONL / OpenCode SQLite
 
 ## Activity path
 
-At launch, discovery snapshots candidate JSONL paths and sizes. A candidate is
+At launch, a run using source `auto` or `claude` loads the built-in Claude
+projects directory and any profiles declared in
+`~/.config/claude-watchdog/profiles.json`, or in the path selected with
+`--profiles-file`. It validates and freezes this set of directories and labels
+before starting `caffeinate`. The omitted default file means zero custom
+profiles; an explicitly selected missing file or invalid configuration aborts
+before the wake assertion starts. Non-Claude-only source selections do not load
+the default registry and reject an explicit `--profiles-file`.
+
+Discovery then snapshots candidate JSONL paths and sizes. A candidate is
 admitted only when an attributable content timestamp falls within
 `--select-window`. Filesystem modification time is never the activity signal.
 
 With `--session-discovery live`, each poll performs another complete discovery
-and additively admits recent targets. Existing targets are not removed. JSONL
-activity reads current content after admission, while the launch snapshot
-prevents content appended during the initial selection scan from changing that
-selection retroactively.
+inside the frozen directories and additively admits recent targets. Existing
+targets are not removed. JSONL activity reads current content after admission,
+while the launch snapshot prevents content appended during the initial
+selection scan from changing that selection retroactively. Editing the profile
+file does not change a running watchdog; newly active sessions inside an
+already configured directory remain discoverable.
 
 Shared sources receive tighter scoping:
 
@@ -59,7 +70,8 @@ content safe to publish.
 
 Native lineage uses exact session and parent IDs within a provider namespace.
 OpenCode expands display-only child rows beneath one database activity guard.
-An optional external registry can join exact visible Claude-family and Codex
+Profile labels identify a display source but never provide model metadata. An
+optional external registry can join exact visible Claude and Codex
 sessions across providers. Registry relationships change presentation only.
 
 ## Quietness and power sequence

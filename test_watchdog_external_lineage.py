@@ -182,10 +182,12 @@ class ExternalLineageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             registry = Path(tmp) / "lineage.json"
             _write_registry(registry, [
-                _link("marjory", "child", "claude", "parent"),
+                _link("claude", "child", "claude", "parent"),
             ])
             parent = _item("/parent", "claude")
-            child = _item("/child", "marjory")
+            child = watchdog.ActivityFile(
+                Path("/work/child"), "claude", profile_id="work", profile_label="Work"
+            )
             loaded = {
                 watchdog.target_key(parent): _metadata("parent", "Parent"),
                 watchdog.target_key(child): _metadata("child", "Child"),
@@ -206,6 +208,51 @@ class ExternalLineageTests(unittest.TestCase):
             result[watchdog.target_key(child)].external_parent_key,
             watchdog.target_key(parent),
         )
+
+    def test_profile_native_trees_keep_reused_ids_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            targets = []
+            for profile in ("work", "personal"):
+                directory = Path(tmp) / profile / "projects" / "project"
+                directory.mkdir(parents=True)
+                parent = directory / "parent.jsonl"
+                child = directory / "parent" / "subagents" / "agent-child.jsonl"
+                child.parent.mkdir(parents=True)
+                for path, session_id in ((parent, "parent"), (child, "child")):
+                    path.write_text(json.dumps({
+                        "type": "assistant", "sessionId": session_id,
+                        "timestamp": NOW.isoformat(), "message": {"model": "example-model"},
+                    }) + "\n", encoding="utf-8")
+                targets.extend(watchdog.ActivityFile(
+                    path, "claude", profile_id=profile, profile_label=profile.title()
+                ) for path in (parent, child))
+            metadata = {watchdog.target_key(item): watchdog.jsonl_metadata(item) for item in targets}
+            snapshot = watchdog.make_dashboard_snapshot(
+                NOW, watchdog.Config(), targets, [(item, NOW) for item in targets], 0, 10, metadata
+            )
+            parents = watchdog._dashboard_parent_keys(snapshot.rows)
+            self.assertEqual(parents, {
+                watchdog.target_key(targets[1]): watchdog.target_key(targets[0]),
+                watchdog.target_key(targets[3]): watchdog.target_key(targets[2]),
+            })
+
+    def test_external_parent_is_not_guessed_between_profiles_with_reused_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = Path(tmp) / "lineage.json"
+            _write_registry(registry, [_link("codex", "reviewer", "claude", "shared-parent")])
+            parents = [watchdog.ActivityFile(
+                Path(tmp) / profile / "parent.jsonl", "claude",
+                profile_id=profile, profile_label=profile.title(),
+            ) for profile in ("work", "personal")]
+            child = _item(str(Path(tmp) / "reviewer.jsonl"), "codex")
+            metadata = {watchdog.target_key(item): _metadata("shared-parent", "Parent") for item in parents}
+            metadata[watchdog.target_key(child)] = _metadata("reviewer", "Review")
+            with (
+                mock.patch.object(watchdog, "external_lineage_registry_path", return_value=registry),
+                mock.patch.object(watchdog, "load_session_metadata", side_effect=lambda item, **kw: metadata[watchdog.target_key(item)]),
+            ):
+                result = watchdog.load_dashboard_metadata([*parents, child])
+            self.assertIsNone(result[watchdog.target_key(child)].external_parent_key)
 
     def test_evidence_is_sanitized_and_bounded_only_for_display(self):
         with tempfile.TemporaryDirectory() as tmp:

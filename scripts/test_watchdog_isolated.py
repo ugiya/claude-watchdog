@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated end-to-end checks for live Codex session discovery.
+"""Isolated end-to-end checks for live Codex and Claude profile discovery.
 
 This script never uses the caller's home, Codex tree, log file, or power tools.
 It invokes the worktree executable with ``--dry-run`` and places fail-closed
@@ -292,6 +292,7 @@ class IsolatedWatchdogTests(unittest.TestCase):
         discovery: str,
         idle_seconds: float = IDLE_SECONDS,
         caffeinate_start_delay: float = 0,
+        source: str = "codex",
     ) -> _RunningWatchdog:
         env = os.environ.copy()
         env.pop("WATCHDOG_TARGET", None)
@@ -313,7 +314,7 @@ class IsolatedWatchdogTests(unittest.TestCase):
             str(TARGET),
             str(idle_seconds / 60),
             "--source",
-            "codex",
+            source,
             "--session-discovery",
             discovery,
             "--user-idle-minutes",
@@ -344,10 +345,10 @@ class IsolatedWatchdogTests(unittest.TestCase):
         self.keepalives.append(keepalive)
         return keepalive
 
-    def _wait_for_holding_handshake(self, running: _RunningWatchdog) -> int:
+    def _wait_for_holding_handshake(self, running: _RunningWatchdog, source: str = "codex") -> int:
         running.wait_for(r"watching 1 .*activity target")
         caffeinate_pid = running.wait_for_caffeinate_pid()
-        running.wait_for(r"source guards:.*codex=holding")
+        running.wait_for(r"source guards:.*" + re.escape(source) + "=holding")
         return caffeinate_pid
 
     def _assert_no_pmset_attempt(self) -> None:
@@ -409,6 +410,39 @@ class IsolatedWatchdogTests(unittest.TestCase):
         self.assertEqual(running.wait(), 0, running.output)
         self.assertFalse(any(ADMISSION_PATTERN.search(line) for line in running.lines))
         self.assertNotIn(str(second), running.output)
+        self._assert_child_released(running)
+
+    def test_live_profile_discovery_uses_launch_configuration(self) -> None:
+        projects = self.home / "work-data" / "projects"
+        first = projects / "project" / "first.jsonl"
+        keepalive = self._start_keepalive(first)
+        config = self.home / ".config" / "claude-watchdog" / "profiles.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({
+            "version": 1, "claude_profiles": [
+                {"id": "work", "label": "Work", "projects_dir": str(projects)},
+            ],
+        }), encoding="utf-8")
+        running = self._launch("live", source="claude")
+        self._wait_for_holding_handshake(running, "claude")
+
+        replacement = self.home / "other-data" / "projects"
+        config.write_text(json.dumps({
+            "version": 1, "claude_profiles": [
+                {"id": "other", "projects_dir": str(replacement)},
+            ],
+        }), encoding="utf-8")
+        ignored = replacement / "project" / "ignored.jsonl"
+        _write_rollout(ignored)
+        second = projects / "project" / "second.jsonl"
+        _write_rollout(second)
+        running.wait_for(ADMISSION_PATTERN)
+        keepalive.stop()
+
+        self.assertEqual(running.wait(), 0, running.output)
+        self.assertIn(str(second), running.output)
+        self.assertNotIn(str(ignored), running.output)
+        self.assertEqual(sum(bool(ADMISSION_PATTERN.search(line)) for line in running.lines), 1)
         self._assert_child_released(running)
 
     def test_sigterm_releases_only_the_watchdogs_caffeinate_child(self) -> None:

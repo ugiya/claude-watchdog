@@ -11,14 +11,16 @@ Initial public prerelease.
 
 ### Added
 
-- Persisted-activity guards for Claude Code, Claudex, Marjory, Codex, OMX, and
-  OpenCode.
+- Persisted-activity guards for Claude Code, configured Claude profiles, Codex,
+  OMX, and OpenCode.
+- Versioned generic Claude-profile configuration with per-run frozen directory
+  scope and live discovery of sessions within that scope.
 - Additive live session discovery and launch-time frozen discovery.
 - macOS `caffeinate`, user-idle, and explicit sleep-request lifecycle.
 - Responsive terminal dashboard with filtering, sorting, details, provider and
   model colors, tree/flat views, and a retained exit report.
 - Native Claude, Codex, and OpenCode parent/child presentation.
-- Optional, bounded external Claude-family/Codex lineage registry.
+- Optional, bounded external Claude/Codex lineage registry.
 - Current OpenCode model selection and scoped descendant metadata.
 - Regression suites, isolated lifecycle tests, PTY dashboard tests, CI, release
   archives, checksums, and a synthetic terminal demo.
