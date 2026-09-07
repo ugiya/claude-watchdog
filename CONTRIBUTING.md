@@ -27,7 +27,7 @@ python3 scripts/check.py
 ```
 
 The default check runs the portable unit, syntax, indentation, command-help,
-and installer validations. On macOS, also run the isolated lifecycle and PTY
+and installer validations, including detached execution of the installed ZIP. On macOS, also run the isolated lifecycle and PTY
 dashboard checks:
 
 ```bash
@@ -43,7 +43,10 @@ uv run --no-project --python 3.14 python scripts/check.py --integration
 uv run --no-project --python 3.14 python scripts/demo.py --no-delay
 ```
 
-The integration command requires macOS. uv downloads the requested interpreter
+The integration command runs the same lifecycle and terminal suites against both
+the source launcher and a ZIP installed into a temporary prefix. Evidence is
+written under ignored `.omx/artifacts/dashboard-pty/source/` and `installed/`;
+never publish raw captures. The integration command requires macOS. uv downloads the requested interpreter
 if needed; no third-party Python packages are required.
 
 The integration checks use isolated command shims and synthetic session data;
@@ -54,6 +57,25 @@ To inspect a synthetic dashboard without reading your agent sessions:
 ```bash
 python3 scripts/demo.py
 ```
+
+## Repository layout
+
+- `claude-watchdog`: thin source-checkout entrypoint.
+- `claude_watchdog/`: internal runtime modules, imported normally by tests.
+- `tests/test_*.py`: portable unit and artifact regression tests.
+- `tests/integration/`: isolated macOS lifecycle and terminal runners; not part
+  of portable unit discovery.
+- `scripts/`: maintainer commands for checking, installing, releases, demos,
+  and benchmarks, plus the shared runtime-bundle helper.
+- `docs/`: architecture, compatibility, release guidance, and synthetic demo assets.
+
+Run unit tests directly with `python3 -m unittest discover -s tests -p 'test_*.py'`.
+Patch the module where a dependency is looked up; do not recreate the former
+monolithic import surface as a test facade. New runtime modules must be included
+in the explicit bundle manifest and source release, and checked for import cycles.
+The canonical checker compiles and indentation-checks runtime, test, and script
+Python files. Keep publication allowlists explicit rather than recursively
+including arbitrary local files.
 
 ## Change guidelines
 

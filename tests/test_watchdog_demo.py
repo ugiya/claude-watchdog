@@ -12,8 +12,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from claude_watchdog import app as watchdog_app
+from claude_watchdog import power as watchdog_power
 
-ROOT = Path(__file__).resolve().parent
+
+ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("watchdog_demo", ROOT / "scripts" / "demo.py")
 demo = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(demo)
@@ -42,10 +45,10 @@ class SyntheticDemoTests(unittest.TestCase):
 
         self.assertEqual((first.watched_count, len(first.rows)), (2, 2))
         self.assertIn("admitted 2 new targets", discovered.admission_notice)
-        visible = demo.watchdog.visible_dashboard_rows(
-            discovered.rows, demo.watchdog.DashboardState(tree=True)
+        visible = demo.dashboard.visible_dashboard_rows(
+            discovered.rows, demo.models.DashboardState(tree=True)
         )
-        prefixes = demo.watchdog.dashboard_tree_prefixes(visible)
+        prefixes = demo.dashboard.dashboard_tree_prefixes(visible)
         rendered = demo.dashboard_frame(discovered, ansi=False)
         self.assertIn("└─ Review terminal hierarchy", rendered)
         self.assertIn("└─ Verify install and rollback", rendered)
@@ -60,9 +63,9 @@ class SyntheticDemoTests(unittest.TestCase):
 
     def test_no_delay_demo_is_ansi_and_never_enters_runtime_or_power_paths(self):
         output = io.StringIO()
-        with mock.patch.object(demo.watchdog, "main", side_effect=AssertionError("runtime main")), \
-             mock.patch.object(demo.watchdog, "block_sleep", side_effect=AssertionError("caffeinate")), \
-             mock.patch.object(demo.watchdog, "force_sleep", side_effect=AssertionError("pmset")):
+        with mock.patch.object(watchdog_app, "main", side_effect=AssertionError("runtime main")), \
+             mock.patch.object(watchdog_power, "block_sleep", side_effect=AssertionError("caffeinate")), \
+             mock.patch.object(watchdog_power, "force_sleep", side_effect=AssertionError("pmset")):
             demo.run_demo(stream=output, no_delay=True)
         rendered = output.getvalue()
         self.assertIn(demo.HIDE_CURSOR, rendered)

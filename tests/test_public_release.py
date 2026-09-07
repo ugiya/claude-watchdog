@@ -10,7 +10,7 @@ from scripts.check_public import inspect
 
 class PublicReleaseTests(unittest.TestCase):
     def test_version_command_has_no_runtime_side_effects(self):
-        root = Path(__file__).resolve().parent
+        root = Path(__file__).resolve().parents[1]
         result = subprocess.run([sys.executable, str(root / "claude-watchdog"), "--version"],
                                 check=True, capture_output=True, text=True)
         self.assertEqual(result.stdout.strip(), "claude-watchdog " + (root / "VERSION").read_text().strip())

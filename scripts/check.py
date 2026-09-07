@@ -22,16 +22,27 @@ def _run(arguments: list[str], *, environment: dict[str, str] | None = None) -> 
 
 def _python_files() -> list[str]:
     paths = [PROJECT_ROOT / "claude-watchdog"]
-    paths.extend(sorted(PROJECT_ROOT.glob("test_*.py")))
+    paths.extend(sorted((PROJECT_ROOT / "claude_watchdog").rglob("*.py")))
+    paths.extend(sorted((PROJECT_ROOT / "tests").rglob("*.py")))
     paths.extend(sorted((PROJECT_ROOT / "scripts").glob("*.py")))
     return [str(path.relative_to(PROJECT_ROOT)) for path in paths]
 
 
+def _run_integration(target: Path, environment: dict[str, str]) -> None:
+    isolated = environment.copy()
+    isolated["WATCHDOG_TEST_TARGET"] = str(target)
+    for runner in ("test_watchdog_isolated.py", "test_watchdog_dashboard_pty.py"):
+        _run([sys.executable, f"tests/integration/{runner}"], environment=isolated)
+
+
 def run_checks(*, integration: bool = False) -> None:
+    if integration and platform.system() != "Darwin":
+        raise RuntimeError("--integration requires macOS")
     python = sys.executable
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    _run([python, "-m", "unittest", "discover", "-p", "test_*.py"], environment=environment)
+    environment.pop("WATCHDOG_TEST_TARGET", None)
+    _run([python, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"], environment=environment)
     with tempfile.TemporaryDirectory(prefix="claude-watchdog-pycache-") as cache:
         compile_environment = environment.copy()
         compile_environment["PYTHONPYCACHEPREFIX"] = cache
@@ -40,16 +51,16 @@ def run_checks(*, integration: bool = False) -> None:
     _run([python, "claude-watchdog", "--help"], environment=environment)
     _run([python, "scripts/install.py", "--help"], environment=environment)
     _run([python, "scripts/build_release.py", "--help"], environment=environment)
+    if integration:
+        _run_integration(PROJECT_ROOT / "claude-watchdog", environment)
     with tempfile.TemporaryDirectory(prefix="claude-watchdog-install-") as prefix:
         _run([python, "scripts/install.py", "--prefix", prefix], environment=environment)
         installed = str(Path(prefix) / "bin" / "claude-watchdog")
         _run([python, installed, "--help"], environment=environment)
+        _run([python, installed, "--version"], environment=environment)
+        if integration:
+            _run_integration(Path(installed), environment)
         _run([python, "scripts/install.py", "--prefix", prefix, "--uninstall"], environment=environment)
-    if integration:
-        if platform.system() != "Darwin":
-            raise RuntimeError("--integration requires macOS")
-        _run([python, "scripts/test_watchdog_isolated.py"], environment=environment)
-        _run([python, "scripts/test_watchdog_dashboard_pty.py"], environment=environment)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

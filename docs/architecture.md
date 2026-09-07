@@ -20,6 +20,39 @@ profile configuration + agent JSONL / OpenCode SQLite
   restore terminal -> release caffeinate -> final report -> pmset sleepnow
 ```
 
+## Source and distribution boundaries
+
+The root `claude-watchdog` launcher calls the internal package entrypoint.
+`python3 -m claude_watchdog` is an equivalent source-checkout entrypoint.
+Runtime responsibilities are separated into ordinary Python modules:
+
+| Module | Responsibility |
+| --- | --- |
+| `models` | Shared records, configuration data, errors, and constants |
+| `text` | Pure terminal normalization, width, and display-time formatting |
+| `presentation` | Shared color settings below dashboard and reporting |
+| `config` | CLI parsing and launch-frozen profile validation |
+| `activity` | Discovery, persisted timestamps, admission, and scoped guards |
+| `metadata` | Observational provider metadata and lineage |
+| `dashboard` | Terminal rendering, navigation, and restoration |
+| `reporting` | Bounded poll history and final reports |
+| `power` | User presence and owned power-command operations |
+| `app` | Polling and lifecycle orchestration |
+
+Imports are acyclic. Configuration, activity, and power do not depend on metadata,
+reporting, or the dashboard. Metadata never imports dashboard or reporting;
+reporting never imports dashboard. Pure text/time and shared palette helpers sit
+below their consumers. The application composes these paths while retaining the
+cleanup order below. Structural regression tests enforce these boundaries.
+
+Installation does not scatter these modules across the destination prefix. The
+installer builds an executable ZIP from an explicit, required runtime-file list,
+using fixed archive metadata and a Python shebang. Only that single executable
+and its ownership manifest are installed, retaining the previous one-file upgrade
+and uninstall model. Missing or symlinked runtime inputs abort before installation
+is changed. The source-release builder includes the same runtime files and the
+explicit test/tool allowlists; local configurations and captures are never bundled.
+
 ## Activity path
 
 At launch, a run using source `auto` or `claude` loads the built-in Claude

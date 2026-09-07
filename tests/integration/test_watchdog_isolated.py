@@ -24,7 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-TARGET = Path(__file__).resolve().parents[1] / "claude-watchdog"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TARGET = Path(os.environ.get("WATCHDOG_TEST_TARGET", PROJECT_ROOT / "claude-watchdog")).resolve()
 IDLE_SECONDS = 1.5
 POLL_SECONDS = 0.1
 PROCESS_TIMEOUT = 8.0
@@ -296,6 +297,7 @@ class IsolatedWatchdogTests(unittest.TestCase):
     ) -> _RunningWatchdog:
         env = os.environ.copy()
         env.pop("WATCHDOG_TARGET", None)
+        env.pop("WATCHDOG_TEST_TARGET", None)
         env.update(
             {
                 "HOME": str(self.home),
@@ -460,5 +462,5 @@ class IsolatedWatchdogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     if not TARGET.is_file():
-        raise SystemExit(f"worktree watchdog not found: {TARGET}")
+        raise SystemExit(f"test watchdog target not found: {TARGET}")
     unittest.main(verbosity=2)

@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load(name: str, path: Path):
@@ -28,13 +28,29 @@ def _load(name: str, path: Path):
 installer = _load("watchdog_installer", ROOT / "scripts" / "install.py")
 release = _load("watchdog_release", ROOT / "scripts" / "build_release.py")
 
+RUNTIME_FILES = (
+    "__init__.py", "__main__.py", "models.py", "text.py", "presentation.py",
+    "config.py", "activity.py", "metadata.py", "dashboard.py", "reporting.py",
+    "power.py", "app.py",
+)
+
 
 class InstallerTests(unittest.TestCase):
     def make_release(self, root: Path, content: bytes = b"exit 0\n") -> Path:
         root.mkdir(parents=True, exist_ok=True)
-        (root / "claude-watchdog").write_bytes(
-            b"#!/bin/sh\nVERSION = '0.1.0'\n" + content
+        package = root / "claude_watchdog"
+        package.mkdir(exist_ok=True)
+        (package / "__init__.py").write_text('VERSION = "0.1.0"\n', encoding="utf-8")
+        (package / "__main__.py").write_text(
+            "from .app import main\nraise SystemExit(main())\n", encoding="utf-8"
         )
+        (package / "app.py").write_bytes(
+            b"def main():\n    " + content.replace(b"exit ", b"return ")
+        )
+        for name in RUNTIME_FILES:
+            path = package / name
+            if not path.exists():
+                path.write_text(f"# {name}\n", encoding="utf-8")
         (root / "VERSION").write_text("0.1.0\n", encoding="utf-8")
         return root
 
@@ -44,9 +60,8 @@ class InstallerTests(unittest.TestCase):
             project = self.make_release(root / "release")
             prefix = root / "prefix"
             destination = installer.install(prefix, project_root=project)
-            self.assertEqual(
-                destination.read_bytes(), b"#!/bin/sh\nVERSION = '0.1.0'\nexit 0\n"
-            )
+            first_bytes = destination.read_bytes()
+            self.assertTrue(first_bytes.startswith(b"#!/usr/bin/env python3\n"))
             self.assertTrue(os.access(destination, os.X_OK))
             manifest_path = prefix / "share" / "claude-watchdog" / "install-manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -54,9 +69,7 @@ class InstallerTests(unittest.TestCase):
 
             self.make_release(project, b"exit 2\n")
             installer.install(prefix, project_root=project)
-            self.assertEqual(
-                destination.read_bytes(), b"#!/bin/sh\nVERSION = '0.1.0'\nexit 2\n"
-            )
+            self.assertNotEqual(destination.read_bytes(), first_bytes)
             installer.uninstall(prefix)
             self.assertFalse(destination.exists())
             self.assertFalse(manifest_path.exists())
@@ -122,21 +135,89 @@ class InstallerTests(unittest.TestCase):
                 installer.install(safe_prefix, force=True, project_root=project)
             self.assertTrue(destination.is_symlink())
 
+    def test_install_upgrades_legacy_single_file_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project = self.make_release(root / "release")
+            prefix = root / "prefix"
+            destination, manifest_path = installer._paths(prefix)
+            destination.parent.mkdir(parents=True)
+            manifest_path.parent.mkdir(parents=True)
+            legacy = b"#!/usr/bin/env python3\nVERSION = '0.1.0'\n"
+            destination.write_bytes(legacy)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "name": "claude-watchdog",
+                        "path": str(destination),
+                        "schema": 1,
+                        "sha256": hashlib.sha256(legacy).hexdigest(),
+                        "version": "0.1.0",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            installer.install(prefix, project_root=project)
+
+            self.assertTrue(destination.read_bytes().startswith(b"#!/usr/bin/env python3\nPK"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["sha256"], hashlib.sha256(destination.read_bytes()).hexdigest()
+            )
+
+    def test_bundle_failure_preserves_existing_install_and_manifest(self):
+        for failure in ("missing file", "symlink file", "symlink parent"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                project = self.make_release(root / "release")
+                prefix = root / "prefix"
+                destination = installer.install(prefix, project_root=project)
+                manifest_path = prefix / "share" / "claude-watchdog" / "install-manifest.json"
+                installed_before = destination.read_bytes()
+                manifest_before = manifest_path.read_bytes()
+                power = project / "claude_watchdog" / "power.py"
+                if failure == "missing file":
+                    power.unlink()
+                elif failure == "symlink file":
+                    power.unlink()
+                    outside = project / "outside.py"
+                    outside.write_text("# outside\n", encoding="utf-8")
+                    power.symlink_to(outside)
+                else:
+                    real_package = project / "real-package"
+                    (project / "claude_watchdog").rename(real_package)
+                    (project / "claude_watchdog").symlink_to(
+                        real_package, target_is_directory=True
+                    )
+
+                with self.assertRaises(installer.InstallError):
+                    installer.install(prefix, project_root=project)
+
+                self.assertEqual(destination.read_bytes(), installed_before)
+                self.assertEqual(manifest_path.read_bytes(), manifest_before)
+
 
 class ReleaseBuilderTests(unittest.TestCase):
     def make_project(self, root: Path) -> None:
         (root / "scripts").mkdir(parents=True)
+        (root / "tests").mkdir()
         (root / "docs").mkdir()
         (root / ".github" / "workflows").mkdir(parents=True)
         (root / ".git").mkdir()
         (root / ".omx").mkdir()
         (root / "VERSION").write_text("0.1.0\n", encoding="utf-8")
-        (root / "claude-watchdog").write_text(
-            "#!/usr/bin/env python3\nVERSION = '0.1.0'\n", encoding="utf-8"
-        )
+        (root / "claude-watchdog").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        package = root / "claude_watchdog"
+        package.mkdir()
+        for name in RUNTIME_FILES:
+            value = 'VERSION = "0.1.0"\n' if name == "__init__.py" else f"# {name}\n"
+            (package / name).write_text(value, encoding="utf-8")
         (root / "README.md").write_text("public\n", encoding="utf-8")
-        (root / "test_release_tooling.py").write_text("pass\n", encoding="utf-8")
+        (root / "tests" / "test_release_tooling.py").write_text("pass\n", encoding="utf-8")
         (root / "scripts" / "install.py").write_text("pass\n", encoding="utf-8")
+        (root / "scripts" / "build_release.py").write_text("pass\n", encoding="utf-8")
+        (root / "scripts" / "runtime_bundle.py").write_text("pass\n", encoding="utf-8")
         (root / "scripts" / "check.py").write_text("pass\n", encoding="utf-8")
         (root / "docs" / "usage.md").write_text("public docs\n", encoding="utf-8")
         (root / ".github" / "workflows" / "ci.yml").write_text("name: CI\n", encoding="utf-8")
@@ -165,7 +246,9 @@ class ReleaseBuilderTests(unittest.TestCase):
             self.assertIn(prefix + "docs/usage.md", names)
             self.assertIn(prefix + ".github/workflows/ci.yml", names)
             self.assertIn(prefix + "scripts/check.py", names)
-            self.assertIn(prefix + "test_release_tooling.py", names)
+            self.assertIn(prefix + "scripts/runtime_bundle.py", names)
+            self.assertIn(prefix + "tests/test_release_tooling.py", names)
+            self.assertIn(prefix + "claude_watchdog/app.py", names)
             self.assertNotIn(prefix + ".git/config", names)
             self.assertNotIn(prefix + ".omx/session.json", names)
             self.assertNotIn(prefix + "private-notes.md", names)
@@ -188,10 +271,26 @@ class ReleaseBuilderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.make_project(root)
-            (root / "claude-watchdog").write_text(
+            (root / "claude_watchdog" / "__init__.py").write_text(
                 "VERSION = '0.2.0'\n", encoding="utf-8"
             )
             with self.assertRaisesRegex(release.ReleaseError, "does not match"):
+                release.build_release(root, root / "out")
+
+    def test_release_rejects_incomplete_or_symlinked_runtime_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_project(root)
+            power = root / "claude_watchdog" / "power.py"
+            power.unlink()
+            with self.assertRaisesRegex(release.ReleaseError, "missing required runtime file"):
+                release.build_release(root, root / "out")
+
+            power.write_text("# power.py\n", encoding="utf-8")
+            real_package = root / "real-package"
+            (root / "claude_watchdog").rename(real_package)
+            (root / "claude_watchdog").symlink_to(real_package, target_is_directory=True)
+            with self.assertRaisesRegex(release.ReleaseError, "parent is a symlink"):
                 release.build_release(root, root / "out")
 
 

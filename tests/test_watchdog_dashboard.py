@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import io
 import json
 import os
@@ -13,22 +11,22 @@ import sys
 import tempfile
 import unittest
 from contextlib import ExitStack, closing
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 
-def _load_target():
-    target = Path(__file__).with_name("claude-watchdog")
-    loader = importlib.machinery.SourceFileLoader("watchdog_dashboard_target", str(target))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    loader.exec_module(module)
-    return module
-
-
-watchdog = _load_target()
+from claude_watchdog import models as wd_models
+from claude_watchdog import text as wd_text
+from claude_watchdog import presentation as wd_presentation
+from claude_watchdog import config as wd_config
+from claude_watchdog import activity as wd_activity
+from claude_watchdog import metadata as wd_metadata
+from claude_watchdog import dashboard as wd_dashboard
+from claude_watchdog import reporting as wd_reporting
+from claude_watchdog import power as wd_power
+from claude_watchdog import app as wd_app
 NOW = datetime(2026, 9, 5, 0, 20, tzinfo=timezone.utc)
 
 
@@ -79,7 +77,7 @@ class FakeScreen:
 
 
 def _item(name="rollout-a.jsonl", source="codex", identities=frozenset()):
-    return watchdog.ActivityFile(Path(name), source, identities=identities)
+    return wd_models.ActivityFile(Path(name), source, identities=identities)
 
 
 def _metadata(**values):
@@ -93,52 +91,52 @@ def _metadata(**values):
         provenance="unknown",
     )
     defaults.update(values)
-    return watchdog.SessionMetadata(**defaults)
+    return wd_models.SessionMetadata(**defaults)
 
 
 def _snapshot(items=None, metadata=None):
     items = items or [_item()]
     activity = [(items[0], NOW - timedelta(seconds=5))]
-    return watchdog.make_dashboard_snapshot(
+    return wd_dashboard.make_dashboard_snapshot(
         now=NOW,
-        cfg=watchdog.Config(idle_minutes=30, user_idle_minutes=5),
+        cfg=wd_models.Config(idle_minutes=30, user_idle_minutes=5),
         watch_set=items,
         activity=activity,
         user_idle=0,
         next_poll_seconds=42,
-        metadata=metadata or {watchdog.target_key(items[0]): _metadata(task="Dashboard")},
+        metadata=metadata or {wd_metadata.target_key(items[0]): _metadata(task="Dashboard")},
     )
 
 
 class DisplaySelectionTests(unittest.TestCase):
     def test_auto_uses_dashboard_only_for_capable_ttys(self):
         with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=False):
-            self.assertEqual(watchdog.resolve_display("auto", FakeTTY(), FakeTTY()), "dashboard")
-            self.assertEqual(watchdog.resolve_display("auto", FakeTTY(False), FakeTTY()), "log")
-            self.assertEqual(watchdog.resolve_display("auto", FakeTTY(), FakeTTY(False)), "log")
+            self.assertEqual(wd_dashboard.resolve_display("auto", FakeTTY(), FakeTTY()), "dashboard")
+            self.assertEqual(wd_dashboard.resolve_display("auto", FakeTTY(False), FakeTTY()), "log")
+            self.assertEqual(wd_dashboard.resolve_display("auto", FakeTTY(), FakeTTY(False)), "log")
         with mock.patch.dict(os.environ, {"TERM": "dumb"}, clear=False):
-            self.assertEqual(watchdog.resolve_display("auto", FakeTTY(), FakeTTY()), "log")
+            self.assertEqual(wd_dashboard.resolve_display("auto", FakeTTY(), FakeTTY()), "log")
 
     def test_explicit_modes_are_preserved(self):
-        self.assertEqual(watchdog.resolve_display("log", FakeTTY(), FakeTTY()), "log")
-        self.assertEqual(watchdog.resolve_display("dashboard", FakeTTY(False), FakeTTY(False)), "dashboard")
+        self.assertEqual(wd_dashboard.resolve_display("log", FakeTTY(), FakeTTY()), "log")
+        self.assertEqual(wd_dashboard.resolve_display("dashboard", FakeTTY(False), FakeTTY(False)), "dashboard")
 
     def test_parse_args_exposes_display_and_no_color(self):
-        cfg = watchdog.parse_args(["--display", "log", "--no-color"])
+        cfg = wd_config.parse_args(["--display", "log", "--no-color"])
         self.assertEqual(cfg.display, "log")
         self.assertTrue(cfg.no_color)
 
     def test_task_labels_default_to_prompt_and_allow_metadata_override(self):
-        self.assertEqual(watchdog.Config().task_label, "prompt")
-        self.assertEqual(watchdog.parse_args([]).task_label, "prompt")
+        self.assertEqual(wd_models.Config().task_label, "prompt")
+        self.assertEqual(wd_config.parse_args([]).task_label, "prompt")
         self.assertEqual(
-            watchdog.parse_args(["--task-label", "metadata"]).task_label,
+            wd_config.parse_args(["--task-label", "metadata"]).task_label,
             "metadata",
         )
 
     def test_no_color_environment_disables_colors(self):
         with mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=False):
-            self.assertFalse(watchdog.colors_enabled(watchdog.Config()))
+            self.assertFalse(wd_presentation.colors_enabled(wd_models.Config()))
 
 
 class MetadataAndSafetyTests(unittest.TestCase):
@@ -153,7 +151,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 db.execute("UPDATE session SET model=NULL WHERE id='child'")
                 db.execute("INSERT INTO message VALUES ('m', 'child', 3000, ?)", (json.dumps({"role": "assistant", "modelID": "opus-model", "variant": "medium", "agent": "explore", "content": "PRIVATE BODY"}),))
             item = _item(str(path), "opencode", frozenset({"root"}))
-            result = watchdog.load_dashboard_metadata([item])[watchdog.target_key(item)]
+            result = wd_metadata.load_dashboard_metadata([item])[wd_metadata.target_key(item)]
             self.assertEqual(result.client, "OpenCode")
             self.assertIn("Build UI", result.task)
             self.assertIn("Map attack surface", result.task)
@@ -161,7 +159,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
             self.assertNotIn("PRIVATE BODY", repr(result))
             self.assertIn("opus-model / medium", "\n".join(result.details))
             self.assertIn("muse-model / high", "\n".join(result.details))
-            snapshot = _snapshot([item], {watchdog.target_key(item): result})
+            snapshot = _snapshot([item], {wd_metadata.target_key(item): result})
             self.assertEqual(snapshot.rows[0].details, result.details)
             self.assertEqual(snapshot.watched_count, 1)
 
@@ -174,7 +172,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 db.execute("INSERT INTO session VALUES ('root', NULL, 'Current task', 1000, 2000, ?)", (json.dumps({"id": "new-model", "variant": "medium"}),))
                 db.execute("INSERT INTO session VALUES ('child', 'root', 'Review', 1000, 3000, ?)", (json.dumps({"id": "child-model", "variant": "high"}),))
                 db.execute("INSERT INTO message VALUES ('old', 'root', 1500, ?)", (json.dumps({"role": "assistant", "modelID": "old-model", "variant": "max"}),))
-            result = watchdog.opencode_metadata(_item(str(path), "opencode", frozenset({"root"})))
+            result = wd_metadata.opencode_metadata(_item(str(path), "opencode", frozenset({"root"})))
             self.assertEqual((result.model, result.effort), ("new-model", "medium"))
             root = next(child for child in result.children if child.session_id == "root")
             self.assertEqual((root.model, root.effort), ("new-model", "medium"))
@@ -185,7 +183,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
             path = Path(tmp) / "old.db"
             with closing(sqlite3.connect(path)) as db, db:
                 db.execute("CREATE TABLE session (id TEXT, parent_id TEXT)")
-            result = watchdog.load_session_metadata(_item(str(path), "opencode", frozenset({"root"})))
+            result = wd_metadata.load_session_metadata(_item(str(path), "opencode", frozenset({"root"})))
             self.assertEqual(result.task, "1 lineage seeds")
 
     def test_omx_client_requires_exact_launch_evidence_and_survives_pointer_change(self):
@@ -199,15 +197,15 @@ class MetadataAndSafetyTests(unittest.TestCase):
             state.mkdir(parents=True)
             pointer = state / 'session.json'
             pointer.write_text(json.dumps({'native_session_id': sid, 'session_id': 'omx-launch'}))
-            self.assertEqual(watchdog.jsonl_metadata(_item(str(path))).client, 'OMX / Codex')
+            self.assertEqual(wd_metadata.jsonl_metadata(_item(str(path))).client, 'OMX / Codex')
             pointer.write_text(json.dumps({'native_session_id': 'other', 'session_id': 'omx-other'}))
-            self.assertEqual(watchdog.jsonl_metadata(_item(str(path))).client, 'codex-tui')
+            self.assertEqual(wd_metadata.jsonl_metadata(_item(str(path))).client, 'codex-tui')
             logs = root / '.omx/logs'
             logs.mkdir()
             log = logs / (NOW.strftime('omx-%Y-%m-%d.jsonl'))
             log.write_text(json.dumps({'event': 'session_start_reconciled', 'native_session_id': sid,
                 'session_id': 'omx-launch', 'timestamp': NOW.isoformat()}) + '\n')
-            self.assertEqual(watchdog.jsonl_metadata(_item(str(path))).client, 'OMX / Codex')
+            self.assertEqual(wd_metadata.jsonl_metadata(_item(str(path))).client, 'OMX / Codex')
 
     def test_omx_files_or_hooks_alone_do_not_relabel_codex(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -222,19 +220,19 @@ class MetadataAndSafetyTests(unittest.TestCase):
             logs.mkdir()
             (logs/NOW.strftime('omx-%Y-%m-%d.jsonl')).write_text(json.dumps({
                 'event': 'notify_hook', 'native_session_id': 'session-a', 'session_id': 'omx-other'})+'\n')
-            self.assertEqual(watchdog.jsonl_metadata(_item(str(path))).client, 'codex-tui')
+            self.assertEqual(wd_metadata.jsonl_metadata(_item(str(path))).client, 'codex-tui')
             (state/'session.json').write_text('{broken')
-            self.assertEqual(watchdog.jsonl_metadata(_item(str(path))).client, 'codex-tui')
+            self.assertEqual(wd_metadata.jsonl_metadata(_item(str(path))).client, 'codex-tui')
 
     def test_sanitize_removes_terminal_controls_bidi_and_newlines(self):
         value = "safe\x1b[31m\nBAD\t\u202etxt\x9b"
-        cleaned = watchdog.sanitize_terminal_text(value)
+        cleaned = wd_text.sanitize_terminal_text(value)
         self.assertEqual(cleaned, "safe[31m BAD txt")
         self.assertFalse(any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in cleaned))
 
     def test_unicode_clipping_counts_terminal_cells_and_uses_ellipsis(self):
-        self.assertEqual(watchdog.clip_cells("ab界cd", 5), "ab界…")
-        self.assertLessEqual(watchdog.text_cells(watchdog.clip_cells("abcdef", 4)), 4)
+        self.assertEqual(wd_text.clip_cells("ab界cd", 5), "ab界…")
+        self.assertLessEqual(wd_text.text_cells(wd_text.clip_cells("abcdef", 4)), 4)
 
     def test_jsonl_metadata_uses_explicit_fields_without_prompt_content(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -246,7 +244,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
                     "model": "gpt-5", "reasoning_effort": "high", "user_prompt": "SECRET"}},
             ]
             path.write_text("".join(json.dumps(x) + "\n" for x in records), encoding="utf-8")
-            result = watchdog.jsonl_metadata(_item(str(path)))
+            result = wd_metadata.jsonl_metadata(_item(str(path)))
         self.assertEqual(result.client, "Codex Desktop")
         self.assertEqual(result.model, "gpt-5")
         self.assertEqual(result.effort, "high")
@@ -284,10 +282,10 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 ("work", "Work", "Claude Code [Work]"),
             ):
                 with self.subTest(profile=profile_id):
-                    item = watchdog.ActivityFile(
+                    item = wd_models.ActivityFile(
                         path, "claude", profile_id=profile_id, profile_label=profile_label
                     )
-                    result = watchdog.jsonl_metadata(item)
+                    result = wd_metadata.jsonl_metadata(item)
                     self.assertEqual(result.client, expected_client)
                     self.assertEqual(result.task, "Load average explanation")
                     self.assertEqual(result.model, "claude-opus-5")
@@ -304,9 +302,9 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 "timestamp": "2026-09-05T00:02:00Z", "effort": "medium",
                 "message": {"model": "gpt-example", "content": []},
             }) + "\n", encoding="utf-8")
-            item = watchdog.ActivityFile(path, "claude", profile_id="work", profile_label="Work")
-            with mock.patch.object(watchdog, "_claude_registry_name", side_effect=AssertionError("vanilla registry read")):
-                result = watchdog.jsonl_metadata(item)
+            item = wd_models.ActivityFile(path, "claude", profile_id="work", profile_label="Work")
+            with mock.patch.object(wd_metadata, "_claude_registry_name", side_effect=AssertionError("vanilla registry read")):
+                result = wd_metadata.jsonl_metadata(item)
             self.assertEqual(result.client, "sdk-cli [Work]")
             self.assertEqual(result.model, "gpt-example")
             self.assertEqual(result.effort, "medium")
@@ -322,7 +320,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
                     "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
                 )
                 with self.subTest(order=index):
-                    result = watchdog.jsonl_metadata(_item(str(path), source="claude"))
+                    result = wd_metadata.jsonl_metadata(_item(str(path), source="claude"))
                     self.assertEqual(result.task, "Chosen Title[31m")
 
     def test_claude_explicit_title_between_large_records_is_discovered(self):
@@ -342,7 +340,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
             }).encode() + b"\n"
             tail = b'{"type":"attachment","content":"' + b"y" * 179_000 + b'"}\n'
             path.write_bytes(metadata + large + title + middle + assistant + tail)
-            result = watchdog.load_session_metadata(_item(str(path), source="claude"))
+            result = wd_metadata.load_session_metadata(_item(str(path), source="claude"))
         self.assertEqual(result.task, "Desktop task")
         self.assertEqual((result.model, result.effort), ("claude-opus-5", "high"))
         self.assertNotIn("PRIVATE", repr(result))
@@ -366,8 +364,8 @@ class MetadataAndSafetyTests(unittest.TestCase):
             (registry / "43.json").write_text(json.dumps({
                 "sessionId": "other", "name": "wrong-agent",
             }), encoding="utf-8")
-            with mock.patch.object(watchdog, "claude_sessions_dir", return_value=registry):
-                result = watchdog.load_session_metadata(_item(str(transcript), source="claude"))
+            with mock.patch.object(wd_config, "claude_sessions_dir", return_value=registry):
+                result = wd_metadata.load_session_metadata(_item(str(transcript), source="claude"))
         self.assertEqual(result.task, "example-notebook-c6")
         self.assertNotIn("PRIVATE", repr(result))
 
@@ -390,8 +388,8 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 }), encoding="utf-8")
                 timestamp = base_ns + index + 1
                 os.utime(decoy, ns=(timestamp, timestamp))
-            with mock.patch.object(watchdog, "claude_sessions_dir", return_value=registry):
-                name = watchdog._claude_registry_name(session_id)
+            with mock.patch.object(wd_config, "claude_sessions_dir", return_value=registry):
+                name = wd_metadata._claude_registry_name(session_id)
         self.assertEqual(name, "older-agent-name")
 
     def test_claude_registry_caps_empty_file_attempts_independently_of_bytes(self):
@@ -408,11 +406,11 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 return original_open(path, *args, **kwargs)
 
             with (
-                mock.patch.object(watchdog, "claude_sessions_dir", return_value=registry),
-                mock.patch.object(watchdog, "MAX_CLAUDE_REGISTRY_FILES", 3),
+                mock.patch.object(wd_config, "claude_sessions_dir", return_value=registry),
+                mock.patch.object(wd_models, "MAX_CLAUDE_REGISTRY_FILES", 3),
                 mock.patch.object(Path, "open", tracking_open),
             ):
-                name = watchdog._claude_registry_name("missing-session")
+                name = wd_metadata._claude_registry_name("missing-session")
         self.assertIsNone(name)
         self.assertEqual(len(opened), 3)
 
@@ -432,12 +430,12 @@ class MetadataAndSafetyTests(unittest.TestCase):
             ]
             transcript.write_text("".join(json.dumps(record) + "\n" for record in records))
             registry = root / "missing-registry"
-            with mock.patch.object(watchdog, "claude_sessions_dir", return_value=registry):
-                private = watchdog.load_session_metadata(
+            with mock.patch.object(wd_config, "claude_sessions_dir", return_value=registry):
+                private = wd_metadata.load_session_metadata(
                     _item(str(transcript), source="claude"), task_label="metadata"
                 )
                 item = _item(str(transcript), source="claude")
-                prompt = watchdog.load_dashboard_metadata([item])[watchdog.target_key(item)]
+                prompt = wd_metadata.load_dashboard_metadata([item])[wd_metadata.target_key(item)]
         self.assertEqual(private.task, "example-notebook · abcdef01")
         self.assertEqual(prompt.task, "Verify final model picker behavior")
         self.assertEqual(prompt.provenance, "jsonl-prompt")
@@ -455,16 +453,15 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 {"type": "last-prompt", "sessionId": session_id,
                  "lastPrompt": selected_prompt},
             )), encoding="utf-8")
-            with mock.patch.object(
-                watchdog, "claude_sessions_dir", return_value=root / "missing-registry"
+            with mock.patch.object(wd_config, "claude_sessions_dir", return_value=root / "missing-registry"
             ):
-                result = watchdog.load_session_metadata(
+                result = wd_metadata.load_session_metadata(
                     _item(str(transcript), source="claude"), task_label="prompt"
                 )
         self.assertEqual(result.provenance, "jsonl-prompt")
         self.assertNotIn("\x1b", result.task)
         self.assertNotIn("\n", result.task)
-        self.assertLessEqual(watchdog.text_cells(result.task), 160)
+        self.assertLessEqual(wd_text.text_cells(result.task), 160)
         self.assertTrue(result.task.endswith("…"))
 
     def test_claude_spread_sampling_reaches_latest_dense_tail_metadata(self):
@@ -490,10 +487,9 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 "lastPrompt": "EXPECTED LATEST",
             }).encode() + b"\n"
             transcript.write_bytes(first + large + noise + assistant + latest)
-            with mock.patch.object(
-                watchdog, "claude_sessions_dir", return_value=root / "missing-registry"
+            with mock.patch.object(wd_config, "claude_sessions_dir", return_value=root / "missing-registry"
             ):
-                result = watchdog.load_session_metadata(
+                result = wd_metadata.load_session_metadata(
                     _item(str(transcript), source="claude"), task_label="prompt"
                 )
         self.assertEqual(result.task, "EXPECTED LATEST")
@@ -515,11 +511,11 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 "type": "user", "entrypoint": "sdk-cli",
                 "sessionId": "12345678-abcd", "cwd": "/repo/project",
             }) + "\n")
-            with mock.patch.object(watchdog, "claude_sessions_dir", return_value=registry):
-                title_result = watchdog.load_session_metadata(
+            with mock.patch.object(wd_config, "claude_sessions_dir", return_value=registry):
+                title_result = wd_metadata.load_session_metadata(
                     _item(str(titled), source="claude"), task_label="prompt"
                 )
-                fallback_result = watchdog.load_session_metadata(
+                fallback_result = wd_metadata.load_session_metadata(
                     _item(str(untitled), source="claude")
                 )
         self.assertEqual(title_result.task, "Chosen title")
@@ -536,7 +532,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 "effort": "high",
                 "aiTitle": "Claude title",
             }) + "\n", encoding="utf-8")
-            result = watchdog.jsonl_metadata(_item(str(path), source="codex"))
+            result = wd_metadata.jsonl_metadata(_item(str(path), source="codex"))
         self.assertEqual(
             (result.client, result.task, result.effort, result.cwd),
             ("unknown", "unknown", "unknown", "unknown"),
@@ -557,7 +553,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 {"type": "custom-title", "customTitle": {"title": "Chosen title"}},
             ]
             path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
-            result = watchdog.jsonl_metadata(_item(str(path), source="claude"))
+            result = wd_metadata.jsonl_metadata(_item(str(path), source="claude"))
         self.assertEqual(
             (result.client, result.task, result.effort, result.cwd),
             ("unknown", "unknown", "unknown", "unknown"),
@@ -571,14 +567,14 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 "timestamp": NOW.isoformat(), "type": "session_meta",
                 "payload": {"originator": "Codex Desktop", "model_provider": "openai"},
             }) + "\n", encoding="utf-8")
-            result = watchdog.jsonl_metadata(_item(str(path)))
+            result = wd_metadata.jsonl_metadata(_item(str(path)))
         self.assertEqual(result.model, "unknown")
 
     def test_unknown_metadata_is_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "empty.jsonl"
             path.write_text("{}\n", encoding="utf-8")
-            result = watchdog.jsonl_metadata(_item(str(path)))
+            result = wd_metadata.jsonl_metadata(_item(str(path)))
         self.assertEqual((result.task, result.model, result.effort), ("unknown", "unknown", "unknown"))
 
     def test_codex_sqlite_metadata_exactly_matches_rollout_path_read_only(self):
@@ -591,15 +587,15 @@ class MetadataAndSafetyTests(unittest.TestCase):
             database.execute("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)", (str(rollout), "Build dashboard", "fable-5.1", "high", 1788566400, "app", "/repo"))
             database.commit()
             database.close()
-            result = watchdog.codex_sqlite_metadata(_item(str(rollout)), root / "state.sqlite")
+            result = wd_metadata.codex_sqlite_metadata(_item(str(rollout)), root / "state.sqlite")
         self.assertEqual((result.task, result.model, result.effort), ("Build dashboard", "fable-5.1", "high"))
         self.assertEqual(result.provenance, "codex-state")
 
     def test_metadata_failure_is_display_only(self):
         item = _item(source="claude")
-        with mock.patch.object(watchdog, "load_session_metadata", side_effect=RuntimeError("bad metadata")):
-            values = watchdog.load_dashboard_metadata([item])
-        self.assertEqual(values[watchdog.target_key(item)].task, "unknown")
+        with mock.patch.object(wd_metadata, "load_session_metadata", side_effect=RuntimeError("bad metadata")):
+            values = wd_metadata.load_dashboard_metadata([item])
+        self.assertEqual(values[wd_metadata.target_key(item)].task, "unknown")
 
     def test_unexpected_codex_batch_failure_keeps_jsonl_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -609,15 +605,14 @@ class MetadataAndSafetyTests(unittest.TestCase):
                 "payload": {"model": "fallback-model", "reasoning_effort": "high"},
             }) + "\n", encoding="utf-8")
             item = _item(str(path))
-            with mock.patch.object(
-                watchdog, "codex_sqlite_metadata_batch", side_effect=RuntimeError("unexpected")):
-                values = watchdog.load_dashboard_metadata([item])
-        self.assertEqual(values[watchdog.target_key(item)].model, "fallback-model")
+            with mock.patch.object(wd_metadata, "codex_sqlite_metadata_batch", side_effect=RuntimeError("unexpected")):
+                values = wd_metadata.load_dashboard_metadata([item])
+        self.assertEqual(values[wd_metadata.target_key(item)].model, "fallback-model")
 
     def test_jsonl_metadata_read_has_a_fixed_byte_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "large.jsonl"
-            path.write_bytes(b'{"payload":"' + b"x" * (watchdog.MAX_METADATA_BYTES * 3) + b'"}\n')
+            path.write_bytes(b'{"payload":"' + b"x" * (wd_models.MAX_METADATA_BYTES * 3) + b'"}\n')
             reads = []
             original = Path.open
 
@@ -639,16 +634,16 @@ class MetadataAndSafetyTests(unittest.TestCase):
                     return self.handle.read(size)
 
             with mock.patch.object(Path, "open", lambda value, *a, **kw: TrackingReader(original(value, *a, **kw))):
-                watchdog.jsonl_metadata(_item(str(path)))
-        self.assertLessEqual(sum(size for size in reads if size > 0), watchdog.MAX_METADATA_BYTES)
+                wd_metadata.jsonl_metadata(_item(str(path)))
+        self.assertLessEqual(sum(size for size in reads if size > 0), wd_models.MAX_METADATA_BYTES)
 
     def test_tail_metadata_is_read_even_when_head_has_many_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "many.jsonl"
             head = "".join(json.dumps({"type": "noise", "n": index}) + "\n" for index in range(250))
             tail = json.dumps({"type": "turn_context", "payload": {"model": "latest-model", "reasoning_effort": "xhigh"}}) + "\n"
-            path.write_text(head + (" " * watchdog.READ_CHUNK_BYTES) + "\n" + tail, encoding="utf-8")
-            result = watchdog.jsonl_metadata(_item(str(path)), max_records=20)
+            path.write_text(head + (" " * wd_models.READ_CHUNK_BYTES) + "\n" + tail, encoding="utf-8")
+            result = wd_metadata.jsonl_metadata(_item(str(path)), max_records=20)
         self.assertEqual((result.model, result.effort), ("latest-model", "xhigh"))
 
     def test_non_claude_metadata_preserves_the_deep_tail_window(self):
@@ -661,7 +656,7 @@ class MetadataAndSafetyTests(unittest.TestCase):
             }).encode() + b"\n"
             tail = b'{"type":"noise","content":"' + b"t" * 99_000 + b'"}\n'
             path.write_bytes(head + metadata + tail)
-            result = watchdog.jsonl_metadata(_item(str(path), source="codex"))
+            result = wd_metadata.jsonl_metadata(_item(str(path), source="codex"))
         self.assertEqual((result.model, result.effort), ("deep-tail-model", "high"))
 
 
@@ -670,8 +665,8 @@ class DashboardControllerTests(unittest.TestCase):
         for down, up in (("j", "k"), (258, 259)):
             with self.subTest(down=down):
                 screen = FakeScreen(keys=[down, up])
-                dashboard = watchdog.TerminalDashboard(
-                    screen, watchdog.Config(no_color=True), mock.Mock(A_REVERSE=1)
+                dashboard = wd_dashboard.TerminalDashboard(
+                    screen, wd_models.Config(no_color=True), mock.Mock(A_REVERSE=1)
                 )
                 snapshot = _snapshot([_item("a"), _item("b")])
                 dashboard.update(snapshot)
@@ -692,73 +687,73 @@ class DashboardControllerTests(unittest.TestCase):
             child.write_text(json.dumps({"timestamp": NOW.isoformat()}) + "\n")
             ignored = child.parent / "agent-one.meta.json"
             ignored.write_text("{}")
-            with mock.patch.object(watchdog, "claude_projects_dir", return_value=root):
-                selected = watchdog.select_watch_set(watchdog.Config(source="claude"), now=NOW)
+            with mock.patch.object(wd_config, "claude_projects_dir", return_value=root):
+                selected = wd_activity.select_watch_set(wd_models.Config(source="claude"), now=NOW)
             self.assertEqual([item.path for item in selected], [child])
 
     def test_filter_changes_rows_but_not_guard_targets(self):
         first, second = _item("a.jsonl", "codex"), _item("b.jsonl", "claude")
         metadata = {
-            watchdog.target_key(first): _metadata(task="Alpha"),
-            watchdog.target_key(second): _metadata(task="Beta"),
+            wd_metadata.target_key(first): _metadata(task="Alpha"),
+            wd_metadata.target_key(second): _metadata(task="Beta"),
         }
-        snap = watchdog.make_dashboard_snapshot(
-            NOW, watchdog.Config(), [first, second],
+        snap = wd_dashboard.make_dashboard_snapshot(
+            NOW, wd_models.Config(), [first, second],
             [(first, NOW), (second, NOW - timedelta(seconds=2))], 0, 10, metadata,
         )
-        state = watchdog.DashboardState(query="beta")
-        visible = watchdog.visible_dashboard_rows(snap.rows, state)
+        state = wd_models.DashboardState(query="beta")
+        visible = wd_dashboard.visible_dashboard_rows(snap.rows, state)
         self.assertEqual([row.task for row in visible], ["Beta"])
         self.assertEqual(snap.watched_count, 2)
 
     def test_keys_filter_sort_provider_navigation_detail_clear_and_quit(self):
-        state = watchdog.DashboardState()
-        self.assertEqual(watchdog.handle_dashboard_key(state, ord("/"), 4), "filter")
-        watchdog.handle_dashboard_key(state, ord("x"), 4)
+        state = wd_models.DashboardState()
+        self.assertEqual(wd_dashboard.handle_dashboard_key(state, ord("/"), 4), "filter")
+        wd_dashboard.handle_dashboard_key(state, ord("x"), 4)
         self.assertEqual(state.query, "x")
-        watchdog.handle_dashboard_key(state, 10, 4)
+        wd_dashboard.handle_dashboard_key(state, 10, 4)
         self.assertFalse(state.filter_input)
-        watchdog.handle_dashboard_key(state, ord("s"), 4)
+        wd_dashboard.handle_dashboard_key(state, ord("s"), 4)
         self.assertEqual(state.sort, "title")
-        watchdog.handle_dashboard_key(state, ord("p"), 4)
+        wd_dashboard.handle_dashboard_key(state, ord("p"), 4)
         self.assertIsNotNone(state.source_filter)
-        watchdog.handle_dashboard_key(state, ord("j"), 4)
+        wd_dashboard.handle_dashboard_key(state, ord("j"), 4)
         self.assertEqual(state.selected, 1)
-        watchdog.handle_dashboard_key(state, ord("k"), 4)
+        wd_dashboard.handle_dashboard_key(state, ord("k"), 4)
         self.assertEqual(state.selected, 0)
-        watchdog.handle_dashboard_key(state, 10, 4)
+        wd_dashboard.handle_dashboard_key(state, 10, 4)
         self.assertTrue(state.details)
-        watchdog.handle_dashboard_key(state, ord("c"), 4)
+        wd_dashboard.handle_dashboard_key(state, ord("c"), 4)
         self.assertEqual((state.query, state.source_filter), ("", None))
         with self.assertRaises(KeyboardInterrupt):
-            watchdog.handle_dashboard_key(state, ord("q"), 4)
+            wd_dashboard.handle_dashboard_key(state, ord("q"), 4)
 
     def test_selection_is_retained_by_stable_target_key(self):
         a, b = _item("a.jsonl"), _item("b.jsonl")
-        state = watchdog.DashboardState(selected_key=watchdog.target_key(b))
-        watchdog.retain_dashboard_selection(state, [_snapshot([b]).rows[0], _snapshot([a]).rows[0]])
+        state = wd_models.DashboardState(selected_key=wd_metadata.target_key(b))
+        wd_dashboard.retain_dashboard_selection(state, [_snapshot([b]).rows[0], _snapshot([a]).rows[0]])
         self.assertEqual(state.selected, 0)
 
     def test_identity_growth_does_not_change_display_target_key(self):
         original = _item("shared.jsonl", "omx", frozenset({"one"}))
         expanded = _item("shared.jsonl", "omx", frozenset({"one", "two"}))
-        self.assertEqual(watchdog.target_key(original), watchdog.target_key(expanded))
+        self.assertEqual(wd_metadata.target_key(original), wd_metadata.target_key(expanded))
         self.assertEqual(
-            watchdog.dashboard_admission_notice([original], [expanded]),
+            wd_app.dashboard_admission_notice([original], [expanded]),
             "admitted 1 new OMX identity",
         )
 
     def test_escape_cancels_filter_edit_and_special_keys_are_not_text(self):
-        state = watchdog.DashboardState(query="alpha")
-        watchdog.handle_dashboard_key(state, ord("/"), 2)
-        watchdog.handle_dashboard_key(state, ord("x"), 2)
-        watchdog.handle_dashboard_key(state, 410, 2)  # curses KEY_RESIZE
-        watchdog.handle_dashboard_key(state, 27, 2)
+        state = wd_models.DashboardState(query="alpha")
+        wd_dashboard.handle_dashboard_key(state, ord("/"), 2)
+        wd_dashboard.handle_dashboard_key(state, ord("x"), 2)
+        wd_dashboard.handle_dashboard_key(state, 410, 2)  # curses KEY_RESIZE
+        wd_dashboard.handle_dashboard_key(state, 27, 2)
         self.assertEqual(state.query, "alpha")
         self.assertFalse(state.filter_input)
-        watchdog.handle_dashboard_key(state, ord("/"), 2)
-        watchdog.handle_dashboard_key(state, "界", 2)
-        watchdog.handle_dashboard_key(state, 10, 2)
+        wd_dashboard.handle_dashboard_key(state, ord("/"), 2)
+        wd_dashboard.handle_dashboard_key(state, "界", 2)
+        wd_dashboard.handle_dashboard_key(state, 10, 2)
         self.assertEqual(state.query, "alpha界")
 
 
@@ -766,16 +761,16 @@ class RenderingTests(unittest.TestCase):
     def test_medium_widths_preserve_full_countdown(self):
         for width in (80, 81, 82, 90, 99):
             with self.subTest(width=width):
-                row = next(line for line in watchdog.dashboard_lines(_snapshot(), width=width) if "CODEX" in line)
+                row = next(line for line in wd_dashboard.dashboard_lines(_snapshot(), width=width) if "CODEX" in line)
                 self.assertIn("29:55", row)
-                self.assertLessEqual(watchdog.text_cells(row), width - 1)
+                self.assertLessEqual(wd_text.text_cells(row), width - 1)
 
     def test_wide_screen_can_donate_short_task_space_to_long_labels(self):
         item = _item()
         client = "OpenCode custom orchestration client"
         model = "model-" + "x" * 90
-        snap = _snapshot(metadata={watchdog.target_key(item): _metadata(task="Task", client=client, model=model)})
-        row = next(line for line in watchdog.dashboard_lines(snap, width=210) if "CODEX" in line)
+        snap = _snapshot(metadata={wd_metadata.target_key(item): _metadata(task="Task", client=client, model=model)})
+        row = next(line for line in wd_dashboard.dashboard_lines(snap, width=210) if "CODEX" in line)
         self.assertIn(client, row)
         self.assertIn(model, row)
 
@@ -783,33 +778,33 @@ class RenderingTests(unittest.TestCase):
         item = _item()
         task = "Review all notebook exercises and validate the generated security report"
         model = "muse-spark-1.3-contributor-free"
-        snap = _snapshot(metadata={watchdog.target_key(item): _metadata(task=task, model=model, effort="high")})
+        snap = _snapshot(metadata={wd_metadata.target_key(item): _metadata(task=task, model=model, effort="high")})
         screen = FakeScreen(width=210)
-        dashboard = watchdog.TerminalDashboard(screen, watchdog.Config(no_color=True))
+        dashboard = wd_dashboard.TerminalDashboard(screen, wd_models.Config(no_color=True))
         dashboard.update(snap)
         row = screen.lines[(3, 0)]
         self.assertIn(task, row)
         self.assertIn(model + " / high", row)
-        self.assertGreater(watchdog.text_cells(row), 180)
+        self.assertGreater(wd_text.text_cells(row), 180)
         screen.width = 100
         dashboard.update(snap)
-        self.assertLessEqual(watchdog.text_cells(screen.lines[(3, 0)]), 99)
+        self.assertLessEqual(wd_text.text_cells(screen.lines[(3, 0)]), 99)
 
     def test_group_details_appear_in_panel_and_exit_report(self):
         item = _item("db", "opencode", frozenset({"root"}))
         details = ("Build UI · builder · muse / high", "Audit · explore · opus / medium")
         metadata = _metadata(client="OpenCode", task="Build UI | Audit", details=details)
-        snap = _snapshot([item], {watchdog.target_key(item): metadata})
+        snap = _snapshot([item], {wd_metadata.target_key(item): metadata})
         screen = FakeScreen(width=180)
-        dashboard = watchdog.TerminalDashboard(screen, watchdog.Config(no_color=True), mock.Mock(A_REVERSE=1))
+        dashboard = wd_dashboard.TerminalDashboard(screen, wd_models.Config(no_color=True), mock.Mock(A_REVERSE=1))
         dashboard.state.details = True
         dashboard.update(snap)
         rendered = "\n".join(screen.lines.values())
         for detail in details:
             self.assertIn(detail, rendered)
-        history = watchdog.WatchHistory()
+        history = wd_reporting.WatchHistory()
         history.observe(snap)
-        report = "\n".join(watchdog.exit_report_lines(history, watchdog.Config(), 130, ""))
+        report = "\n".join(wd_reporting.exit_report_lines(history, wd_models.Config(), 130, ""))
         for detail in details:
             self.assertIn(detail, report)
 
@@ -819,10 +814,10 @@ class RenderingTests(unittest.TestCase):
         screen = FakeScreen(width=120)
         screen.addnstr = mock.Mock()
         with mock.patch.dict(os.environ, {}, clear=True):
-            dashboard = watchdog.TerminalDashboard(screen, watchdog.Config(), curses)
+            dashboard = wd_dashboard.TerminalDashboard(screen, wd_models.Config(), curses)
         items = [_item("a"), _item("b"), _item("c")]
         metadata = {
-            watchdog.target_key(item): _metadata(client=client, model=model, effort="high")
+            wd_metadata.target_key(item): _metadata(client=client, model=model, effort="high")
             for item, client, model in zip(items,
                 ["Claude Code", "Codex Desktop", "codex-tui"],
                 ["claude-opus-5", "gpt-6-astra", "gpt-5.6-sol"])
@@ -854,8 +849,8 @@ class RenderingTests(unittest.TestCase):
                 screen = FakeScreen(width=80)
                 screen.addnstr = mock.Mock()
                 with mock.patch.dict(os.environ, {}, clear=True):
-                    dashboard = watchdog.TerminalDashboard(screen, watchdog.Config(no_color=no_color), curses)
-                dashboard.update(_snapshot(metadata={watchdog.target_key(_item()): _metadata(model="gpt-6-astra")}))
+                    dashboard = wd_dashboard.TerminalDashboard(screen, wd_models.Config(no_color=no_color), curses)
+                dashboard.update(_snapshot(metadata={wd_metadata.target_key(_item()): _metadata(model="gpt-6-astra")}))
                 calls = [call.args for call in screen.addnstr.call_args_list if call.args[0] == 3]
                 if no_color or not available:
                     self.assertTrue(all(args[4] in (0, 1) for args in calls))
@@ -866,8 +861,8 @@ class RenderingTests(unittest.TestCase):
 
     def test_wide_renderer_shows_fields_and_footer(self):
         screen = FakeScreen(width=120)
-        dashboard = watchdog.TerminalDashboard(screen, watchdog.Config(no_color=True))
-        dashboard.update(_snapshot(metadata={watchdog.target_key(_item()): _metadata(
+        dashboard = wd_dashboard.TerminalDashboard(screen, wd_models.Config(no_color=True))
+        dashboard.update(_snapshot(metadata={wd_metadata.target_key(_item()): _metadata(
             client="Desktop", task="Terminal dashboard", model="gpt-5", effort="high",
             started=NOW - timedelta(minutes=10), cwd="/repo", provenance="test")
         }))
@@ -882,38 +877,38 @@ class RenderingTests(unittest.TestCase):
 
     def test_wide_columns_keep_cell_positions_with_unicode_metadata(self):
         item = _item()
-        ascii_snap = _snapshot(metadata={watchdog.target_key(item): _metadata(
+        ascii_snap = _snapshot(metadata={wd_metadata.target_key(item): _metadata(
             client="Desktop", task="Task", model="model", effort="high")})
-        wide_snap = _snapshot(metadata={watchdog.target_key(item): _metadata(
+        wide_snap = _snapshot(metadata={wd_metadata.target_key(item): _metadata(
             client="客戶", task="界面任務", model="模型", effort="高")})
-        ascii_row = next(line for line in watchdog.dashboard_lines(ascii_snap) if "CODEX" in line)
-        wide_row = next(line for line in watchdog.dashboard_lines(wide_snap) if "CODEX" in line)
-        ascii_last_cell = watchdog.text_cells(ascii_row[:ascii_row.index("5s")])
-        wide_last_cell = watchdog.text_cells(wide_row[:wide_row.index("5s")])
+        ascii_row = next(line for line in wd_dashboard.dashboard_lines(ascii_snap) if "CODEX" in line)
+        wide_row = next(line for line in wd_dashboard.dashboard_lines(wide_snap) if "CODEX" in line)
+        ascii_last_cell = wd_text.text_cells(ascii_row[:ascii_row.index("5s")])
+        wide_last_cell = wd_text.text_cells(wide_row[:wide_row.index("5s")])
         self.assertEqual(ascii_last_cell, wide_last_cell)
 
     def test_narrow_renderer_stays_within_screen_and_keeps_labels(self):
         screen = FakeScreen(width=52)
-        dashboard = watchdog.TerminalDashboard(screen, watchdog.Config(no_color=True))
+        dashboard = wd_dashboard.TerminalDashboard(screen, wd_models.Config(no_color=True))
         dashboard.update(_snapshot())
         self.assertTrue(screen.lines)
-        self.assertTrue(all(watchdog.text_cells(text) <= 51 for text in screen.lines.values()))
+        self.assertTrue(all(wd_text.text_cells(text) <= 51 for text in screen.lines.values()))
         output = "\n".join(screen.lines.values())
         self.assertIn("CODEX", output)
         self.assertIn("q exit", output)
 
     def test_compact_row_preserves_last_and_quiet_columns_for_long_task(self):
         item = _item()
-        metadata = {watchdog.target_key(item): _metadata(task="T" * 500)}
-        lines = watchdog.dashboard_lines(_snapshot(metadata=metadata), width=52, height=12)
+        metadata = {wd_metadata.target_key(item): _metadata(task="T" * 500)}
+        lines = wd_dashboard.dashboard_lines(_snapshot(metadata=metadata), width=52, height=12)
         row = next(line for line in lines if "CODEX" in line)
         self.assertIn("5s", row)
         self.assertIn("29:55", row)
 
     def test_countdown_advances_between_authoritative_polls(self):
         snap = _snapshot()
-        later = watchdog.dashboard_lines(
-            watchdog.replace(snap, now=snap.now + timedelta(seconds=10)),
+        later = wd_dashboard.dashboard_lines(
+            replace(snap, now=snap.now + timedelta(seconds=10)),
             width=120,
             height=12,
         )
@@ -921,8 +916,8 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("29:45", row)
 
     def test_admission_notice_is_visible_for_the_poll_cycle(self):
-        snap = watchdog.replace(_snapshot(), admission_notice="admitted 1 new target")
-        output = "\n".join(watchdog.dashboard_lines(snap, width=120, height=12))
+        snap = replace(_snapshot(), admission_notice="admitted 1 new target")
+        output = "\n".join(wd_dashboard.dashboard_lines(snap, width=120, height=12))
         self.assertIn("admitted 1 new target", output)
 
     @unittest.skipUnless(hasattr(__import__("time"), "tzset"), "requires time.tzset")
@@ -934,10 +929,10 @@ class RenderingTests(unittest.TestCase):
         try:
             os.environ["TZ"] = "America/New_York"
             system_time.tzset()
-            metadata = {watchdog.target_key(item): _metadata(
+            metadata = {wd_metadata.target_key(item): _metadata(
                 task="Boundary", started=datetime(1, 1, 1, tzinfo=timezone.utc))}
-            state = watchdog.DashboardState(details=True)
-            output = "\n".join(watchdog.dashboard_lines(
+            state = wd_models.DashboardState(details=True)
+            output = "\n".join(wd_dashboard.dashboard_lines(
                 _snapshot(metadata=metadata), state, width=120, height=12))
         finally:
             if previous_tz is None:
@@ -951,7 +946,7 @@ class RenderingTests(unittest.TestCase):
         screen = FakeScreen(height=4, width=30)
         original = screen.addnstr
         screen.addnstr = mock.Mock(side_effect=[original(0, 0, "", 0), RuntimeError("edge")])
-        dashboard = watchdog.TerminalDashboard(screen, watchdog.Config(no_color=True))
+        dashboard = wd_dashboard.TerminalDashboard(screen, wd_models.Config(no_color=True))
         dashboard.update(_snapshot())
 
     def test_curses_context_restores_terminal_and_stdout_logging_on_failure(self):
@@ -959,36 +954,36 @@ class RenderingTests(unittest.TestCase):
         screen = FakeScreen()
         curses.initscr.return_value = screen
         logging = __import__("logging")
-        original_handlers = list(watchdog.log.handlers)
-        self.addCleanup(setattr, watchdog.log, "handlers", original_handlers)
+        original_handlers = list(wd_models.log.handlers)
+        self.addCleanup(setattr, wd_models.log, "handlers", original_handlers)
         stream_handler = logging.StreamHandler(sys.stdout)
-        watchdog.log.handlers = [stream_handler]
-        with mock.patch.object(watchdog, "_import_curses", return_value=curses):
+        wd_models.log.handlers = [stream_handler]
+        with mock.patch.object(wd_dashboard, "_import_curses", return_value=curses):
             with self.assertRaisesRegex(RuntimeError, "boom"):
-                with watchdog.dashboard_context(watchdog.Config(display="dashboard")):
+                with wd_dashboard.dashboard_context(wd_models.Config(display="dashboard")):
                     raise RuntimeError("boom")
         curses.endwin.assert_called_once_with()
-        self.assertIn(stream_handler, watchdog.log.handlers)
+        self.assertIn(stream_handler, wd_models.log.handlers)
 
 
 class ExitReportTests(unittest.TestCase):
     def test_user_idle_reset_and_quiet_checkpoints_explain_delayed_sleep(self):
-        history = watchdog.WatchHistory()
-        quiet = watchdog.replace(_snapshot(), session_quiet=True, holding_count=0, user_idle=240)
+        history = wd_reporting.WatchHistory()
+        quiet = replace(_snapshot(), session_quiet=True, holding_count=0, user_idle=240)
         history.observe(quiet)
-        history.observe(watchdog.replace(quiet, now=NOW + timedelta(seconds=60), user_idle=5))
-        history.observe(watchdog.replace(quiet, now=NOW + timedelta(minutes=16), user_idle=100))
+        history.observe(replace(quiet, now=NOW + timedelta(seconds=60), user_idle=5))
+        history.observe(replace(quiet, now=NOW + timedelta(minutes=16), user_idle=100))
         text = '\n'.join(message for _, message in history.events)
         self.assertIn('User-idle timer reset', text)
         self.assertIn('1m 40s idle / 5m required', history.events[-1][1])
 
     def test_empty_and_ambiguous_session_reports_include_diagnostics(self):
-        empty = '\n'.join(watchdog.exit_report_lines(watchdog.WatchHistory(), watchdog.Config(), 1, 'failed'))
-        self.assertIn(str(watchdog.LOG_FILE), empty)
-        history = watchdog.WatchHistory()
-        row = watchdog.replace(_snapshot().rows[0], agent='Ada\x1b[2J', identity_count=3, provenance='jsonl', task='x' * 10000)
-        history.observe(watchdog.replace(_snapshot(), rows=(row,)))
-        output = '\n'.join(watchdog.exit_report_lines(history, watchdog.Config(), 130, 'interrupted'))
+        empty = '\n'.join(wd_reporting.exit_report_lines(wd_reporting.WatchHistory(), wd_models.Config(), 1, 'failed'))
+        self.assertIn(str(wd_models.LOG_FILE), empty)
+        history = wd_reporting.WatchHistory()
+        row = replace(_snapshot().rows[0], agent='Ada\x1b[2J', identity_count=3, provenance='jsonl', task='x' * 10000)
+        history.observe(replace(_snapshot(), rows=(row,)))
+        output = '\n'.join(wd_reporting.exit_report_lines(history, wd_models.Config(), 130, 'interrupted'))
         self.assertIn(row.path, output)
         self.assertIn('agent Ada', output)
         self.assertIn('3 identities', output)
@@ -997,23 +992,23 @@ class ExitReportTests(unittest.TestCase):
         self.assertLess(len(output), 6000)
 
     def test_only_authoritative_poll_updates_history_not_ui_repaints(self):
-        cfg = watchdog.Config(idle_minutes=0, user_idle_minutes=0, session_discovery='frozen', no_color=True)
-        dashboard = watchdog.TerminalDashboard(FakeScreen(), cfg)
+        cfg = wd_models.Config(idle_minutes=0, user_idle_minutes=0, session_discovery='frozen', no_color=True)
+        dashboard = wd_dashboard.TerminalDashboard(FakeScreen(), cfg)
         item = _item()
         with (
-            mock.patch.object(watchdog, '_last_activity_for', return_value=NOW),
-            mock.patch.object(watchdog, 'load_dashboard_metadata', return_value={}),
+            mock.patch.object(wd_activity, '_last_activity_for', return_value=NOW),
+            mock.patch.object(wd_metadata, 'load_dashboard_metadata', return_value={}),
         ):
-            watchdog.wait_until_quiet(cfg, [item], dashboard)
+            wd_app.wait_until_quiet(cfg, [item], dashboard)
         recorded = dashboard.history.snapshot
         self.assertIsNotNone(recorded)
         events = list(dashboard.history.events)
-        dashboard.update(watchdog.replace(recorded, now=recorded.now + timedelta(hours=1)))
+        dashboard.update(replace(recorded, now=recorded.now + timedelta(hours=1)))
         self.assertIs(dashboard.history.snapshot, recorded)
         self.assertEqual(list(dashboard.history.events), events)
 
     def test_report_emission_respects_no_color_and_redirected_output(self):
-        history = watchdog.WatchHistory()
+        history = wd_reporting.WatchHistory()
         history.observe(_snapshot())
         for tty, no_color, environment in (
             (False, False, {'TERM': 'xterm-256color'}),
@@ -1024,29 +1019,29 @@ class ExitReportTests(unittest.TestCase):
             with self.subTest(tty=tty, no_color=no_color, environment=environment):
                 output = FakeTTY(tty)
                 with mock.patch.object(sys, 'stdout', output), mock.patch.dict(os.environ, environment, clear=True):
-                    watchdog.emit_exit_report(history, watchdog.Config(no_color=no_color), 130, 'interrupted')
+                    wd_reporting.emit_exit_report(history, wd_models.Config(no_color=no_color), 130, 'interrupted')
                 self.assertNotIn('\x1b', output.getvalue())
 
     def test_timeline_wraps_and_user_idle_uses_readable_durations(self):
-        history = watchdog.WatchHistory()
-        history.observe(watchdog.replace(_snapshot(), user_idle=10057, session_quiet=True, holding_count=0,
+        history = wd_reporting.WatchHistory()
+        history.observe(replace(_snapshot(), user_idle=10057, session_quiet=True, holding_count=0,
             admission_notice='admitted ' + 'new target ' * 30))
-        lines = watchdog.exit_report_lines(history, watchdog.Config(), 0, '', color=False)
+        lines = wd_reporting.exit_report_lines(history, wd_models.Config(), 0, '', color=False)
         output = '\n'.join(lines)
         timeline = output.split('RECENT TIMELINE')[1].split('FINAL SESSIONS')[0]
         self.assertTrue(all(len(line) <= 100 for line in timeline.splitlines()))
         self.assertIn('2h 47m 37s idle / 5m required', output)
 
     def test_history_records_quiet_gate_resumption_and_activity_countdown(self):
-        history = watchdog.WatchHistory()
+        history = wd_reporting.WatchHistory()
         first = _snapshot()
         history.observe(first)
-        quiet = watchdog.replace(first, now=NOW + timedelta(minutes=30),
+        quiet = replace(first, now=NOW + timedelta(minutes=30),
             session_quiet=True, holding_count=0, user_idle=30,
-            rows=tuple(watchdog.replace(row, holding=False) for row in first.rows))
+            rows=tuple(replace(row, holding=False) for row in first.rows))
         history.observe(quiet)
-        history.observe(watchdog.replace(quiet, now=quiet.now + timedelta(seconds=60), user_idle=300))
-        history.observe(watchdog.replace(first, now=quiet.now + timedelta(seconds=120)))
+        history.observe(replace(quiet, now=quiet.now + timedelta(seconds=60), user_idle=300))
+        history.observe(replace(first, now=quiet.now + timedelta(seconds=120)))
         text = '\n'.join(message for _, message in history.events)
         self.assertIn('All session guards quiet', text)
         self.assertIn('User-idle gate satisfied', text)
@@ -1054,28 +1049,28 @@ class ExitReportTests(unittest.TestCase):
         self.assertNotIn('tasks completed', text)
 
     def test_history_is_bounded_and_steady_polls_get_checkpoints(self):
-        history = watchdog.WatchHistory()
+        history = wd_reporting.WatchHistory()
         first = _snapshot()
         history.observe(first)
-        history.observe(watchdog.replace(first, now=NOW + timedelta(minutes=1)))
+        history.observe(replace(first, now=NOW + timedelta(minutes=1)))
         self.assertEqual(len(history.events), 1)
-        history.observe(watchdog.replace(first, now=NOW + timedelta(minutes=15)))
+        history.observe(replace(first, now=NOW + timedelta(minutes=15)))
         self.assertEqual(len(history.events), 2)
         for index in range(400):
-            history.observe(watchdog.replace(first, now=NOW + timedelta(minutes=16, seconds=index),
+            history.observe(replace(first, now=NOW + timedelta(minutes=16, seconds=index),
                 admission_notice=f'admitted {index}'))
         self.assertLessEqual(len(history.events), 256)
-        late = watchdog.replace(first, now=NOW + timedelta(hours=8))
+        late = replace(first, now=NOW + timedelta(hours=8))
         history.observe(late)
         self.assertTrue(all(at >= late.now - timedelta(hours=6) for at, _ in history.events))
 
     def test_report_contains_every_final_session_and_no_interactive_footer(self):
         items = [_item('a'), _item('b')]
-        metadata = {watchdog.target_key(item): _metadata(task=title, client='Codex Desktop', model='gpt-6-astra')
+        metadata = {wd_metadata.target_key(item): _metadata(task=title, client='Codex Desktop', model='gpt-6-astra')
             for item, title in zip(items, ['First task', 'Second task\x1b[2J'])}
-        history = watchdog.WatchHistory()
+        history = wd_reporting.WatchHistory()
         history.observe(_snapshot(items, metadata))
-        plain = '\n'.join(watchdog.exit_report_lines(history, watchdog.Config(), 130, 'interrupted', color=False))
+        plain = '\n'.join(wd_reporting.exit_report_lines(history, wd_models.Config(), 130, 'interrupted', color=False))
         self.assertIn('CLAUDE WATCHDOG — RUN REPORT', plain)
         self.assertIn('STOPPED', plain)
         self.assertIn('FINAL SESSIONS', plain)
@@ -1086,15 +1081,15 @@ class ExitReportTests(unittest.TestCase):
         self.assertNotIn('q exit', plain)
         self.assertNotIn('\x1b', plain)
         self.assertNotIn('sleeping Mac', plain)
-        colored = '\n'.join(watchdog.exit_report_lines(history, watchdog.Config(), 0, '', color=True))
+        colored = '\n'.join(wd_reporting.exit_report_lines(history, wd_models.Config(), 0, '', color=True))
         self.assertIn('\x1b[', colored)
         self.assertNotIn('\x1b', __import__('re').sub(r'\x1b\[[0-9;]*m', '', colored))
 
     def test_report_never_claims_sleep_or_completion_from_missing_activity(self):
-        history = watchdog.WatchHistory()
-        empty_activity = watchdog.replace(_snapshot(), rows=(), holding_count=0, session_quiet=True)
+        history = wd_reporting.WatchHistory()
+        empty_activity = replace(_snapshot(), rows=(), holding_count=0, session_quiet=True)
         history.observe(empty_activity)
-        output = '\n'.join(watchdog.exit_report_lines(history, watchdog.Config(dry_run=True), 0, '', color=False))
+        output = '\n'.join(wd_reporting.exit_report_lines(history, wd_models.Config(dry_run=True), 0, '', color=False))
         self.assertIn('DRY RUN', output)
         self.assertIn('No usable recorded activity', output)
         self.assertNotIn('tasks completed', output)
@@ -1105,7 +1100,7 @@ class DashboardLifecycleTests(unittest.TestCase):
     def test_cleanup_failures_skip_sleep_and_report_error(self):
         for failure in ('endwin', 'caffeinate'):
             with self.subTest(failure=failure):
-                cfg = watchdog.Config(display='dashboard', dry_run=True)
+                cfg = wd_models.Config(display='dashboard', dry_run=True)
                 curses = mock.Mock()
                 curses.initscr.return_value = FakeScreen()
                 item, process, patches = self._main_patches(cfg, curses)
@@ -1117,14 +1112,14 @@ class DashboardLifecycleTests(unittest.TestCase):
                 with ExitStack() as stack:
                     mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
                     stack.enter_context(mock.patch.object(sys, 'stdout', output))
-                    self.assertEqual(watchdog.main([]), 1)
+                    self.assertEqual(wd_app.main([]), 1)
                 mocks['force_sleep'].assert_not_called()
                 self.assertIn('ERROR', output.getvalue())
                 self.assertNotIn('SLEEP READY', output.getvalue())
                 process.terminate.assert_called_once()
 
     def test_failed_restore_during_initialization_cannot_fall_back_to_sleep(self):
-        cfg = watchdog.Config(display='auto', dry_run=True)
+        cfg = wd_models.Config(display='auto', dry_run=True)
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
         curses.noecho.side_effect = OSError('init failed')
@@ -1132,12 +1127,12 @@ class DashboardLifecycleTests(unittest.TestCase):
         item, process, patches = self._main_patches(cfg, curses)
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
-            self.assertEqual(watchdog.main([]), 1)
+            self.assertEqual(wd_app.main([]), 1)
         mocks['block_sleep'].assert_not_called()
         mocks['force_sleep'].assert_not_called()
 
     def test_exit_report_is_flushed_after_terminal_restore_and_before_sleep(self):
-        cfg = watchdog.Config(display='dashboard', dry_run=True)
+        cfg = wd_models.Config(display='dashboard', dry_run=True)
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
         observed = []
@@ -1146,7 +1141,7 @@ class DashboardLifecycleTests(unittest.TestCase):
         def poll(cfg, watch_set, dashboard):
             dashboard.history.observe(_snapshot())
         item, process, patches = self._main_patches(cfg, curses,
-            wait_until_quiet=mock.patch.object(watchdog, 'wait_until_quiet', side_effect=poll))
+            wait_until_quiet=mock.patch.object(wd_app, 'wait_until_quiet', side_effect=poll))
         curses.endwin.side_effect = lambda: observed.append('restored')
         process.terminate.side_effect = lambda: observed.append('released')
         with ExitStack() as stack:
@@ -1156,11 +1151,11 @@ class DashboardLifecycleTests(unittest.TestCase):
                 self.assertIn('RUN REPORT', output.getvalue())
                 self.assertEqual(observed[:3], ['restored', 'released', 'flush'])
             mocks['force_sleep'].side_effect = sleep
-            self.assertEqual(watchdog.main([]), 0)
+            self.assertEqual(wd_app.main([]), 0)
         mocks['force_sleep'].assert_called_once_with(True)
 
     def test_report_output_failure_cannot_skip_cleanup_or_request_sleep(self):
-        cfg = watchdog.Config(display='dashboard', dry_run=True)
+        cfg = wd_models.Config(display='dashboard', dry_run=True)
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
         output = mock.Mock()
@@ -1169,11 +1164,11 @@ class DashboardLifecycleTests(unittest.TestCase):
         def poll(cfg, watch_set, dashboard):
             dashboard.history.observe(_snapshot())
         item, process, patches = self._main_patches(cfg, curses,
-            wait_until_quiet=mock.patch.object(watchdog, 'wait_until_quiet', side_effect=poll))
+            wait_until_quiet=mock.patch.object(wd_app, 'wait_until_quiet', side_effect=poll))
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
             stack.enter_context(mock.patch.object(sys, 'stdout', output))
-            self.assertEqual(watchdog.main([]), 1)
+            self.assertEqual(wd_app.main([]), 1)
         process.terminate.assert_called_once()
         curses.endwin.assert_called_once()
         mocks['force_sleep'].assert_not_called()
@@ -1184,88 +1179,88 @@ class DashboardLifecycleTests(unittest.TestCase):
         process.poll.return_value = None
         process.wait.return_value = 0
         patches = {
-            "parse_args": mock.patch.object(watchdog, "parse_args", return_value=cfg),
-            "setup_logging": mock.patch.object(watchdog, "setup_logging"),
-            "activity_files": mock.patch.object(watchdog, "activity_files", return_value=[item]),
-            "select_watch_set": mock.patch.object(watchdog, "select_watch_set", return_value=[item]),
-            "resolve_display": mock.patch.object(watchdog, "resolve_display", return_value="dashboard"),
-            "_import_curses": mock.patch.object(watchdog, "_import_curses", return_value=curses),
-            "block_sleep": mock.patch.object(watchdog, "block_sleep", return_value=process),
-            "wait_until_quiet": mock.patch.object(watchdog, "wait_until_quiet"),
-            "force_sleep": mock.patch.object(watchdog, "force_sleep"),
+            "parse_args": mock.patch.object(wd_config, "parse_args", return_value=cfg),
+            "setup_logging": mock.patch.object(wd_app, "setup_logging"),
+            "activity_files": mock.patch.object(wd_activity, "activity_files", return_value=[item]),
+            "select_watch_set": mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
+            "resolve_display": mock.patch.object(wd_dashboard, "resolve_display", return_value="dashboard"),
+            "_import_curses": mock.patch.object(wd_dashboard, "_import_curses", return_value=curses),
+            "block_sleep": mock.patch.object(wd_power, "block_sleep", return_value=process),
+            "wait_until_quiet": mock.patch.object(wd_app, "wait_until_quiet"),
+            "force_sleep": mock.patch.object(wd_power, "force_sleep"),
         }
         patches.update(extra)
         return item, process, patches
 
     def test_auto_falls_back_when_lazy_curses_import_fails(self):
-        cfg = watchdog.Config(display="auto", dry_run=True)
+        cfg = wd_models.Config(display="auto", dry_run=True)
         item = _item()
         process = mock.Mock()
         process.poll.return_value = None
         process.wait.return_value = 0
         with (
-            mock.patch.object(watchdog, "parse_args", return_value=cfg),
-            mock.patch.object(watchdog, "setup_logging"),
-            mock.patch.object(watchdog, "activity_files", return_value=[item]),
-            mock.patch.object(watchdog, "select_watch_set", return_value=[item]),
-            mock.patch.object(watchdog, "resolve_display", return_value="dashboard"),
-            mock.patch.object(watchdog, "_import_curses", side_effect=ImportError("no curses")),
-            mock.patch.object(watchdog, "block_sleep", return_value=process),
-            mock.patch.object(watchdog, "wait_until_quiet") as wait,
-            mock.patch.object(watchdog, "force_sleep"),
+            mock.patch.object(wd_config, "parse_args", return_value=cfg),
+            mock.patch.object(wd_app, "setup_logging"),
+            mock.patch.object(wd_activity, "activity_files", return_value=[item]),
+            mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
+            mock.patch.object(wd_dashboard, "resolve_display", return_value="dashboard"),
+            mock.patch.object(wd_dashboard, "_import_curses", side_effect=ImportError("no curses")),
+            mock.patch.object(wd_power, "block_sleep", return_value=process),
+            mock.patch.object(wd_app, "wait_until_quiet") as wait,
+            mock.patch.object(wd_power, "force_sleep"),
         ):
-            self.assertEqual(watchdog.main([]), 0)
+            self.assertEqual(wd_app.main([]), 0)
         wait.assert_called_once_with(cfg, [item])
 
     def test_explicit_dashboard_import_failure_never_starts_hold(self):
-        cfg = watchdog.Config(display="dashboard", dry_run=True)
+        cfg = wd_models.Config(display="dashboard", dry_run=True)
         item = _item()
         with (
-            mock.patch.object(watchdog, "parse_args", return_value=cfg),
-            mock.patch.object(watchdog, "setup_logging"),
-            mock.patch.object(watchdog, "activity_files", return_value=[item]),
-            mock.patch.object(watchdog, "select_watch_set", return_value=[item]),
-            mock.patch.object(watchdog, "resolve_display", return_value="dashboard"),
-            mock.patch.object(watchdog, "_import_curses", side_effect=ImportError("no curses")),
-            mock.patch.object(watchdog, "block_sleep") as block,
-            mock.patch.object(watchdog, "wait_until_quiet") as wait,
-            mock.patch.object(watchdog, "force_sleep") as sleep,
+            mock.patch.object(wd_config, "parse_args", return_value=cfg),
+            mock.patch.object(wd_app, "setup_logging"),
+            mock.patch.object(wd_activity, "activity_files", return_value=[item]),
+            mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
+            mock.patch.object(wd_dashboard, "resolve_display", return_value="dashboard"),
+            mock.patch.object(wd_dashboard, "_import_curses", side_effect=ImportError("no curses")),
+            mock.patch.object(wd_power, "block_sleep") as block,
+            mock.patch.object(wd_app, "wait_until_quiet") as wait,
+            mock.patch.object(wd_power, "force_sleep") as sleep,
         ):
-            self.assertEqual(watchdog.main([]), 1)
+            self.assertEqual(wd_app.main([]), 1)
         block.assert_not_called()
         wait.assert_not_called()
         sleep.assert_not_called()
 
     def test_main_passes_yielded_dashboard_to_watch_loop(self):
-        cfg = watchdog.Config(display="dashboard", dry_run=True)
+        cfg = wd_models.Config(display="dashboard", dry_run=True)
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
         item, process, patches = self._main_patches(cfg, curses)
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
-            self.assertEqual(watchdog.main([]), 0)
+            self.assertEqual(wd_app.main([]), 0)
         args = mocks["wait_until_quiet"].call_args.args
         self.assertEqual(args[:2], (cfg, [item]))
-        self.assertIsInstance(args[2], watchdog.TerminalDashboard)
+        self.assertIsInstance(args[2], wd_dashboard.TerminalDashboard)
         curses.endwin.assert_called_once_with()
         process.terminate.assert_called_once_with()
 
     def test_block_sleep_interrupt_restores_dashboard(self):
-        cfg = watchdog.Config(display="dashboard")
+        cfg = wd_models.Config(display="dashboard")
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
         item, process, patches = self._main_patches(
             cfg, curses,
-            block_sleep=mock.patch.object(watchdog, "block_sleep", side_effect=KeyboardInterrupt),
+            block_sleep=mock.patch.object(wd_power, "block_sleep", side_effect=KeyboardInterrupt),
         )
         with ExitStack() as stack:
             for patch in patches.values():
                 stack.enter_context(patch)
-            self.assertEqual(watchdog.main([]), 130)
+            self.assertEqual(wd_app.main([]), 130)
         curses.endwin.assert_called_once_with()
 
     def test_cleanup_interrupt_occurs_after_dashboard_restoration(self):
-        cfg = watchdog.Config(display="dashboard")
+        cfg = wd_models.Config(display="dashboard")
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
         restored = []
@@ -1276,55 +1271,54 @@ class DashboardLifecycleTests(unittest.TestCase):
 
         item, process, patches = self._main_patches(
             cfg, curses,
-            _stop_caffeinate=mock.patch.object(watchdog, "_stop_caffeinate", side_effect=interrupted_cleanup),
+            _stop_caffeinate=mock.patch.object(wd_power, "_stop_caffeinate", side_effect=interrupted_cleanup),
         )
         with ExitStack() as stack:
             for patch in patches.values():
                 stack.enter_context(patch)
-            self.assertEqual(watchdog.main([]), 130)
+            self.assertEqual(wd_app.main([]), 130)
         self.assertGreaterEqual(len(restored), 1)
         self.assertTrue(all(restored))
 
     def test_dashboard_initialization_interrupt_exits_without_starting_hold(self):
-        cfg = watchdog.Config(display="dashboard")
+        cfg = wd_models.Config(display="dashboard")
         item = _item()
         with (
-            mock.patch.object(watchdog, "parse_args", return_value=cfg),
-            mock.patch.object(watchdog, "setup_logging"),
-            mock.patch.object(watchdog, "activity_files", return_value=[item]),
-            mock.patch.object(watchdog, "select_watch_set", return_value=[item]),
-            mock.patch.object(watchdog, "resolve_display", return_value="dashboard"),
-            mock.patch.object(watchdog, "_import_curses", side_effect=KeyboardInterrupt),
-            mock.patch.object(watchdog, "block_sleep") as block,
+            mock.patch.object(wd_config, "parse_args", return_value=cfg),
+            mock.patch.object(wd_app, "setup_logging"),
+            mock.patch.object(wd_activity, "activity_files", return_value=[item]),
+            mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
+            mock.patch.object(wd_dashboard, "resolve_display", return_value="dashboard"),
+            mock.patch.object(wd_dashboard, "_import_curses", side_effect=KeyboardInterrupt),
+            mock.patch.object(wd_power, "block_sleep") as block,
         ):
-            self.assertEqual(watchdog.main([]), 130)
+            self.assertEqual(wd_app.main([]), 130)
         block.assert_not_called()
 
     def test_dashboard_exit_interrupt_releases_existing_hold_without_rerun(self):
-        cfg = watchdog.Config(display="auto")
+        cfg = wd_models.Config(display="auto")
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
         curses.endwin.side_effect = KeyboardInterrupt
         item, process, patches = self._main_patches(cfg, curses)
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
-            self.assertEqual(watchdog.main([]), 130)
+            self.assertEqual(wd_app.main([]), 130)
         mocks["block_sleep"].assert_called_once_with()
         process.terminate.assert_called_once()
 
     def test_unexpected_display_failure_restores_and_aborts_without_sleep(self):
-        cfg = watchdog.Config(display="dashboard")
+        cfg = wd_models.Config(display="dashboard")
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
         item, process, patches = self._main_patches(
             cfg, curses,
-            wait_until_quiet=mock.patch.object(
-                watchdog, "wait_until_quiet", side_effect=RuntimeError("render broke")),
+            wait_until_quiet=mock.patch.object(wd_app, "wait_until_quiet", side_effect=RuntimeError("render broke")),
         )
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
-            with self.assertLogs(watchdog.log, level="ERROR") as captured:
-                self.assertEqual(watchdog.main([]), 1)
+            with self.assertLogs(wd_models.log, level="ERROR") as captured:
+                self.assertEqual(wd_app.main([]), 1)
         curses.endwin.assert_called_once_with()
         process.terminate.assert_called_once_with()
         mocks["block_sleep"].assert_called_once_with()

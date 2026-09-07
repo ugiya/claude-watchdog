@@ -35,8 +35,11 @@ from pathlib import Path
 from typing import Callable
 
 
-TARGET = Path(__file__).resolve().parents[1] / "claude-watchdog"
-ARTIFACT_DIR = TARGET.parent / ".omx" / "artifacts" / "dashboard-pty"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TARGET = Path(os.environ.get("WATCHDOG_TEST_TARGET", PROJECT_ROOT / "claude-watchdog")).resolve()
+ARTIFACT_DIR = PROJECT_ROOT / ".omx" / "artifacts" / "dashboard-pty" / (
+    "source" if TARGET == PROJECT_ROOT / "claude-watchdog" else "installed"
+)
 POLL_SECONDS = 0.2
 WAIT_SECONDS = 10.0
 ALTERNATE_SCREEN_EXIT = b"\x1b[?1049l"
@@ -635,6 +638,7 @@ class DashboardPtyTests(unittest.TestCase):
         _set_pty_size(slave_fd, rows, columns)
         env = os.environ.copy()
         env.pop("WATCHDOG_TARGET", None)
+        env.pop("WATCHDOG_TEST_TARGET", None)
         env.pop("NO_COLOR", None)
         env.update(
             {
@@ -767,7 +771,7 @@ class DashboardPtyTests(unittest.TestCase):
                 "watchdog_pid": running.process.pid,
                 "caffeinate_pid": running.caffeinate_pid,
                 "return_code": running.process.returncode,
-                "transcript": str(running.transcript_path.relative_to(TARGET.parent)),
+                "transcript": str(running.transcript_path.relative_to(PROJECT_ROOT)),
                 "transcript_bytes": len(running.transcript),
                 "pmset_invoked": self.pmset_attempt_file.exists(),
                 **facts,
@@ -1030,5 +1034,5 @@ class DashboardPtyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     if not TARGET.is_file():
-        raise SystemExit(f"worktree watchdog not found: {TARGET}")
+        raise SystemExit(f"test watchdog target not found: {TARGET}")
     unittest.main(verbosity=2)

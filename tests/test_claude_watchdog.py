@@ -3,14 +3,11 @@
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import io
 import json
 import os
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -18,18 +15,11 @@ from pathlib import Path
 from unittest import mock
 
 
-def _load_target():
-    default_target = Path(__file__).with_name("claude-watchdog")
-    target = Path(os.environ.get("WATCHDOG_TARGET", default_target))
-    loader = importlib.machinery.SourceFileLoader("claude_watchdog_target", str(target))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    loader.exec_module(module)
-    return module
-
-
-watchdog = _load_target()
+from claude_watchdog import models as wd_models
+from claude_watchdog import config as wd_config
+from claude_watchdog import activity as wd_activity
+from claude_watchdog import power as wd_power
+from claude_watchdog import app as wd_app
 
 
 def _write_records(path: Path, *records: object) -> None:
@@ -41,7 +31,7 @@ def _write_records(path: Path, *records: object) -> None:
 
 
 def _item(path: Path, source: str = "codex"):
-    return watchdog.ActivityFile(
+    return wd_models.ActivityFile(
         path=path,
         source=source,
         snapshot_size=path.stat().st_size,
@@ -84,10 +74,10 @@ class ClaudeProfileTests(unittest.TestCase):
                 path,
                 [{"id": "work", "label": "Work", "projects_dir": str(projects)}],
             )
-            profiles = watchdog.load_claude_profiles(path, required=True)
+            profiles = wd_config.load_claude_profiles(path, required=True)
         self.assertEqual(
             profiles,
-            (watchdog.ClaudeProfile("work", "Work", projects.resolve()),),
+            (wd_models.ClaudeProfile("work", "Work", projects.resolve()),),
         )
 
     def test_profile_label_defaults_to_id(self):
@@ -105,38 +95,38 @@ class ClaudeProfileTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            profile = watchdog.load_claude_profiles(path, required=True)[0]
+            profile = wd_config.load_claude_profiles(path, required=True)[0]
         self.assertEqual(profile.label, "work")
 
     def test_missing_default_is_empty_but_missing_explicit_path_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "missing.json"
             self.assertEqual(
-                watchdog.load_claude_profiles(missing, required=False), ()
+                wd_config.load_claude_profiles(missing, required=False), ()
             )
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "does not exist"):
-                watchdog.load_claude_profiles(missing, required=True)
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "does not exist"):
+                wd_config.load_claude_profiles(missing, required=True)
 
     def test_rejects_oversized_or_malformed_profile_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             oversized = root / "oversized.json"
-            oversized.write_bytes(b" " * (watchdog.MAX_PROFILES_BYTES + 1))
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "64 KiB"):
-                watchdog.load_claude_profiles(oversized, required=True)
+            oversized.write_bytes(b" " * (wd_models.MAX_PROFILES_BYTES + 1))
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "64 KiB"):
+                wd_config.load_claude_profiles(oversized, required=True)
 
             malformed = root / "malformed.json"
             malformed.write_text("{", encoding="utf-8")
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "valid JSON"):
-                watchdog.load_claude_profiles(malformed, required=True)
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "valid JSON"):
+                wd_config.load_claude_profiles(malformed, required=True)
 
             boolean_version = root / "boolean-version.json"
             boolean_version.write_text(
                 json.dumps({"version": True, "claude_profiles": []}),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "version must be 1"):
-                watchdog.load_claude_profiles(boolean_version, required=True)
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "version must be 1"):
+                wd_config.load_claude_profiles(boolean_version, required=True)
 
     def test_rejects_duplicate_ids_roots_builtin_alias_and_invalid_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -161,17 +151,17 @@ class ClaudeProfileTests(unittest.TestCase):
             for profiles in cases:
                 with self.subTest(profiles=profiles):
                     self._write_config(path, profiles)
-                    with self.assertRaises(watchdog.ActivityReadError):
-                        watchdog.load_claude_profiles(path, required=True)
+                    with self.assertRaises(wd_models.ActivityReadError):
+                        wd_config.load_claude_profiles(path, required=True)
 
             builtin = root / "builtin"
             self._write_config(
                 path,
                 [{"id": "work", "label": "Work", "projects_dir": str(builtin)}],
             )
-            with mock.patch.object(watchdog, "claude_projects_dir", return_value=builtin):
-                with self.assertRaisesRegex(watchdog.ActivityReadError, "built-in"):
-                    watchdog.load_claude_profiles(path, required=True)
+            with mock.patch.object(wd_config, "claude_projects_dir", return_value=builtin):
+                with self.assertRaisesRegex(wd_models.ActivityReadError, "built-in"):
+                    wd_config.load_claude_profiles(path, required=True)
 
     def test_rejects_more_than_32_profiles(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,20 +171,20 @@ class ClaudeProfileTests(unittest.TestCase):
                 path,
                 [
                     {"id": f"p{index}", "label": f"P {index}", "projects_dir": str(root / f"p{index}")}
-                    for index in range(watchdog.MAX_CLAUDE_PROFILES + 1)
+                    for index in range(wd_models.MAX_CLAUDE_PROFILES + 1)
                 ],
             )
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "at most 32"):
-                watchdog.load_claude_profiles(path, required=True)
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "at most 32"):
+                wd_config.load_claude_profiles(path, required=True)
 
 
 class TimestampAndTailTests(unittest.TestCase):
     def test_timestamp_parser_normalizes_offsets(self):
         self.assertEqual(
-            watchdog._parse_ts("2026-08-14T03:00:00+03:00"),
+            wd_activity._parse_ts("2026-08-14T03:00:00+03:00"),
             datetime(2026, 8, 14, 0, 0, tzinfo=timezone.utc),
         )
-        self.assertIsNone(watchdog._parse_ts("not-a-timestamp"))
+        self.assertIsNone(wd_activity._parse_ts("not-a-timestamp"))
 
     def test_complete_record_larger_than_read_chunk_is_parsed(self):
         now = datetime(2026, 8, 14, tzinfo=timezone.utc)
@@ -206,10 +196,10 @@ class TimestampAndTailTests(unittest.TestCase):
                 {"timestamp": (now - timedelta(hours=1)).isoformat()},
                 {
                     "timestamp": recent.isoformat(),
-                    "payload": "x" * (watchdog.READ_CHUNK_BYTES * 4),
+                    "payload": "x" * (wd_models.READ_CHUNK_BYTES * 4),
                 },
             )
-            self.assertEqual(watchdog.last_activity(path, now=now), recent)
+            self.assertEqual(wd_activity.last_activity(path, now=now), recent)
 
     def test_malformed_partial_tail_falls_back_to_last_complete_record(self):
         now = datetime(2026, 8, 14, tzinfo=timezone.utc)
@@ -219,21 +209,19 @@ class TimestampAndTailTests(unittest.TestCase):
             _write_records(path, {"timestamp": recent.isoformat()})
             with path.open("a", encoding="utf-8") as handle:
                 handle.write('{"timestamp":"unterminated')
-            self.assertEqual(watchdog.last_activity(path, now=now), recent)
+            self.assertEqual(wd_activity.last_activity(path, now=now), recent)
 
     def test_missing_activity_file_is_quiet(self):
         self.assertIsNone(
-            watchdog.last_activity(Path("/definitely/missing.jsonl"))
+            wd_activity.last_activity(Path("/definitely/missing.jsonl"))
         )
 
     def test_activity_read_permission_error_fails_safe(self):
-        with mock.patch.object(
-            watchdog,
-            "_json_objects_reverse",
+        with mock.patch.object(wd_activity, "_json_objects_reverse",
             side_effect=PermissionError("denied"),
         ):
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "denied"):
-                watchdog.last_activity(Path("denied.jsonl"))
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "denied"):
+                wd_activity.last_activity(Path("denied.jsonl"))
 
     def test_far_future_timestamp_is_ignored(self):
         now = datetime(2026, 8, 14, tzinfo=timezone.utc)
@@ -245,35 +233,33 @@ class TimestampAndTailTests(unittest.TestCase):
                 {"timestamp": recent.isoformat()},
                 {"timestamp": (now + timedelta(days=30)).isoformat()},
             )
-            self.assertEqual(watchdog.last_activity(path, now=now), recent)
+            self.assertEqual(wd_activity.last_activity(path, now=now), recent)
 
 
 class DiscoveryAndSelectionTests(unittest.TestCase):
     def test_disappearing_file_during_discovery_is_ignored(self):
         path = Path("gone.jsonl")
         with (
-            mock.patch.object(watchdog, "_paths_for_source", return_value=[path]),
+            mock.patch.object(wd_activity, "_paths_for_source", return_value=[path]),
             mock.patch.object(Path, "stat", side_effect=FileNotFoundError("gone")),
         ):
-            self.assertEqual(watchdog.activity_files("codex"), [])
+            self.assertEqual(wd_activity.activity_files("codex"), [])
 
     def test_discovery_stat_permission_error_fails_safe(self):
         path = Path("denied.jsonl")
         with (
-            mock.patch.object(watchdog, "_paths_for_source", return_value=[path]),
+            mock.patch.object(wd_activity, "_paths_for_source", return_value=[path]),
             mock.patch.object(Path, "stat", side_effect=PermissionError("denied")),
         ):
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "denied"):
-                watchdog.activity_files("codex")
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "denied"):
+                wd_activity.activity_files("codex")
 
     def test_provider_discovery_error_fails_safe(self):
-        with mock.patch.object(
-            watchdog,
-            "_paths_for_source",
+        with mock.patch.object(wd_activity, "_paths_for_source",
             side_effect=PermissionError("provider denied"),
         ):
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "provider denied"):
-                watchdog.activity_files("codex")
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "provider denied"):
+                wd_activity.activity_files("codex")
 
     def test_source_union_and_filters(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -294,30 +280,30 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             opencode.write_bytes(b"")
 
             with (
-                mock.patch.object(watchdog, "claude_projects_dir", return_value=claude),
-                mock.patch.object(watchdog, "codex_sessions_dir", return_value=codex),
-                mock.patch.object(watchdog, "omx_log_dirs", return_value=[omx]),
-                mock.patch.object(watchdog, "opencode_database_path", return_value=opencode),
+                mock.patch.object(wd_config, "claude_projects_dir", return_value=claude),
+                mock.patch.object(wd_config, "codex_sessions_dir", return_value=codex),
+                mock.patch.object(wd_config, "omx_log_dirs", return_value=[omx]),
+                mock.patch.object(wd_config, "opencode_database_path", return_value=opencode),
             ):
-                profiles = (watchdog.ClaudeProfile("work", "Work", profile_root),)
-                auto = watchdog.activity_files("auto", profiles)
+                profiles = (wd_models.ClaudeProfile("work", "Work", profile_root),)
+                auto = wd_activity.activity_files("auto", profiles)
                 self.assertEqual(
                     {item.source for item in auto},
                     {"claude", "codex", "omx", "opencode"},
                 )
-                claude_files = watchdog.activity_files("claude", profiles)
+                claude_files = wd_activity.activity_files("claude", profiles)
                 self.assertEqual([item.source for item in claude_files], ["claude", "claude"])
                 self.assertEqual(
                     [(item.profile_id, item.profile_label) for item in claude_files],
                     [(None, None), ("work", "Work")],
                 )
-                self.assertEqual([item.source for item in watchdog.activity_files("codex")], ["codex"])
-                self.assertEqual([item.source for item in watchdog.activity_files("omx")], ["omx"])
+                self.assertEqual([item.source for item in wd_activity.activity_files("codex")], ["codex"])
+                self.assertEqual([item.source for item in wd_activity.activity_files("omx")], ["omx"])
                 self.assertEqual(
-                    [item.source for item in watchdog.activity_files("opencode")],
+                    [item.source for item in wd_activity.activity_files("opencode")],
                     ["opencode"],
                 )
-                self.assertNotIn("claude", {item.source for item in watchdog.activity_files("codex-omx")})
+                self.assertNotIn("claude", {item.source for item in wd_activity.activity_files("codex-omx")})
                 self.assertTrue(all(item.snapshot_size is not None for item in auto))
 
     def test_auto_selects_recent_profile_transcript(self):
@@ -330,16 +316,16 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             transcript = projects / "project" / "session.jsonl"
             _write_records(transcript, {"timestamp": now.isoformat()})
             with (
-                mock.patch.object(watchdog, "claude_projects_dir", return_value=claude),
-                mock.patch.object(watchdog, "codex_sessions_dir", return_value=root / "codex"),
-                mock.patch.object(watchdog, "omx_log_dirs", return_value=[root / "omx"]),
-                mock.patch.object(watchdog, "opencode_database_path", return_value=None),
+                mock.patch.object(wd_config, "claude_projects_dir", return_value=claude),
+                mock.patch.object(wd_config, "codex_sessions_dir", return_value=root / "codex"),
+                mock.patch.object(wd_config, "omx_log_dirs", return_value=[root / "omx"]),
+                mock.patch.object(wd_config, "opencode_database_path", return_value=None),
             ):
-                selected = watchdog.select_watch_set(
-                    watchdog.Config(
+                selected = wd_activity.select_watch_set(
+                    wd_models.Config(
                         select_window_seconds=120,
                         source="auto",
-                        claude_profiles=(watchdog.ClaudeProfile("work", "Work", projects),),
+                        claude_profiles=(wd_models.ClaudeProfile("work", "Work", projects),),
                     ),
                     now=now,
                 )
@@ -358,10 +344,10 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             profile_transcript = profile_root / "project" / "session.jsonl"
             _write_records(profile_transcript, {"timestamp": now.isoformat()})
             with (
-                mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "claude"),
+                mock.patch.object(wd_config, "claude_projects_dir", return_value=root / "claude"),
             ):
-                files = watchdog.activity_files(
-                    "claude", (watchdog.ClaudeProfile("work", "Work", profile_root),)
+                files = wd_activity.activity_files(
+                    "claude", (wd_models.ClaudeProfile("work", "Work", profile_root),)
                 )
             self.assertEqual(
                 [(item.profile_id, item.path) for item in files],
@@ -376,12 +362,12 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             _write_records(transcript, {"timestamp": "2026-08-16T00:00:00Z"})
             alias = root / "alias"
             alias.symlink_to(actual, target_is_directory=True)
-            with mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "vanilla"):
-                files = watchdog.activity_files(
+            with mock.patch.object(wd_config, "claude_projects_dir", return_value=root / "vanilla"):
+                files = wd_activity.activity_files(
                     "claude",
                     (
-                        watchdog.ClaudeProfile("first", "First", actual),
-                        watchdog.ClaudeProfile("second", "Second", alias),
+                        wd_models.ClaudeProfile("first", "First", actual),
+                        wd_models.ClaudeProfile("second", "Second", alias),
                     ),
                 )
             self.assertEqual(len(files), 1)
@@ -395,8 +381,8 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             def paths(source):
                 return [path] if source in {"claude", "codex"} else []
 
-            with mock.patch.object(watchdog, "_paths_for_source", side_effect=paths):
-                files = watchdog.activity_files("auto")
+            with mock.patch.object(wd_activity, "_paths_for_source", side_effect=paths):
+                files = wd_activity.activity_files("auto")
             self.assertEqual(
                 [(item.source, item.path) for item in files],
                 [("claude", path), ("codex", path)],
@@ -411,21 +397,20 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             alias = root / "alias"
             alias.symlink_to(actual, target_is_directory=True)
             discovered = alias / transcript.name
-            with mock.patch.object(
-                watchdog, "_paths_for_source", return_value=[discovered, transcript]
+            with mock.patch.object(wd_activity, "_paths_for_source", return_value=[discovered, transcript]
             ):
-                files = watchdog.activity_files("codex")
+                files = wd_activity.activity_files("codex")
             self.assertEqual(len(files), 1)
             self.assertEqual(files[0].path, discovered)
 
     def test_missing_profile_root_is_harmless(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "vanilla"):
+            with mock.patch.object(wd_config, "claude_projects_dir", return_value=root / "vanilla"):
                 self.assertEqual(
-                    watchdog.activity_files(
+                    wd_activity.activity_files(
                         "claude",
-                        (watchdog.ClaudeProfile("work", "Work", root / "missing"),),
+                        (wd_models.ClaudeProfile("work", "Work", root / "missing"),),
                     ),
                     [],
                 )
@@ -440,13 +425,13 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 initial,
                 {"timestamp": (now - timedelta(seconds=10)).isoformat()},
             )
-            with mock.patch.object(watchdog, "claude_projects_dir", return_value=root / "vanilla"):
-                profile = watchdog.ClaudeProfile("work", "Work", projects)
-                snapshot = watchdog.activity_files("claude", (profile,))
+            with mock.patch.object(wd_config, "claude_projects_dir", return_value=root / "vanilla"):
+                profile = wd_models.ClaudeProfile("work", "Work", projects)
+                snapshot = wd_activity.activity_files("claude", (profile,))
                 later = projects / "other" / "later.jsonl"
                 _write_records(later, {"timestamp": now.isoformat()})
-                selected = watchdog.select_watch_set(
-                    watchdog.Config(
+                selected = wd_activity.select_watch_set(
+                    wd_models.Config(
                         select_window_seconds=120,
                         source="claude",
                         claude_profiles=(profile,),
@@ -462,7 +447,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
     def test_omx_scope_is_global_only(self):
         expected = [Path.home() / ".omx" / "logs"]
         with mock.patch.dict(os.environ, {"OMX_LOG_DIR": "/tmp/unrequested"}):
-            self.assertEqual(watchdog.omx_log_dirs(), expected)
+            self.assertEqual(wd_config.omx_log_dirs(), expected)
 
     def test_opencode_database_path_honors_xdg_and_official_override(self):
         with mock.patch.dict(
@@ -470,7 +455,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             {"XDG_DATA_HOME": "", "OPENCODE_DB": ""},
         ):
             self.assertEqual(
-                watchdog.opencode_database_path(),
+                wd_config.opencode_database_path(),
                 Path.home() / ".local" / "share" / "opencode" / "opencode.db",
             )
 
@@ -482,22 +467,22 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 {"XDG_DATA_HOME": str(data_home), "OPENCODE_DB": ""},
             ):
                 self.assertEqual(
-                    watchdog.opencode_database_path(),
+                    wd_config.opencode_database_path(),
                     data_home / "opencode" / "opencode.db",
                 )
                 os.environ["OPENCODE_DB"] = "custom.db"
                 self.assertEqual(
-                    watchdog.opencode_database_path(),
+                    wd_config.opencode_database_path(),
                     data_home / "opencode" / "custom.db",
                 )
                 os.environ["OPENCODE_DB"] = str(absolute)
-                self.assertEqual(watchdog.opencode_database_path(), absolute)
+                self.assertEqual(wd_config.opencode_database_path(), absolute)
                 os.environ["OPENCODE_DB"] = ":memory:"
-                self.assertIsNone(watchdog.opencode_database_path())
+                self.assertIsNone(wd_config.opencode_database_path())
 
     def test_launch_window_boundary_and_stale_mtime(self):
         now = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        cfg = watchdog.Config(select_window_seconds=120, source="codex")
+        cfg = wd_models.Config(select_window_seconds=120, source="codex")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             boundary = root / "rollout-boundary.jsonl"
@@ -506,7 +491,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             _write_records(stale, {"timestamp": (now - timedelta(seconds=121)).isoformat()})
             os.utime(boundary, (1, 1))
 
-            selected = watchdog.select_watch_set(
+            selected = wd_activity.select_watch_set(
                 cfg,
                 [_item(boundary), _item(stale)],
                 now=now,
@@ -515,7 +500,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
 
     def test_selection_does_not_rediscover_paths(self):
         now = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        cfg = watchdog.Config(select_window_seconds=120, source="codex")
+        cfg = wd_models.Config(select_window_seconds=120, source="codex")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             initial = root / "rollout-initial.jsonl"
@@ -524,17 +509,15 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             snapshot = [_item(initial)]
             _write_records(later, {"timestamp": now.isoformat()})
 
-            with mock.patch.object(
-                watchdog,
-                "activity_files",
+            with mock.patch.object(wd_activity, "activity_files",
                 side_effect=AssertionError("post-launch rediscovery"),
             ):
-                selected = watchdog.select_watch_set(cfg, snapshot, now=now)
+                selected = wd_activity.select_watch_set(cfg, snapshot, now=now)
             self.assertEqual([item.path for item in selected], [initial])
 
     def test_selection_ignores_content_appended_after_size_snapshot(self):
         now = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        cfg = watchdog.Config(select_window_seconds=120, source="codex")
+        cfg = wd_models.Config(select_window_seconds=120, source="codex")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rollout-existing.jsonl"
             _write_records(path, {"timestamp": (now - timedelta(hours=1)).isoformat()})
@@ -543,13 +526,13 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 handle.write(json.dumps({"timestamp": now.isoformat()}) + "\n")
 
             self.assertEqual(
-                watchdog.select_watch_set(cfg, [snapshot], now=now),
+                wd_activity.select_watch_set(cfg, [snapshot], now=now),
                 [],
             )
 
     def test_shared_omx_log_only_tracks_launch_identities(self):
         launch = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        cfg = watchdog.Config(select_window_seconds=120, source="omx")
+        cfg = wd_models.Config(select_window_seconds=120, source="omx")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "turns.jsonl"
             initial_time = launch - timedelta(seconds=10)
@@ -557,7 +540,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 path,
                 {"timestamp": initial_time.isoformat(), "thread_id": "session-a"},
             )
-            selected = watchdog.select_watch_set(cfg, [_item(path, "omx")], now=launch)
+            selected = wd_activity.select_watch_set(cfg, [_item(path, "omx")], now=launch)
             self.assertEqual(len(selected), 1)
             self.assertEqual(selected[0].identities, frozenset({"session-a"}))
 
@@ -570,7 +553,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                     + "\n"
                 )
             self.assertEqual(
-                watchdog._last_activity_for(selected[0], launch + timedelta(seconds=30)),
+                wd_activity._last_activity_for(selected[0], launch + timedelta(seconds=30)),
                 initial_time,
             )
 
@@ -583,13 +566,13 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                     + "\n"
                 )
             self.assertEqual(
-                watchdog._last_activity_for(selected[0], launch + timedelta(seconds=30)),
+                wd_activity._last_activity_for(selected[0], launch + timedelta(seconds=30)),
                 session_a_time,
             )
 
     def test_omx_launch_scan_skips_stale_out_of_order_record(self):
         launch = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        cfg = watchdog.Config(select_window_seconds=120, source="omx")
+        cfg = wd_models.Config(select_window_seconds=120, source="omx")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "turns.jsonl"
             _write_records(
@@ -604,7 +587,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 },
             )
 
-            selected = watchdog.select_watch_set(
+            selected = wd_activity.select_watch_set(
                 cfg, [_item(path, "omx")], now=launch
             )
 
@@ -627,7 +610,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                watchdog.last_activity(
+                wd_activity.last_activity(
                     path,
                     now=now,
                     identities=frozenset({"session-a"}),
@@ -637,7 +620,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
 
     def test_omx_file_field_cannot_link_different_threads(self):
         launch = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        cfg = watchdog.Config(select_window_seconds=120, source="omx")
+        cfg = wd_models.Config(select_window_seconds=120, source="omx")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "turns.jsonl"
             initial = launch - timedelta(seconds=10)
@@ -649,7 +632,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                     "file": "shared-plugin.jsonl",
                 },
             )
-            selected = watchdog.select_watch_set(
+            selected = wd_activity.select_watch_set(
                 cfg, [_item(path, "omx")], now=launch
             )
             self.assertEqual(selected[0].identities, frozenset({"session-a"}))
@@ -667,7 +650,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 )
 
             self.assertEqual(
-                watchdog._last_activity_for(
+                wd_activity._last_activity_for(
                     selected[0], launch + timedelta(seconds=30)
                 ),
                 initial,
@@ -675,7 +658,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
 
     def test_omx_identity_aliases_are_preserved(self):
         self.assertEqual(
-            watchdog._record_identifiers(
+            wd_activity._record_identifiers(
                 {
                     "session_id": "session",
                     "native_session_id": "native",
@@ -687,24 +670,22 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
         )
 
     def test_omx_launch_read_permission_error_fails_safe(self):
-        item = watchdog.ActivityFile(
+        item = wd_models.ActivityFile(
             Path("denied.jsonl"), "omx", snapshot_size=1
         )
-        with mock.patch.object(
-            watchdog,
-            "_json_objects_reverse",
+        with mock.patch.object(wd_activity, "_json_objects_reverse",
             side_effect=PermissionError("denied"),
         ):
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "denied"):
-                watchdog._freeze_omx_item(
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "denied"):
+                wd_activity._freeze_omx_item(
                     item,
-                    watchdog.Config(source="omx"),
+                    wd_models.Config(source="omx"),
                     datetime(2026, 8, 14, tzinfo=timezone.utc),
                 )
 
     def test_shared_opencode_database_only_tracks_launch_identities(self):
         launch = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        cfg = watchdog.Config(select_window_seconds=120, source="opencode")
+        cfg = wd_models.Config(select_window_seconds=120, source="opencode")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "opencode.db"
             database = _open_opencode_fixture(path)
@@ -720,7 +701,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 database.commit()
                 os.utime(path, (1, 1))
 
-                selected = watchdog.select_watch_set(
+                selected = wd_activity.select_watch_set(
                     cfg,
                     [_item(path, "opencode")],
                     now=launch,
@@ -734,7 +715,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 )
                 database.commit()
                 self.assertEqual(
-                    watchdog._last_activity_for(
+                    wd_activity._last_activity_for(
                         selected[0], launch + timedelta(seconds=30)
                     ),
                     initial_time,
@@ -747,7 +728,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 )
                 database.commit()
                 self.assertEqual(
-                    watchdog._last_activity_for(
+                    wd_activity._last_activity_for(
                         selected[0], launch + timedelta(seconds=30)
                     ),
                     session_a_time,
@@ -757,7 +738,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
 
     def test_opencode_tracks_post_launch_descendants_but_not_new_roots(self):
         launch = datetime(2026, 8, 15, tzinfo=timezone.utc)
-        cfg = watchdog.Config(select_window_seconds=120, source="opencode")
+        cfg = wd_models.Config(select_window_seconds=120, source="opencode")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "opencode.db"
             database = _open_opencode_fixture(path)
@@ -773,7 +754,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 )
                 database.commit()
 
-                selected = watchdog.select_watch_set(
+                selected = wd_activity.select_watch_set(
                     cfg,
                     [_item(path, "opencode")],
                     now=launch,
@@ -806,7 +787,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 database.commit()
 
                 self.assertEqual(
-                    watchdog._last_activity_for(
+                    wd_activity._last_activity_for(
                         selected[0], launch + timedelta(seconds=35)
                     ),
                     grandchild_time,
@@ -816,7 +797,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
 
     def test_opencode_future_timestamp_does_not_mask_recent_activity(self):
         launch = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        cfg = watchdog.Config(select_window_seconds=120, source="opencode")
+        cfg = wd_models.Config(select_window_seconds=120, source="opencode")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "opencode.db"
             database = _open_opencode_fixture(path)
@@ -835,7 +816,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 )
                 database.commit()
 
-                selected = watchdog.select_watch_set(
+                selected = wd_activity.select_watch_set(
                     cfg,
                     [_item(path, "opencode")],
                     now=launch,
@@ -844,7 +825,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
                 self.assertEqual(len(selected), 1)
                 self.assertEqual(selected[0].identities, frozenset({"session-a"}))
                 self.assertEqual(
-                    watchdog._last_activity_for(selected[0], launch),
+                    wd_activity._last_activity_for(selected[0], launch),
                     recent,
                 )
             finally:
@@ -855,8 +836,8 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "omx.jsonl"
             _write_records(path, {"timestamp": now.isoformat(), "event": "background"})
-            selected = watchdog.select_watch_set(
-                watchdog.Config(source="omx"),
+            selected = wd_activity.select_watch_set(
+                wd_models.Config(source="omx"),
                 [_item(path, "omx")],
                 now=now,
             )
@@ -866,7 +847,7 @@ class DiscoveryAndSelectionTests(unittest.TestCase):
 class LiveSessionAdmissionTests(unittest.TestCase):
     def test_refresh_adds_new_recent_jsonl_path_once_and_is_pure(self):
         now = datetime(2026, 9, 5, tzinfo=timezone.utc)
-        cfg = watchdog.Config(source="codex", select_window_seconds=120)
+        cfg = wd_models.Config(source="codex", select_window_seconds=120)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             first_path = root / "rollout-first.jsonl"
@@ -877,10 +858,10 @@ class LiveSessionAdmissionTests(unittest.TestCase):
             second = _item(second_path)
             current = [first]
 
-            refreshed = watchdog.refresh_watch_set(
+            refreshed = wd_activity.refresh_watch_set(
                 cfg, current, candidates=[first, second], now=now
             )
-            repeated = watchdog.refresh_watch_set(
+            repeated = wd_activity.refresh_watch_set(
                 cfg, refreshed, candidates=[first, second], now=now
             )
 
@@ -897,8 +878,8 @@ class LiveSessionAdmissionTests(unittest.TestCase):
             claude_path = root / "claude.jsonl"
             _write_records(codex_path, {"timestamp": now.isoformat()})
             _write_records(claude_path, {"timestamp": now.isoformat()})
-            refreshed = watchdog.refresh_watch_set(
-                watchdog.Config(source="codex", select_window_seconds=120),
+            refreshed = wd_activity.refresh_watch_set(
+                wd_models.Config(source="codex", select_window_seconds=120),
                 [],
                 candidates=[
                     _item(claude_path, "claude"),
@@ -913,7 +894,7 @@ class LiveSessionAdmissionTests(unittest.TestCase):
 
     def test_refresh_retains_missing_target_and_uses_scan_size_boundary(self):
         now = datetime(2026, 9, 5, tzinfo=timezone.utc)
-        cfg = watchdog.Config(source="codex", select_window_seconds=120)
+        cfg = wd_models.Config(source="codex", select_window_seconds=120)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             retained_path = root / "rollout-retained.jsonl"
@@ -928,10 +909,10 @@ class LiveSessionAdmissionTests(unittest.TestCase):
             with candidate_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"timestamp": now.isoformat()}) + "\n")
 
-            first_refresh = watchdog.refresh_watch_set(
+            first_refresh = wd_activity.refresh_watch_set(
                 cfg, [retained], candidates=[stale_snapshot], now=now
             )
-            second_refresh = watchdog.refresh_watch_set(
+            second_refresh = wd_activity.refresh_watch_set(
                 cfg, first_refresh, candidates=[_item(candidate_path)], now=now
             )
 
@@ -952,11 +933,11 @@ class LiveSessionAdmissionTests(unittest.TestCase):
                 {"timestamp": now.isoformat(), "native_session_id": "session-b"},
                 {"timestamp": now.isoformat(), "event": "unattributed"},
             )
-            current_omx = watchdog.ActivityFile(
+            current_omx = wd_models.ActivityFile(
                 omx_path, "omx", identities=frozenset({"session-a"})
             )
-            merged_omx = watchdog.refresh_watch_set(
-                watchdog.Config(source="omx", select_window_seconds=120),
+            merged_omx = wd_activity.refresh_watch_set(
+                wd_models.Config(source="omx", select_window_seconds=120),
                 [current_omx],
                 candidates=[_item(omx_path, "omx")],
                 now=now,
@@ -982,13 +963,13 @@ class LiveSessionAdmissionTests(unittest.TestCase):
                     ],
                 )
                 database.commit()
-                current_db = watchdog.ActivityFile(
+                current_db = wd_models.ActivityFile(
                     database_path,
                     "opencode",
                     identities=frozenset({"seed-a"}),
                 )
-                merged_db = watchdog.refresh_watch_set(
-                    watchdog.Config(source="opencode", select_window_seconds=120),
+                merged_db = wd_activity.refresh_watch_set(
+                    wd_models.Config(source="opencode", select_window_seconds=120),
                     [current_db],
                     candidates=[_item(database_path, "opencode")],
                     now=now,
@@ -1002,9 +983,9 @@ class LiveSessionAdmissionTests(unittest.TestCase):
 
     def test_live_refresh_precedes_activity_and_logs_new_target_once(self):
         now = datetime(2026, 9, 5, tzinfo=timezone.utc)
-        old = watchdog.ActivityFile(Path("old.jsonl"), "codex")
-        new = watchdog.ActivityFile(Path("new.jsonl"), "codex")
-        cfg = watchdog.Config(
+        old = wd_models.ActivityFile(Path("old.jsonl"), "codex")
+        new = wd_models.ActivityFile(Path("new.jsonl"), "codex")
+        cfg = wd_models.Config(
             source="codex",
             session_discovery="live",
             idle_minutes=1,
@@ -1027,14 +1008,14 @@ class LiveSessionAdmissionTests(unittest.TestCase):
             return current_time if item is new else current_time - timedelta(hours=1)
 
         with (
-            mock.patch.object(watchdog, "activity_files", side_effect=discover),
-            mock.patch.object(watchdog, "select_watch_set", side_effect=select),
-            mock.patch.object(watchdog, "_last_activity_for", side_effect=activity),
-            mock.patch.object(watchdog.time, "sleep", side_effect=RuntimeError("polled")),
-            self.assertLogs(watchdog.log, level="INFO") as captured,
+            mock.patch.object(wd_activity, "activity_files", side_effect=discover),
+            mock.patch.object(wd_activity, "select_watch_set", side_effect=select),
+            mock.patch.object(wd_activity, "_last_activity_for", side_effect=activity),
+            mock.patch.object(wd_app.time, "sleep", side_effect=RuntimeError("polled")),
+            self.assertLogs(wd_models.log, level="INFO") as captured,
         ):
             with self.assertRaisesRegex(RuntimeError, "polled"):
-                watchdog.wait_until_quiet(cfg, [old])
+                wd_app.wait_until_quiet(cfg, [old])
 
         self.assertEqual(order[:3], ["discover", "select", "activity:old.jsonl"])
         self.assertEqual(
@@ -1046,27 +1027,23 @@ class LiveSessionAdmissionTests(unittest.TestCase):
         )
 
     def test_frozen_mode_never_rediscovers(self):
-        cfg = watchdog.Config(
+        cfg = wd_models.Config(
             source="codex",
             session_discovery="frozen",
             idle_minutes=1,
             user_idle_minutes=0,
         )
-        item = watchdog.ActivityFile(Path("old.jsonl"), "codex")
+        item = wd_models.ActivityFile(Path("old.jsonl"), "codex")
         with (
-            mock.patch.object(
-                watchdog, "activity_files", side_effect=AssertionError("rediscovered")
+            mock.patch.object(wd_activity, "activity_files", side_effect=AssertionError("rediscovered")
             ),
-            mock.patch.object(
-                watchdog, "refresh_watch_set", side_effect=AssertionError("refreshed")
+            mock.patch.object(wd_activity, "refresh_watch_set", side_effect=AssertionError("refreshed")
             ),
-            mock.patch.object(
-                watchdog,
-                "_last_activity_for",
+            mock.patch.object(wd_activity, "_last_activity_for",
                 return_value=datetime.now(timezone.utc) - timedelta(hours=1),
             ),
         ):
-            watchdog.wait_until_quiet(cfg, [item])
+            wd_app.wait_until_quiet(cfg, [item])
 
     def test_codex_traversal_is_recursive_but_skips_directory_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1085,48 +1062,47 @@ class LiveSessionAdmissionTests(unittest.TestCase):
                 {"timestamp": "2026-09-05T00:00:00Z"},
             )
             (root / "linked").symlink_to(external, target_is_directory=True)
-            with mock.patch.object(watchdog, "codex_sessions_dir", return_value=root):
-                paths = watchdog._paths_for_source("codex")
+            with mock.patch.object(wd_config, "codex_sessions_dir", return_value=root):
+                paths = wd_activity._paths_for_source("codex")
             self.assertEqual(paths, [expected])
 
     def test_missing_roots_are_absent_but_resolution_errors_are_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "missing"
-            with mock.patch.object(watchdog, "codex_sessions_dir", return_value=missing):
-                self.assertEqual(watchdog.activity_files("codex"), [])
-            with mock.patch.object(
-                watchdog, "opencode_database_path", return_value=missing / "opencode.db"
+            with mock.patch.object(wd_config, "codex_sessions_dir", return_value=missing):
+                self.assertEqual(wd_activity.activity_files("codex"), [])
+            with mock.patch.object(wd_config, "opencode_database_path", return_value=missing / "opencode.db"
             ):
-                self.assertEqual(watchdog.activity_files("opencode"), [])
+                self.assertEqual(wd_activity.activity_files("opencode"), [])
 
     def test_opencode_stat_error_is_explicit(self):
         path = Path("/denied/opencode.db")
         with (
-            mock.patch.object(watchdog, "opencode_database_path", return_value=path),
+            mock.patch.object(wd_config, "opencode_database_path", return_value=path),
             mock.patch.object(Path, "stat", side_effect=PermissionError("denied")),
         ):
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "OpenCode.*denied"):
-                watchdog.activity_files("opencode")
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "OpenCode.*denied"):
+                wd_activity.activity_files("opencode")
 
     def test_provider_root_permission_error_is_explicit(self):
         root = Path("/denied/codex")
         with (
-            mock.patch.object(watchdog, "codex_sessions_dir", return_value=root),
+            mock.patch.object(wd_config, "codex_sessions_dir", return_value=root),
             mock.patch.object(
-                watchdog.os, "scandir", side_effect=PermissionError("denied")
+                wd_activity.os, "scandir", side_effect=PermissionError("denied")
             ),
         ):
-            with self.assertRaisesRegex(watchdog.ActivityReadError, "codex.*denied"):
-                watchdog.activity_files("codex")
+            with self.assertRaisesRegex(wd_models.ActivityReadError, "codex.*denied"):
+                wd_activity.activity_files("codex")
 
 
 class QuietnessAndPowerTests(unittest.TestCase):
     def test_block_sleep_is_bound_to_watchdog_process(self):
         process = mock.Mock()
         with mock.patch.object(
-            watchdog.subprocess, "Popen", return_value=process
+            wd_power.subprocess, "Popen", return_value=process
         ) as popen:
-            self.assertIs(watchdog.block_sleep(), process)
+            self.assertIs(wd_power.block_sleep(), process)
         popen.assert_called_once_with(
             ["caffeinate", "-is", "-w", str(os.getpid())]
         )
@@ -1139,7 +1115,7 @@ class QuietnessAndPowerTests(unittest.TestCase):
             0,
         ]
 
-        watchdog._stop_caffeinate(process)
+        wd_power._stop_caffeinate(process)
 
         process.terminate.assert_called_once_with()
         process.kill.assert_called_once_with()
@@ -1147,13 +1123,13 @@ class QuietnessAndPowerTests(unittest.TestCase):
 
     def test_opencode_status_names_database_activity_signal(self):
         now = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        item = watchdog.ActivityFile(
+        item = wd_models.ActivityFile(
             Path("opencode.db"),
             "opencode",
             identities=frozenset({"session-a"}),
         )
 
-        status = watchdog._source_guard_status(
+        status = wd_app._source_guard_status(
             now,
             30 * 60,
             [item],
@@ -1167,10 +1143,10 @@ class QuietnessAndPowerTests(unittest.TestCase):
 
     def test_profile_status_remains_part_of_the_claude_jsonl_guard(self):
         now = datetime(2026, 8, 16, tzinfo=timezone.utc)
-        item = watchdog.ActivityFile(
+        item = wd_models.ActivityFile(
             Path("work.jsonl"), "claude", profile_id="work", profile_label="Work"
         )
-        status = watchdog._source_guard_status(
+        status = wd_app._source_guard_status(
             now,
             30 * 60,
             [item],
@@ -1184,14 +1160,14 @@ class QuietnessAndPowerTests(unittest.TestCase):
     def test_source_status_reports_each_provider_as_a_guard_not_liveness(self):
         now = datetime(2026, 8, 14, tzinfo=timezone.utc)
         claude_items = [
-            watchdog.ActivityFile(Path(f"claude-{index}.jsonl"), "claude")
+            wd_models.ActivityFile(Path(f"claude-{index}.jsonl"), "claude")
             for index in range(3)
         ]
         codex_items = [
-            watchdog.ActivityFile(Path(f"codex-{index}.jsonl"), "codex")
+            wd_models.ActivityFile(Path(f"codex-{index}.jsonl"), "codex")
             for index in range(3)
         ]
-        status = watchdog._source_guard_status(
+        status = wd_app._source_guard_status(
             now,
             30 * 60,
             claude_items + codex_items,
@@ -1209,10 +1185,10 @@ class QuietnessAndPowerTests(unittest.TestCase):
 
     def test_source_status_marks_quiet_and_unavailable_providers(self):
         now = datetime(2026, 8, 14, tzinfo=timezone.utc)
-        claude = watchdog.ActivityFile(Path("claude.jsonl"), "claude")
-        codex = watchdog.ActivityFile(Path("codex.jsonl"), "codex")
+        claude = wd_models.ActivityFile(Path("claude.jsonl"), "claude")
+        codex = wd_models.ActivityFile(Path("codex.jsonl"), "codex")
 
-        status = watchdog._source_guard_status(
+        status = wd_app._source_guard_status(
             now,
             30 * 60,
             [claude, codex],
@@ -1226,27 +1202,25 @@ class QuietnessAndPowerTests(unittest.TestCase):
         )
 
     def test_gone_file_is_quiet_and_disabled_user_gate_skips_ioreg(self):
-        missing = watchdog.ActivityFile(Path("/definitely/missing.jsonl"), "codex")
-        cfg = watchdog.Config(
+        missing = wd_models.ActivityFile(Path("/definitely/missing.jsonl"), "codex")
+        cfg = wd_models.Config(
             user_idle_minutes=0, poll_seconds=0.01, session_discovery="frozen"
         )
-        with mock.patch.object(
-            watchdog,
-            "user_idle_seconds",
+        with mock.patch.object(wd_power, "user_idle_seconds",
             side_effect=AssertionError("ioreg should be skipped"),
         ):
-            watchdog.wait_until_quiet(cfg, [missing])
+            wd_app.wait_until_quiet(cfg, [missing])
 
     def test_freshest_source_must_be_quiet(self):
-        cfg = watchdog.Config(
+        cfg = wd_models.Config(
             idle_minutes=1,
             user_idle_minutes=0,
             poll_seconds=0.01,
             session_discovery="frozen",
         )
         items = [
-            watchdog.ActivityFile(Path("old.jsonl"), "claude"),
-            watchdog.ActivityFile(Path("recent.jsonl"), "codex"),
+            wd_models.ActivityFile(Path("old.jsonl"), "claude"),
+            wd_models.ActivityFile(Path("recent.jsonl"), "codex"),
         ]
 
         def activity(item, now):
@@ -1255,52 +1229,48 @@ class QuietnessAndPowerTests(unittest.TestCase):
             return now - timedelta(seconds=5)
 
         with (
-            mock.patch.object(watchdog, "_last_activity_for", side_effect=activity),
-            mock.patch.object(watchdog.time, "sleep", side_effect=RuntimeError("polled")),
+            mock.patch.object(wd_activity, "_last_activity_for", side_effect=activity),
+            mock.patch.object(wd_app.time, "sleep", side_effect=RuntimeError("polled")),
         ):
             with self.assertRaisesRegex(RuntimeError, "polled"):
-                watchdog.wait_until_quiet(cfg, items)
+                wd_app.wait_until_quiet(cfg, items)
 
     def test_active_session_defers_ioreg_query(self):
-        cfg = watchdog.Config(
+        cfg = wd_models.Config(
             idle_minutes=1,
             user_idle_minutes=5,
             poll_seconds=0.01,
             session_discovery="frozen",
         )
-        item = watchdog.ActivityFile(Path("recent.jsonl"), "codex")
+        item = wd_models.ActivityFile(Path("recent.jsonl"), "codex")
         with (
-            mock.patch.object(
-                watchdog,
-                "_last_activity_for",
+            mock.patch.object(wd_activity, "_last_activity_for",
                 side_effect=lambda item, now: now - timedelta(seconds=5),
             ),
-            mock.patch.object(
-                watchdog,
-                "user_idle_seconds",
+            mock.patch.object(wd_power, "user_idle_seconds",
                 side_effect=AssertionError("ioreg queried while session active"),
             ),
             mock.patch.object(
-                watchdog.time,
+                wd_app.time,
                 "sleep",
                 side_effect=RuntimeError("polled"),
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "polled"):
-                watchdog.wait_until_quiet(cfg, [item])
+                wd_app.wait_until_quiet(cfg, [item])
 
     def test_ioreg_failure_is_explicit(self):
         with mock.patch.object(
-            watchdog.subprocess,
+            wd_power.subprocess,
             "check_output",
             side_effect=OSError("ioreg unavailable"),
         ):
-            with self.assertRaises(watchdog.PresenceCheckError):
-                watchdog.user_idle_seconds()
+            with self.assertRaises(wd_models.PresenceCheckError):
+                wd_power.user_idle_seconds()
 
     def test_dry_run_never_invokes_pmset(self):
-        with mock.patch.object(watchdog.subprocess, "run") as run:
-            watchdog.force_sleep(True)
+        with mock.patch.object(wd_power.subprocess, "run") as run:
+            wd_power.force_sleep(True)
         run.assert_not_called()
 
     def test_pmset_failure_is_reported(self):
@@ -1309,36 +1279,36 @@ class QuietnessAndPowerTests(unittest.TestCase):
             ["pmset", "sleepnow"],
             stderr="not permitted",
         )
-        with mock.patch.object(watchdog.subprocess, "run", side_effect=failure):
-            with self.assertRaisesRegex(watchdog.PowerCommandError, "not permitted"):
-                watchdog.force_sleep(False)
+        with mock.patch.object(wd_power.subprocess, "run", side_effect=failure):
+            with self.assertRaisesRegex(wd_models.PowerCommandError, "not permitted"):
+                wd_power.force_sleep(False)
 
 
 class CliAndLifecycleTests(unittest.TestCase):
     def test_session_discovery_cli_defaults_to_live_and_accepts_frozen(self):
-        self.assertEqual(watchdog.parse_args([]).session_discovery, "live")
+        self.assertEqual(wd_config.parse_args([]).session_discovery, "live")
         self.assertEqual(
-            watchdog.parse_args(["--session-discovery", "frozen"]).session_discovery,
+            wd_config.parse_args(["--session-discovery", "frozen"]).session_discovery,
             "frozen",
         )
         with mock.patch("sys.stderr", new=io.StringIO()):
             with self.assertRaises(SystemExit) as raised:
-                watchdog.parse_args(["--session-discovery", "unknown"])
+                wd_config.parse_args(["--session-discovery", "unknown"])
         self.assertEqual(raised.exception.code, 2)
 
     def test_cli_compatibility_and_source_option(self):
-        cfg = watchdog.parse_args(["12", "--source", "codex-omx", "--dry-run"])
+        cfg = wd_config.parse_args(["12", "--source", "codex-omx", "--dry-run"])
         self.assertEqual(cfg.idle_minutes, 12)
         self.assertEqual(cfg.source, "codex-omx")
         self.assertTrue(cfg.dry_run)
-        self.assertEqual(watchdog.parse_args([]).source, "auto")
+        self.assertEqual(wd_config.parse_args([]).source, "auto")
         self.assertEqual(
-            watchdog.parse_args(["--source", "opencode"]).source,
+            wd_config.parse_args(["--source", "opencode"]).source,
             "opencode",
         )
         with mock.patch("sys.stderr", new=io.StringIO()):
             with self.assertRaises(SystemExit) as raised:
-                watchdog.parse_args(["--source", "private-wrapper"])
+                wd_config.parse_args(["--source", "private-wrapper"])
         self.assertEqual(raised.exception.code, 2)
 
     def test_profiles_file_cli_loads_once_and_explicit_missing_fails(self):
@@ -1360,26 +1330,25 @@ class CliAndLifecycleTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            cfg = watchdog.parse_args(["--profiles-file", str(path)])
+            cfg = wd_config.parse_args(["--profiles-file", str(path)])
             self.assertEqual(cfg.profiles_file, path.resolve())
             self.assertEqual(cfg.claude_profiles[0].id, "work")
 
-            with self.assertRaises(watchdog.ActivityReadError):
-                watchdog.parse_args(["--profiles-file", str(root / "missing.json")])
+            with self.assertRaises(wd_models.ActivityReadError):
+                wd_config.parse_args(["--profiles-file", str(root / "missing.json")])
 
     def test_non_claude_source_ignores_default_profiles_but_rejects_override(self):
         with tempfile.TemporaryDirectory() as tmp:
             malformed = Path(tmp) / "profiles.json"
             malformed.write_text("{", encoding="utf-8")
-            with mock.patch.object(
-                watchdog, "claude_profiles_path", return_value=malformed
+            with mock.patch.object(wd_config, "claude_profiles_path", return_value=malformed
             ):
-                cfg = watchdog.parse_args(["--source", "codex"])
+                cfg = wd_config.parse_args(["--source", "codex"])
             self.assertEqual(cfg.claude_profiles, ())
 
             with mock.patch("sys.stderr", new=io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
-                    watchdog.parse_args(
+                    wd_config.parse_args(
                         ["--source", "codex", "--profiles-file", str(malformed)]
                     )
             self.assertEqual(raised.exception.code, 2)
@@ -1390,11 +1359,11 @@ class CliAndLifecycleTests(unittest.TestCase):
             path.write_text("{", encoding="utf-8")
             stderr = io.StringIO()
             with (
-                mock.patch.object(watchdog, "block_sleep") as block_sleep,
+                mock.patch.object(wd_power, "block_sleep") as block_sleep,
                 mock.patch("sys.stderr", new=stderr),
             ):
                 self.assertEqual(
-                    watchdog.main(["--profiles-file", str(path)]), 1
+                    wd_app.main(["--profiles-file", str(path)]), 1
                 )
             block_sleep.assert_not_called()
             self.assertIn("not valid JSON", stderr.getvalue())
@@ -1411,38 +1380,38 @@ class CliAndLifecycleTests(unittest.TestCase):
         for argv in invalid:
             with self.subTest(argv=argv), mock.patch("sys.stderr", new=io.StringIO()):
                 with self.assertRaises(SystemExit) as raised:
-                    watchdog.parse_args(argv)
+                    wd_config.parse_args(argv)
                 self.assertEqual(raised.exception.code, 2)
 
     def test_no_active_launch_snapshot_exits_without_caffeinate(self):
-        cfg = watchdog.Config(source="codex")
+        cfg = wd_models.Config(source="codex")
         with (
-            mock.patch.object(watchdog, "parse_args", return_value=cfg),
-            mock.patch.object(watchdog, "setup_logging"),
-            mock.patch.object(watchdog, "activity_files", return_value=[]),
-            mock.patch.object(watchdog, "block_sleep") as block_sleep,
+            mock.patch.object(wd_config, "parse_args", return_value=cfg),
+            mock.patch.object(wd_app, "setup_logging"),
+            mock.patch.object(wd_activity, "activity_files", return_value=[]),
+            mock.patch.object(wd_power, "block_sleep") as block_sleep,
         ):
-            self.assertEqual(watchdog.main([]), 1)
+            self.assertEqual(wd_app.main([]), 1)
         block_sleep.assert_not_called()
 
     def test_opencode_selection_error_exits_without_caffeinate(self):
-        cfg = watchdog.Config(source="opencode")
+        cfg = wd_models.Config(source="opencode")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "opencode.db"
             sqlite3.connect(path).close()
             item = _item(path, "opencode")
             with (
-                mock.patch.object(watchdog, "parse_args", return_value=cfg),
-                mock.patch.object(watchdog, "setup_logging"),
-                mock.patch.object(watchdog, "activity_files", return_value=[item]),
-                mock.patch.object(watchdog, "block_sleep") as block_sleep,
+                mock.patch.object(wd_config, "parse_args", return_value=cfg),
+                mock.patch.object(wd_app, "setup_logging"),
+                mock.patch.object(wd_activity, "activity_files", return_value=[item]),
+                mock.patch.object(wd_power, "block_sleep") as block_sleep,
             ):
-                self.assertEqual(watchdog.main([]), 1)
+                self.assertEqual(wd_app.main([]), 1)
             block_sleep.assert_not_called()
 
     def test_opencode_lineage_schema_is_validated_before_caffeinate(self):
         launch = datetime.now(timezone.utc)
-        cfg = watchdog.Config(source="opencode")
+        cfg = wd_models.Config(source="opencode")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "opencode.db"
             database = sqlite3.connect(path)
@@ -1461,30 +1430,30 @@ class CliAndLifecycleTests(unittest.TestCase):
             item = _item(path, "opencode")
 
             with (
-                mock.patch.object(watchdog, "parse_args", return_value=cfg),
-                mock.patch.object(watchdog, "setup_logging"),
-                mock.patch.object(watchdog, "activity_files", return_value=[item]),
-                mock.patch.object(watchdog, "block_sleep") as block_sleep,
+                mock.patch.object(wd_config, "parse_args", return_value=cfg),
+                mock.patch.object(wd_app, "setup_logging"),
+                mock.patch.object(wd_activity, "activity_files", return_value=[item]),
+                mock.patch.object(wd_power, "block_sleep") as block_sleep,
             ):
-                self.assertEqual(watchdog.main([]), 1)
+                self.assertEqual(wd_app.main([]), 1)
             block_sleep.assert_not_called()
 
     def test_successful_dry_run_releases_caffeinate_then_skips_sleep(self):
-        cfg = watchdog.Config(source="codex", dry_run=True, display="log")
-        item = watchdog.ActivityFile(Path("rollout.jsonl"), "codex")
+        cfg = wd_models.Config(source="codex", dry_run=True, display="log")
+        item = wd_models.ActivityFile(Path("rollout.jsonl"), "codex")
         process = mock.Mock()
         process.poll.return_value = None
         process.wait.return_value = 0
         with (
-            mock.patch.object(watchdog, "parse_args", return_value=cfg),
-            mock.patch.object(watchdog, "setup_logging"),
-            mock.patch.object(watchdog, "activity_files", return_value=[item]),
-            mock.patch.object(watchdog, "select_watch_set", return_value=[item]),
-            mock.patch.object(watchdog, "block_sleep", return_value=process),
-            mock.patch.object(watchdog, "wait_until_quiet") as wait_until_quiet,
-            mock.patch.object(watchdog, "force_sleep") as force_sleep,
+            mock.patch.object(wd_config, "parse_args", return_value=cfg),
+            mock.patch.object(wd_app, "setup_logging"),
+            mock.patch.object(wd_activity, "activity_files", return_value=[item]),
+            mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
+            mock.patch.object(wd_power, "block_sleep", return_value=process),
+            mock.patch.object(wd_app, "wait_until_quiet") as wait_until_quiet,
+            mock.patch.object(wd_power, "force_sleep") as force_sleep,
         ):
-            self.assertEqual(watchdog.main([]), 0)
+            self.assertEqual(wd_app.main([]), 0)
 
         wait_until_quiet.assert_called_once_with(cfg, [item])
         process.terminate.assert_called_once_with()
@@ -1492,66 +1461,62 @@ class CliAndLifecycleTests(unittest.TestCase):
         force_sleep.assert_called_once_with(True)
 
     def test_interrupt_releases_caffeinate_without_sleep(self):
-        cfg = watchdog.Config(source="codex", dry_run=True, display="log")
-        item = watchdog.ActivityFile(Path("rollout.jsonl"), "codex")
+        cfg = wd_models.Config(source="codex", dry_run=True, display="log")
+        item = wd_models.ActivityFile(Path("rollout.jsonl"), "codex")
         process = mock.Mock()
         process.poll.return_value = None
         process.wait.return_value = 0
         with (
-            mock.patch.object(watchdog, "parse_args", return_value=cfg),
-            mock.patch.object(watchdog, "setup_logging"),
-            mock.patch.object(watchdog, "activity_files", return_value=[item]),
-            mock.patch.object(watchdog, "select_watch_set", return_value=[item]),
-            mock.patch.object(watchdog, "block_sleep", return_value=process),
-            mock.patch.object(watchdog, "wait_until_quiet", side_effect=KeyboardInterrupt),
-            mock.patch.object(watchdog, "force_sleep") as force_sleep,
+            mock.patch.object(wd_config, "parse_args", return_value=cfg),
+            mock.patch.object(wd_app, "setup_logging"),
+            mock.patch.object(wd_activity, "activity_files", return_value=[item]),
+            mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
+            mock.patch.object(wd_power, "block_sleep", return_value=process),
+            mock.patch.object(wd_app, "wait_until_quiet", side_effect=KeyboardInterrupt),
+            mock.patch.object(wd_power, "force_sleep") as force_sleep,
         ):
-            self.assertEqual(watchdog.main([]), 130)
+            self.assertEqual(wd_app.main([]), 130)
         process.terminate.assert_called_once()
         force_sleep.assert_not_called()
 
     def test_presence_error_releases_caffeinate_without_sleep(self):
-        cfg = watchdog.Config(source="codex", display="log")
-        item = watchdog.ActivityFile(Path("rollout.jsonl"), "codex")
+        cfg = wd_models.Config(source="codex", display="log")
+        item = wd_models.ActivityFile(Path("rollout.jsonl"), "codex")
         process = mock.Mock()
         process.poll.return_value = None
         process.wait.return_value = 0
         with (
-            mock.patch.object(watchdog, "parse_args", return_value=cfg),
-            mock.patch.object(watchdog, "setup_logging"),
-            mock.patch.object(watchdog, "activity_files", return_value=[item]),
-            mock.patch.object(watchdog, "select_watch_set", return_value=[item]),
-            mock.patch.object(watchdog, "block_sleep", return_value=process),
-            mock.patch.object(
-                watchdog,
-                "wait_until_quiet",
-                side_effect=watchdog.PresenceCheckError("unavailable"),
+            mock.patch.object(wd_config, "parse_args", return_value=cfg),
+            mock.patch.object(wd_app, "setup_logging"),
+            mock.patch.object(wd_activity, "activity_files", return_value=[item]),
+            mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
+            mock.patch.object(wd_power, "block_sleep", return_value=process),
+            mock.patch.object(wd_app, "wait_until_quiet",
+                side_effect=wd_models.PresenceCheckError("unavailable"),
             ),
-            mock.patch.object(watchdog, "force_sleep") as force_sleep,
+            mock.patch.object(wd_power, "force_sleep") as force_sleep,
         ):
-            self.assertEqual(watchdog.main([]), 1)
+            self.assertEqual(wd_app.main([]), 1)
         process.terminate.assert_called_once()
         force_sleep.assert_not_called()
 
     def test_refresh_error_releases_caffeinate_without_sleep(self):
-        cfg = watchdog.Config(source="codex", session_discovery="live", display="log")
-        item = watchdog.ActivityFile(Path("rollout.jsonl"), "codex")
+        cfg = wd_models.Config(source="codex", session_discovery="live", display="log")
+        item = wd_models.ActivityFile(Path("rollout.jsonl"), "codex")
         process = mock.Mock()
         process.poll.return_value = None
         process.wait.return_value = 0
         with (
-            mock.patch.object(watchdog, "parse_args", return_value=cfg),
-            mock.patch.object(watchdog, "setup_logging"),
-            mock.patch.object(
-                watchdog,
-                "activity_files",
-                side_effect=([item], watchdog.ActivityReadError("refresh denied")),
+            mock.patch.object(wd_config, "parse_args", return_value=cfg),
+            mock.patch.object(wd_app, "setup_logging"),
+            mock.patch.object(wd_activity, "activity_files",
+                side_effect=([item], wd_models.ActivityReadError("refresh denied")),
             ),
-            mock.patch.object(watchdog, "select_watch_set", return_value=[item]),
-            mock.patch.object(watchdog, "block_sleep", return_value=process),
-            mock.patch.object(watchdog, "force_sleep") as force_sleep,
+            mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
+            mock.patch.object(wd_power, "block_sleep", return_value=process),
+            mock.patch.object(wd_power, "force_sleep") as force_sleep,
         ):
-            self.assertEqual(watchdog.main([]), 1)
+            self.assertEqual(wd_app.main([]), 1)
         process.terminate.assert_called_once_with()
         process.wait.assert_called_once_with(timeout=5)
         force_sleep.assert_not_called()

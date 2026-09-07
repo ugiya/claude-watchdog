@@ -4,18 +4,24 @@
 from __future__ import annotations
 
 import argparse
-import importlib.machinery
-import importlib.util
+import importlib
 import json
+import os
 import platform
 import sqlite3
 import statistics
 import sys
 import tempfile
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 CODEX_FILE_COUNT = 15_000
@@ -31,14 +37,43 @@ MAX_SINGLE_PASS_SECONDS = 10.0
 
 
 def _load_target(path: Path):
-    loader = importlib.machinery.SourceFileLoader("benchmark_watchdog_target", str(path))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    if spec is None:
-        raise RuntimeError(f"unable to load target: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    loader.exec_module(module)
-    return module
+    """Import the package selected by a source launcher/tree or executable ZIP."""
+    path = path.resolve(strict=True)
+    archive_target = path.is_file() and zipfile.is_zipfile(path)
+    if archive_target:
+        import_root = path
+    elif path.is_dir():
+        import_root = path.parent if path.name == "claude_watchdog" else path
+    else:
+        import_root = path.parent
+
+    if archive_target:
+        with zipfile.ZipFile(path) as archive:
+            contains_package = "claude_watchdog/__init__.py" in archive.namelist()
+    else:
+        contains_package = (import_root / "claude_watchdog" / "__init__.py").is_file()
+    if not contains_package:
+        raise RuntimeError(f"target does not contain the runtime package: {path}")
+
+    for name in tuple(sys.modules):
+        if name == "claude_watchdog" or name.startswith("claude_watchdog."):
+            del sys.modules[name]
+    sys.path.insert(0, str(import_root))
+    try:
+        importlib.invalidate_caches()
+        models = importlib.import_module("claude_watchdog.models")
+        activity = importlib.import_module("claude_watchdog.activity")
+        config = importlib.import_module("claude_watchdog.config")
+    finally:
+        sys.path.pop(0)
+
+    expected = str(import_root / "claude_watchdog") + os.sep
+    origins = (models.__file__ or "", activity.__file__ or "", config.__file__ or "")
+    if not all(origin.startswith(expected) for origin in origins):
+        raise RuntimeError(
+            f"target import escaped {import_root}: {', '.join(origins)}"
+        )
+    return models, activity, config
 
 
 def _write_codex_tree(root: Path, now: datetime) -> None:
@@ -152,19 +187,19 @@ def _summarize(durations: list[float]) -> dict[str, object]:
     }
 
 
-def _benchmark_codex(watchdog, refresh, root: Path, now: datetime) -> dict[str, object]:
+def _benchmark_codex(models, activity, config, refresh, root: Path, now: datetime) -> dict[str, object]:
     sessions = root / "codex-sessions"
     sessions.mkdir()
     _write_codex_tree(sessions, now)
-    cfg = watchdog.Config(
+    cfg = models.Config(
         source="codex",
         select_window_seconds=30,
         poll_seconds=POLL_SECONDS,
         session_discovery="live",
     )
-    with mock.patch.object(watchdog, "codex_sessions_dir", return_value=sessions):
-        candidates = watchdog.activity_files("codex")
-        watch_set = watchdog.select_watch_set(cfg, candidates, now=now)
+    with mock.patch.object(config, "codex_sessions_dir", return_value=sessions):
+        candidates = activity.activity_files("codex")
+        watch_set = activity.select_watch_set(cfg, candidates, now=now)
         if len(watch_set) != CODEX_RECENT_COUNT:
             raise AssertionError(
                 f"Codex fixture selected {len(watch_set)} files; "
@@ -178,19 +213,19 @@ def _benchmark_codex(watchdog, refresh, root: Path, now: datetime) -> dict[str, 
     }
 
 
-def _benchmark_omx(watchdog, refresh, root: Path, now: datetime) -> dict[str, object]:
+def _benchmark_omx(models, activity, config, refresh, root: Path, now: datetime) -> dict[str, object]:
     log_directory = root / "omx-logs"
     log_path = log_directory / "turns.jsonl"
     _write_omx_log(log_path, now)
-    cfg = watchdog.Config(
+    cfg = models.Config(
         source="omx",
         select_window_seconds=30,
         poll_seconds=POLL_SECONDS,
         session_discovery="live",
     )
-    with mock.patch.object(watchdog, "omx_log_dirs", return_value=[log_directory]):
-        candidates = watchdog.activity_files("omx")
-        watch_set = watchdog.select_watch_set(cfg, candidates, now=now)
+    with mock.patch.object(config, "omx_log_dirs", return_value=[log_directory]):
+        candidates = activity.activity_files("omx")
+        watch_set = activity.select_watch_set(cfg, candidates, now=now)
         if len(watch_set) != 1:
             raise AssertionError(f"OMX fixture selected {len(watch_set)} logs; expected 1")
         if len(watch_set[0].identities) != OMX_RECENT_IDENTITIES:
@@ -208,22 +243,22 @@ def _benchmark_omx(watchdog, refresh, root: Path, now: datetime) -> dict[str, ob
 
 
 def _benchmark_opencode(
-    watchdog, refresh, root: Path, now: datetime
+    models, activity, config, refresh, root: Path, now: datetime
 ) -> dict[str, object]:
     database_path = root / "opencode" / "opencode.db"
     database = _write_opencode_database(database_path, now)
     try:
-        cfg = watchdog.Config(
+        cfg = models.Config(
             source="opencode",
             select_window_seconds=30,
             poll_seconds=POLL_SECONDS,
             session_discovery="live",
         )
         with mock.patch.object(
-            watchdog, "opencode_database_path", return_value=database_path
+            config, "opencode_database_path", return_value=database_path
         ):
-            candidates = watchdog.activity_files("opencode")
-            watch_set = watchdog.select_watch_set(cfg, candidates, now=now)
+            candidates = activity.activity_files("opencode")
+            watch_set = activity.select_watch_set(cfg, candidates, now=now)
             if len(watch_set) != 1:
                 raise AssertionError(
                     f"OpenCode fixture selected {len(watch_set)} databases; expected 1"
@@ -274,18 +309,16 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     target = args.target.resolve(strict=True)
-    watchdog = _load_target(target)
-    refresh = getattr(watchdog, "refresh_watch_set", None)
-    if refresh is None:
-        raise SystemExit("target does not expose refresh_watch_set")
+    models, activity, config = _load_target(target)
+    refresh = activity.refresh_watch_set
 
     now = datetime.now(timezone.utc)
     with tempfile.TemporaryDirectory(prefix="watchdog-benchmark-") as temporary:
         root = Path(temporary)
         workloads = {
-            "codex": _benchmark_codex(watchdog, refresh, root, now),
-            "omx": _benchmark_omx(watchdog, refresh, root, now),
-            "opencode": _benchmark_opencode(watchdog, refresh, root, now),
+            "codex": _benchmark_codex(models, activity, config, refresh, root, now),
+            "omx": _benchmark_omx(models, activity, config, refresh, root, now),
+            "opencode": _benchmark_opencode(models, activity, config, refresh, root, now),
         }
 
     passed = all(bool(workload["passed"]) for workload in workloads.values())
