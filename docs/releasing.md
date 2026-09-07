@@ -10,6 +10,8 @@ version, not to rebuilding or moving an existing release.
 2. Confirm `CHANGELOG.md` describes the intended version and date.
 3. Update `VERSION` and the literal version in `claude_watchdog/__init__.py`
    together. The runtime bundle and source-release builder reject mismatches.
+   Update the README's project status and any changed installation or usage
+   instructions for the new release.
 4. Update `docs/compatibility.md` with exact provider versions actually tested.
    Preserve `unknown` for versions that were not captured.
 5. Inspect the repository and Git history for prompts, usernames, local paths,
@@ -85,7 +87,9 @@ you created. Use a fresh temporary directory when repeating this check.
 
 ## Publish
 
-1. Review the final commit and required CI result.
+1. Merge the release pull request only after reviewing the final diff and
+   required CI and CodeQL results. Inspect open code-scanning alerts separately
+   as described below, including the final merged commit before tagging.
 2. Create a signed or annotated tag for the **new version** at that commit.
    Never move `v0.1.0` or any other published tag.
 3. Push the branch and tag to `ugiya/claude-watchdog`.
@@ -98,3 +102,29 @@ you created. Use a fresh temporary directory when repeating this check.
 Do not mark the release stable until compatibility has been recorded across
 named agent versions and the real-world sleep lifecycle has broader macOS
 coverage.
+
+## Code-scanning review
+
+A successful CodeQL workflow means the analysis completed; it does not mean
+there are no open alerts. Before tagging, check the Security tab's code-scanning
+results for `main` and the release candidate. With the GitHub CLI:
+
+```bash
+gh api 'repos/{owner}/{repo}/code-scanning/alerts?state=open&ref=refs/heads/main' \
+  --paginate --jq '.[] | {number, rule: .rule.id, location: .most_recent_instance.location, html_url}'
+gh api 'repos/{owner}/{repo}/code-scanning/analyses?ref=refs/heads/main' \
+  --jq '.[] | {commit_sha, tool: .tool.name, error, created_at}'
+```
+
+Also inspect the release PR's code-scanning results. Confirm that the latest
+successful analyses cover the intended final commit; do not treat an empty
+alert list, failed API request, missing analysis, or stale scan as a clean bill
+of health. Do not publish while actionable findings remain unresolved.
+
+For a suspected false positive, trace the exact value to the reported sink and
+check the relevant test or runtime path. Record the evidence and disposition
+on that alert. Synthetic credential-shaped fixtures may intentionally exercise
+the publication guard; their test location alone is not proof of safety.
+Renaming a file can produce new alert instances even when an earlier instance
+was dismissed, so revalidate the new instances rather than assuming the old
+disposition carried over. Keep queries and regression coverage enabled.

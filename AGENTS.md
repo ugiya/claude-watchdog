@@ -40,3 +40,19 @@ python3 scripts/check.py --integration
 
 Update `docs/compatibility.md` when provider parsing changes. Record the exact
 provider version when known and say `unknown` when it was not captured.
+
+## Release and documentation gates
+
+- Update `README.md` when user-facing behavior, installation, project layout,
+  or the current release changes; keep it consistent with `CHANGELOG.md`.
+- Submit changes through a pull request and wait for required checks before
+  merging. Do not push changes directly to `main`.
+- For each new release, update `VERSION` and `claude_watchdog/__init__.py`
+  together, then create a new annotated version tag at the approved commit.
+  Never move or reuse a published tag.
+- Review open GitHub code-scanning alerts on `main` and the release candidate,
+  not just workflow conclusions. A successful CodeQL job means analysis ran,
+  not that no findings exist. Follow `docs/releasing.md` before publishing.
+- Resolve actionable findings before release. Dismiss a false positive only
+  after checking the exact source and recording evidence on the alert; never
+  disable a query or exclude tests merely to make the security page green.

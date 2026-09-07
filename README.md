@@ -287,6 +287,12 @@ rendering, and isolated lifecycle behavior. That coverage does not establish
 compatibility with every agent release or prove real-world sleep behavior on
 every Mac.
 
+Changes are reviewed through pull requests. Each release gets a new immutable
+version tag, matching runtime version, and updated changelog and README.
+Maintainers review open code-scanning alerts separately from successful CI and
+CodeQL runs; a passing scan job is not a finding-free verdict. See the
+[release checklist](docs/releasing.md) for the publication gates.
+
 - [Compatibility evidence](docs/compatibility.md)
 - [Architecture and safety boundaries](docs/architecture.md)
 - [Contributing](CONTRIBUTING.md)
