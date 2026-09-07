@@ -56,3 +56,20 @@ provider version when known and say `unknown` when it was not captured.
 - Resolve actionable findings before release. Dismiss a false positive only
   after checking the exact source and recording evidence on the alert; never
   disable a query or exclude tests merely to make the security page green.
+
+## Agent skills
+
+### Issue tracker
+
+Track work in this repository's GitHub Issues using the `gh` CLI.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five default triage labels.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use a single-context layout: root `CONTEXT.md` and `docs/adr/`.
+See `docs/agents/domain.md`.

@@ -299,6 +299,10 @@ CodeQL runs; a passing scan job is not a finding-free verdict. See the
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
 
+Agent-assisted engineering uses GitHub Issues, the triage vocabulary, and
+domain-documentation conventions under [`docs/agents/`](docs/agents/); see the
+[Agent skills section in AGENTS.md](AGENTS.md#agent-skills).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
