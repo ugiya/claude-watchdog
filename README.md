@@ -281,7 +281,7 @@ sanitized to remove control characters, but sanitization is not anonymization.
 
 ## Project status
 
-`v0.1.0` is an experimental public prerelease. The repository has regression
+`v0.1.1` is an experimental public prerelease. The repository has regression
 coverage for parsers, watch-set scoping, power-command ordering, dashboard
 rendering, and isolated lifecycle behavior. That coverage does not establish
 compatibility with every agent release or prove real-world sleep behavior on
