@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-07
+
+Maintenance prerelease; persisted-activity and sleep-guard behavior is unchanged.
+
 ### Changed
 
 - Split the runtime into cohesive, normally importable modules while preserving
