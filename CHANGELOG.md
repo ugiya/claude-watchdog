@@ -9,6 +9,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- Ignore inverted OMX subagent-tracking claims for a project's launch root,
+  including when the corresponding leader is outside the dashboard watch window.
 - Restore dashboard tree indentation for Codex subagents recorded by OMX while
   preserving rollout-embedded parentage and discarding only tracking-added
   parents from any resulting lineage cycle.

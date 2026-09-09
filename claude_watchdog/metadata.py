@@ -285,20 +285,21 @@ def jsonl_metadata(
                 record_id = payload.get("id")
                 if isinstance(record_id, str) and record_id:
                     session_id = record_id
+                record_omx_launch = _has_omx_launch(
+                    payload.get("session_id") or payload.get("id"),
+                    payload.get("cwd"), payload.get("timestamp") or obj.get("timestamp"),
+                )
+                omx_launch = omx_launch or record_omx_launch
                 source = payload.get("source")
                 subagent = source.get("subagent") if isinstance(source, dict) else None
                 thread_spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
                 parent_id = thread_spawn.get("parent_thread_id") if isinstance(thread_spawn, dict) else None
                 if isinstance(parent_id, str) and parent_id:
                     parent_session_id = parent_id
-                else:
+                elif not record_omx_launch:
                     tracking_parent_session_id = _omx_tracking_parent(
                         record_id, payload.get("cwd")
                     )
-                omx_launch = omx_launch or _has_omx_launch(
-                    payload.get("session_id") or payload.get("id"),
-                    payload.get("cwd"), payload.get("timestamp") or obj.get("timestamp"),
-                )
         elif kind == "turn_context":
             model = text_module._safe_metadata_value(payload.get("model") or model)
             effort = text_module._safe_metadata_value(payload.get("reasoning_effort") or effort)

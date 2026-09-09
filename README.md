@@ -245,7 +245,9 @@ exact lineage recorded in the rollout project's
 `.omx/state/subagent-tracking.json`. Rollout-embedded Codex parentage remains
 authoritative: if tracking fallbacks would create a cycle, only the tracking
 parents in that cycle are discarded and embedded parents remain intact. Only
-sessions recorded by OMX's tracking machinery receive this fallback.
+sessions recorded by OMX's tracking machinery receive this fallback, and a
+session identified by exact OMX launch evidence as the project's launch root is
+excluded even if the tracking file labels it as a subagent.
 
 Shell-launched cross-provider children do not necessarily record a native
 parent. An optional `~/.config/claude-watchdog/lineage.json` can declare an
