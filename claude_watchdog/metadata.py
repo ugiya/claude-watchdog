@@ -504,6 +504,52 @@ def external_lineage_registry_path() -> Path:
     return Path.home() / ".config" / "claude-watchdog" / "lineage.json"
 
 
+def lineage_parent_keys(
+    entries: Iterable[
+        tuple[
+            tuple[str, str],
+            models_module.SessionMetadata | models_module.SessionRow,
+        ]
+    ],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """Resolve edges; see test_dashboard_parent_keys_match_legacy_oracle."""
+    values = list(entries)
+    row_keys: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    identities: dict[tuple[str, str, str], list[tuple[str, str]]] = {}
+    for key, value in values:
+        row_keys.setdefault(key, []).append(key)
+        if value.session_id != models_module.UNKNOWN:
+            identities.setdefault(
+                (key[0], value.lineage_namespace, value.session_id), []
+            ).append(key)
+
+    parents = {}
+    for child_key, child_metadata in values:
+        parent_keys = identities.get(
+            (
+                child_key[0],
+                child_metadata.lineage_namespace,
+                child_metadata.parent_session_id,
+            ),
+            [],
+        )
+        if len(parent_keys) == 1 and parent_keys[0] != child_key:
+            parents[child_key] = parent_keys[0]
+        elif (
+            child_metadata.parent_session_id == models_module.UNKNOWN
+            and child_metadata.external_parent_key is not None
+        ):
+            external_parent_keys = row_keys.get(
+                child_metadata.external_parent_key, []
+            )
+            if (
+                len(external_parent_keys) == 1
+                and external_parent_keys[0] != child_key
+            ):
+                parents[child_key] = external_parent_keys[0]
+    return parents
+
+
 def apply_external_lineage_registry(
     metadata: dict[tuple[str, str], models_module.SessionMetadata],
     registry_path: Path | None = None,

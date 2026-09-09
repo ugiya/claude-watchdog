@@ -7,6 +7,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,6 +30,47 @@ def _row(
         lineage_namespace=lineage_namespace,
     )
 
+
+def _legacy_dashboard_parent_keys(rows):
+    """Oracle copied from the pre-extraction dashboard resolver."""
+    row_list = list(rows)
+    row_keys = {}
+    for row in row_list:
+        row_keys.setdefault(row.key, []).append(row)
+    identities = {}
+    for row in row_list:
+        if row.session_id != wd_models.UNKNOWN:
+            identities.setdefault(
+                (row.source, row.lineage_namespace, row.session_id), []
+            ).append(row)
+    parents = {}
+    for row in row_list:
+        matches = identities.get(
+            (row.source, row.lineage_namespace, row.parent_session_id), []
+        )
+        if len(matches) == 1 and matches[0].key != row.key:
+            parents[row.key] = matches[0].key
+        elif (
+            row.parent_session_id == wd_models.UNKNOWN
+            and row.external_parent_key is not None
+        ):
+            external_matches = row_keys.get(row.external_parent_key, [])
+            if len(external_matches) == 1 and external_matches[0].key != row.key:
+                parents[row.key] = external_matches[0].key
+
+    cyclic = set()
+    for row in row_list:
+        path, positions = [], {}
+        current = row.key
+        while current in parents and current not in positions:
+            positions[current] = len(path)
+            path.append(current)
+            current = parents[current]
+        if current in positions:
+            cyclic.update(path[positions[current]:])
+    for key in cyclic:
+        parents.pop(key, None)
+    return parents
 
 class FakeScreen:
     def __init__(self, height=20, width=180):
@@ -243,6 +285,128 @@ class TreePresentationTests(unittest.TestCase):
         self.assertEqual(len(visible), 1100)
         self.assertEqual((visible[0].session_id, visible[-1].session_id),
                          ("node-0", "node-1099"))
+
+    def test_dashboard_parent_keys_match_legacy_oracle(self):
+        def row(
+            source,
+            name,
+            session_id,
+            parent_session_id=wd_models.UNKNOWN,
+            *,
+            key_name=None,
+            external_parent_key=None,
+        ):
+            path = f"synthetic-{key_name or name}.jsonl"
+            return replace(
+                _row(name, session_id, parent_session_id, "synthetic-lineage"),
+                key=(source, path),
+                source=source,
+                path=path,
+                external_parent_key=external_parent_key,
+            )
+
+        present_external_key = ("claude", "synthetic-external-parent.jsonl")
+        duplicated_external_key = ("opencode", "synthetic-duplicate.jsonl")
+        blocked_external_key = ("codex", "synthetic-blocked-parent.jsonl")
+        row_sets = {
+            "native_identity_and_unknown_exclusion": [
+                row("codex", "native-parent", "shared-parent"),
+                row("codex", "native-child", "codex-child", "shared-parent"),
+                row("claude", "provider-local-parent", "shared-parent"),
+                row("claude", "self-parent", "self-id", "self-id"),
+                row("opencode", "unknown-identity", wd_models.UNKNOWN),
+                row("opencode", "unknown-child", "unknown-child"),
+            ],
+            "external_present_missing_and_duplicate": [
+                row("claude", "external-parent", "external-parent"),
+                row(
+                    "claude",
+                    "external-child",
+                    "external-child",
+                    external_parent_key=present_external_key,
+                ),
+                row(
+                    "codex",
+                    "missing-external-child",
+                    "missing-external-child",
+                    external_parent_key=("codex", "synthetic-missing.jsonl"),
+                ),
+                row(
+                    "opencode",
+                    "duplicate-first",
+                    "duplicate-first",
+                    key_name="duplicate",
+                ),
+                row(
+                    "opencode",
+                    "duplicate-second",
+                    "duplicate-second",
+                    key_name="duplicate",
+                ),
+                row(
+                    "opencode",
+                    "ambiguous-external-child",
+                    "ambiguous-external-child",
+                    external_parent_key=duplicated_external_key,
+                ),
+            ],
+            "known_unresolvable_parent_blocks_external_fallback": [
+                row("codex", "blocked-parent", "external-parent"),
+                row(
+                    "codex",
+                    "blocked-child",
+                    "blocked-child",
+                    "missing-native-parent",
+                    external_parent_key=blocked_external_key,
+                ),
+                row("claude", "other-provider", "external-parent"),
+                row("opencode", "unknown-provider-row", wd_models.UNKNOWN),
+            ],
+        }
+
+        for name, rows in row_sets.items():
+            with self.subTest(name=name):
+                # The copied oracle is equivalent only while row.source == key[0].
+                self.assertTrue(all(row.source == row.key[0] for row in rows))
+                self.assertEqual(
+                    wd_dashboard._dashboard_parent_keys(rows),
+                    _legacy_dashboard_parent_keys(rows),
+                )
+
+    def test_dashboard_row_constructors_preserve_source_key_invariant(self):
+        now = datetime(2026, 9, 9, tzinfo=timezone.utc)
+        items = [
+            wd_models.ActivityFile(Path("synthetic-codex.jsonl"), "codex"),
+            wd_models.ActivityFile(Path("synthetic-claude.jsonl"), "claude"),
+            wd_models.ActivityFile(Path("synthetic-opencode.db"), "opencode"),
+        ]
+        metadata = {
+            wd_metadata.target_key(items[2]): wd_models.SessionMetadata(
+                lineage_namespace="synthetic-lineage",
+                children=(wd_models.SessionChildMetadata("synthetic-child"),),
+            )
+        }
+
+        snapshot = wd_dashboard.make_dashboard_snapshot(
+            now,
+            wd_models.Config(),
+            items,
+            [(item, now) for item in items],
+            0,
+            10,
+            metadata,
+        )
+        expanded = wd_dashboard._expanded_dashboard_rows(snapshot.rows)
+
+        self.assertEqual(
+            [row.source for row in snapshot.rows],
+            [row.key[0] for row in snapshot.rows],
+        )
+        self.assertGreater(len(expanded), len(snapshot.rows))
+        self.assertEqual(
+            [row.source for row in expanded],
+            [row.key[0] for row in expanded],
+        )
 
 
 class TreeFrameTests(unittest.TestCase):

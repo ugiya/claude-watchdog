@@ -71,26 +71,9 @@ def _dashboard_parent_keys(
 ) -> dict[tuple[str, str], tuple[str, str]]:
     """Resolve safe, provider-local parent links for visible dashboard rows."""
     row_list = list(rows)
-    row_keys: dict[tuple[str, str], list[models_module.SessionRow]] = {}
-    for row in row_list:
-        row_keys.setdefault(row.key, []).append(row)
-    identities: dict[tuple[str, str, str], list[models_module.SessionRow]] = {}
-    for row in row_list:
-        if row.session_id != models_module.UNKNOWN:
-            identities.setdefault(
-                (row.source, row.lineage_namespace, row.session_id), []
-            ).append(row)
-    parents = {}
-    for row in row_list:
-        matches = identities.get(
-            (row.source, row.lineage_namespace, row.parent_session_id), []
-        )
-        if len(matches) == 1 and matches[0].key != row.key:
-            parents[row.key] = matches[0].key
-        elif row.parent_session_id == models_module.UNKNOWN and row.external_parent_key is not None:
-            external_matches = row_keys.get(row.external_parent_key, [])
-            if len(external_matches) == 1 and external_matches[0].key != row.key:
-                parents[row.key] = external_matches[0].key
+    parents = metadata_module.lineage_parent_keys(
+        (row.key, row) for row in row_list
+    )
 
     cyclic = set()
     for row in row_list:
