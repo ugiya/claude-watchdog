@@ -240,7 +240,12 @@ reliably.
 Native Claude, Codex, and OpenCode parent identifiers appear as a `pstree`-style
 hierarchy when both parent and child are visible. Codex parsing preserves the
 child's own first `session_meta` identity when forked transcripts contain an
-inherited parent record.
+inherited parent record. Codex sessions launched as OMX subagents can also use
+exact lineage recorded in the rollout project's
+`.omx/state/subagent-tracking.json`. Rollout-embedded Codex parentage remains
+authoritative: if tracking fallbacks would create a cycle, only the tracking
+parents in that cycle are discarded and embedded parents remain intact. Only
+sessions recorded by OMX's tracking machinery receive this fallback.
 
 Shell-launched cross-provider children do not necessarily record a native
 parent. An optional `~/.config/claude-watchdog/lineage.json` can declare an
@@ -262,6 +267,8 @@ exact relationship for Claude and Codex sessions:
 The registry affects presentation only. Entries must resolve to one visible
 parent and one visible child; conflicts, ambiguity, unsupported sources, and
 malformed files are ignored. The file is limited to 256 KiB and 256 links.
+Lineage precedence is rollout-embedded parentage, then OMX tracking, then the
+external registry.
 
 ## Logs and privacy
 

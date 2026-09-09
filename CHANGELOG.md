@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- Restore dashboard tree indentation for Codex subagents recorded by OMX while
+  preserving rollout-embedded parentage and discarding only tracking-added
+  parents from any resulting lineage cycle.
+
 ## [0.1.1] - 2026-09-07
 
 Maintenance prerelease; persisted-activity and sleep-guard behavior is unchanged.

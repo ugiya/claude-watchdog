@@ -112,7 +112,7 @@ def _has_omx_launch(session_id: object, cwd: object, started: object) -> bool:
         with (root / "state/session.json").open("rb") as handle:
             if matches(json.loads(handle.read(models_module.READ_CHUNK_BYTES))):
                 return True
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         pass
     timestamp = activity_module._parse_ts(started) if isinstance(started, str) else None
     if timestamp is None:
@@ -127,6 +127,75 @@ def _has_omx_launch(session_id: object, cwd: object, started: object) -> bool:
         if any(record.get("event") == "session_start_reconciled" and matches(record) for record in records):
             return True
     return False
+
+
+def _omx_tracking_parent(session_id: object, cwd: object) -> str | None:
+    """Return one exact, bounded OMX parent declaration for a Codex rollout."""
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(cwd, str)
+        or not Path(cwd).is_absolute()
+    ):
+        return None
+    try:
+        path = Path(cwd) / ".omx/state/subagent-tracking.json"
+        with path.open("rb") as handle:
+            raw = handle.read(models_module.MAX_OMX_TRACKING_BYTES + 1)
+        if len(raw) > models_module.MAX_OMX_TRACKING_BYTES:
+            return None
+        document = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    schema_version = document.get("schemaVersion")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
+        return None
+    sessions = document.get("sessions")
+    if (
+        not isinstance(sessions, dict)
+        or len(sessions) > models_module.MAX_OMX_TRACKING_SESSIONS
+    ):
+        return None
+
+    parents = set()
+    for launch_id, value in sessions.items():
+        if not isinstance(launch_id, str) or not isinstance(value, dict):
+            continue
+        tracked_session_id = value.get("session_id")
+        leader_thread_id = value.get("leader_thread_id")
+        threads = value.get("threads")
+        if (
+            not isinstance(tracked_session_id, str)
+            or tracked_session_id != launch_id
+            or not isinstance(leader_thread_id, str)
+            or not leader_thread_id
+            or not isinstance(threads, dict)
+            or len(threads) > models_module.MAX_OMX_TRACKING_THREADS
+        ):
+            continue
+        thread = threads.get(session_id)
+        if not isinstance(thread, dict):
+            continue
+        thread_id = thread.get("thread_id")
+        kind = thread.get("kind")
+        if (
+            not isinstance(thread_id, str)
+            or thread_id != session_id
+            or not isinstance(kind, str)
+            or kind != "subagent"
+            or leader_thread_id == session_id
+        ):
+            continue
+        parents.add(leader_thread_id)
+        if len(parents) > 1:
+            return None
+    return next(iter(parents), None)
 
 
 def _claude_registry_name(session_id: str) -> str | None:
@@ -186,6 +255,7 @@ def jsonl_metadata(
     omx_launch = False
     session_id: str | None = None
     parent_session_id: str | None = None
+    tracking_parent_session_id: str | None = None
     claude_agent_id: str | None = None
     try:
         records = _bounded_metadata_objects(item.path, max_records, spread=claude_family)
@@ -221,6 +291,10 @@ def jsonl_metadata(
                 parent_id = thread_spawn.get("parent_thread_id") if isinstance(thread_spawn, dict) else None
                 if isinstance(parent_id, str) and parent_id:
                     parent_session_id = parent_id
+                else:
+                    tracking_parent_session_id = _omx_tracking_parent(
+                        record_id, payload.get("cwd")
+                    )
                 omx_launch = omx_launch or _has_omx_launch(
                     payload.get("session_id") or payload.get("id"),
                     payload.get("cwd"), payload.get("timestamp") or obj.get("timestamp"),
@@ -309,6 +383,9 @@ def jsonl_metadata(
         session_id=text_module._safe_metadata_value(session_id),
         parent_session_id=text_module._safe_metadata_value(parent_session_id),
         lineage_namespace=text_module._safe_metadata_value(lineage_namespace),
+        tracking_parent_session_id=text_module._safe_metadata_value(
+            tracking_parent_session_id
+        ),
     )
 
 
@@ -371,6 +448,7 @@ def _merge_metadata(primary: models_module.SessionMetadata, fallback: models_mod
     scalar_fields = (
         "client", "task", "model", "effort", "started", "cwd", "provenance",
         "agent", "session_id", "parent_session_id", "lineage_namespace",
+        "tracking_parent_session_id",
     )
     values = {
         field_name: (
@@ -504,6 +582,104 @@ def external_lineage_registry_path() -> Path:
     return Path.home() / ".config" / "claude-watchdog" / "lineage.json"
 
 
+def lineage_parent_keys(
+    entries: Iterable[
+        tuple[
+            tuple[str, str],
+            models_module.SessionMetadata | models_module.SessionRow,
+        ]
+    ],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """Resolve edges; see test_dashboard_parent_keys_match_legacy_oracle."""
+    values = list(entries)
+    row_keys: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    identities: dict[tuple[str, str, str], list[tuple[str, str]]] = {}
+    for key, value in values:
+        row_keys.setdefault(key, []).append(key)
+        if value.session_id != models_module.UNKNOWN:
+            identities.setdefault(
+                (key[0], value.lineage_namespace, value.session_id), []
+            ).append(key)
+
+    parents = {}
+    for child_key, child_metadata in values:
+        parent_keys = identities.get(
+            (
+                child_key[0],
+                child_metadata.lineage_namespace,
+                child_metadata.parent_session_id,
+            ),
+            [],
+        )
+        if len(parent_keys) == 1 and parent_keys[0] != child_key:
+            parents[child_key] = parent_keys[0]
+        elif (
+            child_metadata.parent_session_id == models_module.UNKNOWN
+            and child_metadata.external_parent_key is not None
+        ):
+            external_parent_keys = row_keys.get(
+                child_metadata.external_parent_key, []
+            )
+            if (
+                len(external_parent_keys) == 1
+                and external_parent_keys[0] != child_key
+            ):
+                parents[child_key] = external_parent_keys[0]
+    return parents
+
+
+def apply_omx_tracking_lineage(
+    metadata: dict[tuple[str, str], models_module.SessionMetadata],
+    fixed_lineage: dict[
+        tuple[str, str], models_module.SessionMetadata
+    ] | None = None,
+) -> dict[tuple[str, str], models_module.SessionMetadata]:
+    """Apply OMX candidates without creating cycles through embedded lineage."""
+    result = dict(metadata)
+
+    tracking_parent_keys = set()
+    for child_key, child_metadata in metadata.items():
+        tracking_parent_id = child_metadata.tracking_parent_session_id
+        if (
+            child_key[0] != "codex"
+            or child_metadata.parent_session_id != models_module.UNKNOWN
+            or tracking_parent_id == models_module.UNKNOWN
+            or tracking_parent_id == child_metadata.session_id
+        ):
+            continue
+        result[child_key] = replace(
+            child_metadata, parent_session_id=tracking_parent_id
+        )
+        tracking_parent_keys.add(child_key)
+
+    guard_values = result
+    if fixed_lineage is not None:
+        guard_values = {
+            key: replace(
+                value,
+                external_parent_key=fixed_lineage.get(
+                    key, value
+                ).external_parent_key,
+            )
+            for key, value in result.items()
+        }
+    parents = lineage_parent_keys(guard_values.items())
+
+    cyclic = set()
+    for child_key in result:
+        path, positions = [], {}
+        current = child_key
+        while current in parents and current not in positions:
+            positions[current] = len(path)
+            path.append(current)
+            current = parents[current]
+        if current in positions:
+            cyclic.update(path[positions[current]:])
+    for child_key in cyclic & tracking_parent_keys:
+        result[child_key] = metadata[child_key]
+    return result
+
+
 def apply_external_lineage_registry(
     metadata: dict[tuple[str, str], models_module.SessionMetadata],
     registry_path: Path | None = None,
@@ -611,4 +787,7 @@ def load_dashboard_metadata(
                 values[target_key(item)] = load_session_metadata(item, task_label=task_label)
         except Exception:
             values[target_key(item)] = models_module.SessionMetadata()
-    return apply_external_lineage_registry(values)
+    fixed_lineage = apply_external_lineage_registry(values)
+    return apply_external_lineage_registry(
+        apply_omx_tracking_lineage(values, fixed_lineage=fixed_lineage)
+    )
