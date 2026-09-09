@@ -26,6 +26,15 @@ MAX_EXTERNAL_LINEAGE_BYTES = 256 * 1024
 MAX_EXTERNAL_LINEAGE_LINKS = 256
 
 
+MAX_OMX_TRACKING_BYTES = 256 * 1024
+
+
+MAX_OMX_TRACKING_SESSIONS = 256
+
+
+MAX_OMX_TRACKING_THREADS = 256
+
+
 MAX_PROFILES_BYTES = 64 * 1024
 
 
@@ -169,6 +178,7 @@ class SessionMetadata:
     lineage_namespace: str = UNKNOWN
     children: tuple[SessionChildMetadata, ...] = ()
     external_parent_key: tuple[str, str] | None = None
+    tracking_parent_session_id: str = UNKNOWN
 
 
 @dataclass(frozen=True)

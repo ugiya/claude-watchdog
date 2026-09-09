@@ -15,7 +15,7 @@ regression fixtures for the observed formats described below.
 | --- | --- | --- | --- |
 | Claude Code and configured profiles | Unknown | Synthetic JSONL parsing, profile scoping, native child discovery, prompt/title metadata, and tree tests | Experimental |
 | Codex CLI/App | Unknown | Synthetic rollout JSONL, optional state database metadata, inherited-identity, and tree tests | Experimental |
-| OMX | Unknown | Synthetic shared-log identity admission and timestamp attribution tests | Experimental |
+| OMX | 0.21.3 | Synthetic shared-log identity admission, timestamp attribution, and Codex subagent-tracking lineage tests | Experimental |
 | OpenCode | Unknown | Synthetic SQLite root/descendant, activity, current-model, and tree tests | Experimental |
 
 CI on Linux exercises portable unit behavior. CI on macOS additionally runs
@@ -124,6 +124,35 @@ a top-level `timestamp` and at least one recognized identity field:
 Because logs are shared, the launch scan admits only identities with recent
 content. Live discovery may add recently active identities; activity queries
 remain attributable to the admitted identity set.
+
+For Codex rollouts whose `session_meta.payload.cwd` is absolute, display lineage
+may also come from:
+
+```text
+<cwd>/.omx/state/subagent-tracking.json
+```
+
+The accepted document has `schemaVersion: 1` and a `sessions` object. Each
+accepted session entry has a string `session_id` matching its object key, a
+non-empty string `leader_thread_id`, and a `threads` object. A rollout receives
+that leader as its parent only when its exact session ID selects a thread entry
+whose matching string `thread_id` has `kind: "subagent"`. A rollout with an
+embedded Codex `thread_spawn.parent_thread_id` does not use its own tracking
+fallback. After all visible rollouts are loaded, tracking parents that
+participate in a cycle are discarded while embedded parents remain intact.
+Leaders are never made their own parent. Conflicting parent declarations yield
+no lineage. Lineage precedence is rollout-embedded parentage, then OMX tracking,
+then the external registry.
+
+The file read is limited to 256 KiB, with one extra byte read to detect and
+reject oversized documents. Documents with more than 256 session entries or a
+considered session with more than 256 thread entries are ignored. Missing,
+malformed, truncated, recursive, unsupported-schema, oversized, or invalid
+nested data yields no lineage and does not affect activity or sleep decisions.
+
+This fallback restores lineage only for sessions recorded by OMX's subagent
+tracking machinery. Sessions launched outside that machinery do not receive
+this fallback.
 
 ### OpenCode
 
