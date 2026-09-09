@@ -697,6 +697,185 @@ class AncestryMetadataTests(unittest.TestCase):
             ["", "└─ "],
         )
 
+    def test_omx_launch_root_alone_ignores_inverted_tracking_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "synthetic-project"
+            project.mkdir()
+            launch_root = _codex_rollout(
+                root, project, "launch-root", "launch-root-thread", source="cli"
+            )
+            state = project / ".omx" / "state"
+            state.mkdir(parents=True)
+            (state / "session.json").write_text(json.dumps({
+                "native_session_id": "launch-root-thread",
+                "session_id": "omx-synthetic-launch",
+            }), encoding="utf-8")
+            _write_omx_tracking(project, "leader-thread", {
+                "launch-root-thread": {
+                    "thread_id": "launch-root-thread",
+                    "kind": "subagent",
+                },
+            })
+
+            result = _load_codex_metadata((launch_root,))[
+                wd_metadata.target_key(launch_root)
+            ]
+
+        self.assertEqual(result.client, "OMX / Codex")
+        self.assertEqual(result.parent_session_id, wd_models.UNKNOWN)
+        self.assertEqual(result.tracking_parent_session_id, wd_models.UNKNOWN)
+
+    def test_omx_launch_root_guard_preserves_genuine_subagent_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "synthetic-project"
+            project.mkdir()
+            launch_root = _codex_rollout(
+                root, project, "launch-root", "launch-root-thread", source="cli"
+            )
+            child = _codex_rollout(
+                root, project, "child", "child-thread", source="cli"
+            )
+            state = project / ".omx" / "state"
+            state.mkdir(parents=True)
+            (state / "session.json").write_text(json.dumps({
+                "native_session_id": "launch-root-thread",
+                "session_id": "omx-synthetic-launch",
+            }), encoding="utf-8")
+            _write_omx_tracking(project, "leader-thread", {
+                "launch-root-thread": {
+                    "thread_id": "launch-root-thread",
+                    "kind": "subagent",
+                },
+                "child-thread": {
+                    "thread_id": "child-thread",
+                    "kind": "subagent",
+                },
+            })
+
+            metadata = _load_codex_metadata((launch_root, child))
+            root_metadata = metadata[wd_metadata.target_key(launch_root)]
+            child_metadata = metadata[wd_metadata.target_key(child)]
+
+        self.assertEqual(root_metadata.parent_session_id, wd_models.UNKNOWN)
+        self.assertEqual(
+            root_metadata.tracking_parent_session_id, wd_models.UNKNOWN
+        )
+        self.assertEqual(child_metadata.parent_session_id, "leader-thread")
+        self.assertEqual(
+            child_metadata.tracking_parent_session_id, "leader-thread"
+        )
+
+    def test_omx_launch_root_guard_preserves_embedded_root_to_leader_edge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "synthetic-project"
+            project.mkdir()
+            launch_root = _codex_rollout(
+                root, project, "launch-root", "launch-root-thread", source="cli"
+            )
+            leader = _codex_rollout(
+                root,
+                project,
+                "leader",
+                "leader-thread",
+                source={
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "launch-root-thread"
+                        }
+                    }
+                },
+            )
+            state = project / ".omx" / "state"
+            state.mkdir(parents=True)
+            (state / "session.json").write_text(json.dumps({
+                "native_session_id": "launch-root-thread",
+                "session_id": "omx-synthetic-launch",
+            }), encoding="utf-8")
+            _write_omx_tracking(project, "leader-thread", {
+                "launch-root-thread": {
+                    "thread_id": "launch-root-thread",
+                    "kind": "subagent",
+                },
+                "leader-thread": {
+                    "thread_id": "leader-thread",
+                    "kind": "leader",
+                },
+            })
+
+            items = (launch_root, leader)
+            metadata = _load_codex_metadata(items)
+            now = datetime(2026, 9, 9, tzinfo=timezone.utc)
+            snapshot = wd_dashboard.make_dashboard_snapshot(
+                now,
+                wd_models.Config(),
+                list(items),
+                [(item, now) for item in items],
+                0,
+                10,
+                metadata,
+            )
+
+        root_metadata = metadata[wd_metadata.target_key(launch_root)]
+        self.assertEqual(root_metadata.parent_session_id, wd_models.UNKNOWN)
+        self.assertEqual(
+            root_metadata.tracking_parent_session_id, wd_models.UNKNOWN
+        )
+        self.assertEqual(
+            metadata[wd_metadata.target_key(leader)].parent_session_id,
+            "launch-root-thread",
+        )
+        self.assertEqual(
+            list(wd_dashboard.dashboard_tree_prefixes(snapshot.rows).values()),
+            ["", "└─ "],
+        )
+
+    def test_omx_launch_root_shared_log_ignores_inverted_tracking_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "synthetic-project"
+            project.mkdir()
+            started = datetime(2026, 9, 9, 8, tzinfo=timezone.utc)
+            path = root / "rollout-launch-root.jsonl"
+            path.write_text(json.dumps({
+                "type": "session_meta",
+                "payload": {
+                    "id": "launch-root-thread",
+                    "originator": "codex-tui",
+                    "source": "cli",
+                    "cwd": str(project),
+                    "timestamp": started.isoformat(),
+                },
+            }) + "\n", encoding="utf-8")
+            launch_root = wd_models.ActivityFile(path, "codex")
+            logs = project / ".omx" / "logs"
+            logs.mkdir(parents=True)
+            (logs / started.strftime("omx-%Y-%m-%d.jsonl")).write_text(
+                json.dumps({
+                    "event": "session_start_reconciled",
+                    "native_session_id": "launch-root-thread",
+                    "session_id": "omx-synthetic-launch",
+                    "timestamp": started.isoformat(),
+                }) + "\n",
+                encoding="utf-8",
+            )
+            _write_omx_tracking(project, "leader-thread", {
+                "launch-root-thread": {
+                    "thread_id": "launch-root-thread",
+                    "kind": "subagent",
+                },
+            })
+
+            result = _load_codex_metadata((launch_root,))[
+                wd_metadata.target_key(launch_root)
+            ]
+
+        self.assertEqual(result.client, "OMX / Codex")
+        self.assertEqual(result.parent_session_id, wd_models.UNKNOWN)
+        self.assertEqual(result.tracking_parent_session_id, wd_models.UNKNOWN)
+
     def test_embedded_parent_precedes_omx_tracking_and_preserves_three_level_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

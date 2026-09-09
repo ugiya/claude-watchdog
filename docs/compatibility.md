@@ -136,13 +136,16 @@ The accepted document has `schemaVersion: 1` and a `sessions` object. Each
 accepted session entry has a string `session_id` matching its object key, a
 non-empty string `leader_thread_id`, and a `threads` object. A rollout receives
 that leader as its parent only when its exact session ID selects a thread entry
-whose matching string `thread_id` has `kind: "subagent"`. A rollout with an
-embedded Codex `thread_spawn.parent_thread_id` does not use its own tracking
-fallback. After all visible rollouts are loaded, tracking parents that
-participate in a cycle are discarded while embedded parents remain intact.
-Leaders are never made their own parent. Conflicting parent declarations yield
-no lineage. Lineage precedence is rollout-embedded parentage, then OMX tracking,
-then the external registry.
+whose matching string `thread_id` has `kind: "subagent"`, and exact launch
+evidence does not identify the rollout as that project's OMX launch root. Launch
+evidence is an exact `native_session_id` match in `.omx/state/session.json` or an
+`omx-`-prefixed `session_start_reconciled` record in the date-adjacent shared
+logs. A rollout with an embedded Codex `thread_spawn.parent_thread_id` does not
+use its own tracking fallback. After all visible rollouts are loaded, tracking
+parents that participate in a cycle are discarded while embedded parents remain
+intact. Leaders are never made their own parent. Conflicting parent declarations
+yield no lineage. Lineage precedence is rollout-embedded parentage, then OMX
+tracking, then the external registry.
 
 The file read is limited to 256 KiB, with one extra byte read to detect and
 reject oversized documents. Documents with more than 256 session entries or a
