@@ -120,8 +120,14 @@ def wait_until_quiet(
     cfg: models_module.Config,
     watch_set: list[models_module.ActivityFile],
     dashboard: dashboard_module.TerminalDashboard | None = None,
+    display_items: list[models_module.ActivityFile] | None = None,
 ) -> None:
     """Wait for every watched session to be quiet and for the user to be idle."""
+    ancestor_candidates = (
+        dashboard_module.index_display_ancestor_candidates(display_items or ())
+        if dashboard is not None
+        else {}
+    )
     while True:
         now = datetime.now(timezone.utc)
         admission_notice = ""
@@ -160,7 +166,7 @@ def wait_until_quiet(
             metadata = metadata_module.load_dashboard_metadata(watch_set, cfg.task_label)
             snapshot = dashboard_module.make_dashboard_snapshot(
                 now, cfg, watch_set, activity, idle, cfg.poll_seconds, metadata,
-                admission_notice,
+                admission_notice, ancestor_candidates,
             )
             dashboard.history.observe(snapshot)
             dashboard.update(snapshot)
@@ -204,6 +210,7 @@ def _run_watch_phase(
     cfg: models_module.Config,
     watch_set: list[models_module.ActivityFile],
     dashboard: dashboard_module.TerminalDashboard | None,
+    display_items: list[models_module.ActivityFile] | None = None,
 ) -> tuple[subprocess.Popen | None, int, tuple[int, str, tuple[object, ...]]]:
     """Start the wake assertion and run the loop without performing cleanup or logging."""
     try:
@@ -225,7 +232,7 @@ def _run_watch_phase(
         if dashboard is None:
             wait_until_quiet(cfg, watch_set)
         else:
-            wait_until_quiet(cfg, watch_set, dashboard)
+            wait_until_quiet(cfg, watch_set, dashboard, display_items)
     except KeyboardInterrupt:
         return process, 130, (
             logging.INFO,
@@ -348,7 +355,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with dashboard_module.dashboard_context(cfg) as dashboard:
                 finished_dashboard = dashboard
-                process, status, record = _run_watch_phase(cfg, watch_set, dashboard)
+                process, status, record = _run_watch_phase(
+                    cfg, watch_set, dashboard, candidates
+                )
         except KeyboardInterrupt:
             status, record = 130, (
                 logging.INFO,

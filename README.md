@@ -152,6 +152,8 @@ Run `claude-watchdog --help` for every option.
 
 Filters, sorting, and tree presentation change only the display. Hidden rows
 remain in the watch set and continue to affect the sleep decision.
+Conversely, tree-only ancestor rows are descriptive: they never join the watch
+set, increase holding counts, or delay the sleep decision.
 
 ## Supported sources
 
@@ -238,7 +240,14 @@ reliably.
 ## Agent trees and external lineage
 
 Native Claude, Codex, and OpenCode parent identifiers appear as a `pstree`-style
-hierarchy when both parent and child are visible. Codex parsing preserves the
+hierarchy. When a watched child has a known but unwatched parent and that
+parent's metadata is available, tree view adds the parent as a display-only row
+so the hierarchy remains connected. It does not invent rows for unavailable
+metadata. Filters select watched rows first and retain any structural ancestors
+they require; sorting keeps each subtree together, and `recent` ranks a
+timestamp-less structural ancestor by its most recent subtree member. Tree-only
+ancestors are labeled as unwatched and remain selectable, while flat view
+continues to show only the filtered watched rows. Codex parsing preserves the
 child's own first `session_meta` identity when forked transcripts contain an
 inherited parent record. Codex sessions launched as OMX subagents can also use
 exact lineage recorded in the rollout project's
@@ -266,11 +275,11 @@ exact relationship for Claude and Codex sessions:
 }
 ```
 
-The registry affects presentation only. Entries must resolve to one visible
-parent and one visible child; conflicts, ambiguity, unsupported sources, and
-malformed files are ignored. The file is limited to 256 KiB and 256 links.
-Lineage precedence is rollout-embedded parentage, then OMX tracking, then the
-external registry.
+The registry affects presentation only. Entries must resolve unambiguously
+among metadata-known candidates, and only ancestry required by a watched row is
+rendered; conflicts, ambiguity, unsupported sources, and malformed files are
+ignored. The file is limited to 256 KiB and 256 links. Lineage precedence is
+rollout-embedded parentage, then OMX tracking, then the external registry.
 
 ## Logs and privacy
 

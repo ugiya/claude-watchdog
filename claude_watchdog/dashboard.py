@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -18,6 +19,134 @@ from . import models as models_module
 from . import presentation as presentation_module
 from . import reporting as reporting_module
 from . import text as text_module
+
+
+_CODEX_ROLLOUT_NAME = re.compile(
+    r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:\.\d+)?Z?-(.+)$"
+)
+
+
+def _activity_file_identities(
+    item: models_module.ActivityFile,
+) -> frozenset[str]:
+    """Return identities available from discovery data without reading content."""
+    identities = set(item.identities)
+    stem = item.path.stem
+    if item.source == "claude" and item.path.suffix == ".jsonl":
+        identities.add(stem)
+        if stem.startswith("agent-"):
+            identities.add(stem.removeprefix("agent-"))
+    elif item.source == "codex" and item.path.suffix == ".jsonl":
+        match = _CODEX_ROLLOUT_NAME.fullmatch(stem)
+        if match is not None:
+            identities.add(match.group(1))
+    return frozenset(identity for identity in identities if identity)
+
+
+def index_display_ancestor_candidates(
+    items: Iterable[models_module.ActivityFile],
+) -> dict[tuple[str, str], tuple[models_module.ActivityFile, ...]]:
+    """Index candidate identities once without opening activity files."""
+    indexed: dict[
+        tuple[str, str], dict[tuple[str, str], models_module.ActivityFile]
+    ] = {}
+    for item in items:
+        key = metadata_module.target_key(item)
+        for identity in _activity_file_identities(item):
+            indexed.setdefault((item.source, identity), {}).setdefault(key, item)
+    return {
+        identity: tuple(candidates.values())
+        for identity, candidates in indexed.items()
+    }
+
+
+def _metadata_identities(
+    value: models_module.SessionMetadata,
+) -> frozenset[str]:
+    return frozenset(
+        identity
+        for identity in (
+            value.session_id,
+            *(child.session_id for child in value.children),
+        )
+        if identity != models_module.UNKNOWN
+    )
+
+
+def _missing_parent_identities(
+    metadata: dict[tuple[str, str], models_module.SessionMetadata],
+) -> list[tuple[str, str]]:
+    available = {
+        (key[0], value.lineage_namespace, identity)
+        for key, value in metadata.items()
+        for identity in _metadata_identities(value)
+    }
+    missing: list[tuple[str, str]] = []
+    seen = set()
+    for key, value in metadata.items():
+        parent_id = value.parent_session_id
+        reference = (key[0], parent_id)
+        if (
+            parent_id == models_module.UNKNOWN
+            or (key[0], value.lineage_namespace, parent_id) in available
+            or reference in seen
+        ):
+            continue
+        seen.add(reference)
+        missing.append(reference)
+    return missing
+
+
+def load_display_ancestor_metadata(
+    metadata: dict[tuple[str, str], models_module.SessionMetadata],
+    candidates: dict[
+        tuple[str, str], tuple[models_module.ActivityFile, ...]
+    ],
+    task_label: str,
+) -> tuple[
+    dict[tuple[str, str], models_module.SessionMetadata],
+    tuple[models_module.ActivityFile, ...],
+]:
+    """Load only filename-resolved ancestors, bounded independently of history."""
+    combined = dict(metadata)
+    display_items: list[models_module.ActivityFile] = []
+    attempted: set[tuple[str, str]] = set()
+    metadata_loads = 0
+    while metadata_loads < models_module.MAX_SYNTHESIZED_ANCESTORS:
+        selected: list[models_module.ActivityFile] = []
+        requested: dict[tuple[str, str], str] = {}
+        remaining = models_module.MAX_SYNTHESIZED_ANCESTORS - metadata_loads
+        for reference in _missing_parent_identities(combined):
+            if reference in attempted:
+                continue
+            attempted.add(reference)
+            matches = candidates.get(reference, ())
+            if len(matches) != 1:
+                continue
+            item = matches[0]
+            key = metadata_module.target_key(item)
+            if key in combined or key in requested:
+                continue
+            selected.append(item)
+            requested[key] = reference[1]
+            if len(selected) >= remaining:
+                break
+        if not selected:
+            break
+
+        metadata_loads += len(selected)
+        loaded = metadata_module.load_dashboard_metadata(selected, task_label)
+        accepted = {
+            key: value
+            for key, value in loaded.items()
+            if key in requested and requested[key] in _metadata_identities(value)
+        }
+        for item in selected:
+            key = metadata_module.target_key(item)
+            if key in accepted:
+                combined[key] = accepted[key]
+                display_items.append(item)
+    return combined, tuple(display_items)
 
 def resolve_display(requested: str, stdin=None, stdout=None) -> str:
     if requested != "auto":
@@ -41,28 +170,49 @@ def make_dashboard_snapshot(
     next_poll_seconds: float,
     metadata: dict[tuple[str, str], models_module.SessionMetadata],
     admission_notice: str = "",
+    ancestor_candidates: dict[
+        tuple[str, str], tuple[models_module.ActivityFile, ...]
+    ] | None = None,
 ) -> models_module.DashboardSnapshot:
+    metadata, display_items = load_display_ancestor_metadata(
+        metadata, ancestor_candidates or {}, cfg.task_label
+    )
     timestamps = {metadata_module.target_key(item): timestamp for item, timestamp in activity}
-    rows = []
-    for item in watch_set:
+    watched_keys = {metadata_module.target_key(item) for item in watch_set}
+
+    def make_row(
+        item: models_module.ActivityFile, *, display_only: bool = False
+    ) -> models_module.SessionRow:
         key = metadata_module.target_key(item)
         meta = metadata.get(key, models_module.SessionMetadata())
-        timestamp = timestamps.get(key)
+        timestamp = None if display_only else timestamps.get(key)
         age = activity_module._activity_age(now, timestamp) if timestamp else None
         remaining = max(0.0, cfg.idle_seconds - age) if age is not None else 0.0
-        rows.append(models_module.SessionRow(
+        return models_module.SessionRow(
             key, item.source, meta.client, meta.task, meta.model, meta.effort,
             meta.started, timestamp, remaining, str(item.path), len(item.identities),
-            meta.provenance, age is not None and age < cfg.idle_seconds, meta.agent,
+            meta.provenance,
+            not display_only and age is not None and age < cfg.idle_seconds,
+            meta.agent,
             meta.details, meta.session_id, meta.parent_session_id,
             meta.lineage_namespace, meta.children,
+            display_only=display_only,
+            lineage_context_only=display_only,
             external_parent_key=meta.external_parent_key,
-        ))
+        )
+
+    rows = [make_row(item) for item in watch_set]
+    display_rows = tuple(
+        make_row(item, display_only=True)
+        for item in display_items
+        if metadata_module.target_key(item) not in watched_keys
+        and metadata_module.target_key(item) in metadata
+    )
     holding = sum(row.holding for row in rows)
     return models_module.DashboardSnapshot(
         now, tuple(rows), len(watch_set), holding, holding == 0, user_idle,
         cfg.user_idle_seconds, next_poll_seconds, cfg.source,
-        cfg.session_discovery, cfg.idle_seconds, admission_notice,
+        cfg.session_discovery, cfg.idle_seconds, admission_notice, display_rows,
     )
 
 
@@ -90,44 +240,91 @@ def _dashboard_parent_keys(
     return parents
 
 
-def _dashboard_sort_key(row: models_module.SessionRow, sort: str):
+def _dashboard_sort_key(
+    row: models_module.SessionRow,
+    sort: str,
+    subtree_last_event: datetime | None = None,
+):
     if sort == "title":
         return (row.task.casefold(), row.source, row.path)
     if sort == "source":
         return (row.source, row.task.casefold(), row.path)
+    last_event = (
+        subtree_last_event
+        if row.lineage_context_only and subtree_last_event is not None
+        else row.last_event
+    )
     return (
-        row.last_event is None,
-        -(row.last_event.timestamp() if row.last_event else 0),
+        last_event is None,
+        -(last_event.timestamp() if last_event else 0),
         row.path,
     )
 
 
-def _expanded_dashboard_rows(rows: Iterable[models_module.SessionRow]) -> list[models_module.SessionRow]:
+def _expanded_dashboard_rows(
+    rows: Iterable[models_module.SessionRow],
+    display_rows: Iterable[models_module.SessionRow] = (),
+) -> list[models_module.SessionRow]:
     """Expand grouped metadata into descriptive rows without adding activity guards."""
-    expanded = []
-    for row in rows:
-        if not row.children:
-            expanded.append(row)
-            continue
-        namespace = row.lineage_namespace if row.lineage_namespace != models_module.UNKNOWN else row.path
-        group_id = f"watchdog-group:{row.path}"
-        expanded.append(replace(row, session_id=group_id, lineage_namespace=namespace))
-        child_ids = {child.session_id for child in row.children}
-        for child in row.children:
-            parent_id = (
-                child.parent_session_id
-                if child.parent_session_id in child_ids else group_id
-            )
-            expanded.append(models_module.SessionRow(
-                key=(row.source, f"{row.path}#session={child.session_id}"),
-                source=row.source, client=row.client, task=child.task,
-                model=child.model, effort=child.effort, started=child.started,
-                last_event=None, quiet_remaining=0.0, path=row.path,
-                identity_count=0, provenance=row.provenance, holding=False,
-                agent=child.agent, session_id=child.session_id,
-                parent_session_id=parent_id, lineage_namespace=namespace,
-                display_only=True,
-            ))
+    def expand(values: Iterable[models_module.SessionRow]) -> list[models_module.SessionRow]:
+        result = []
+        for row in values:
+            if not row.children:
+                result.append(row)
+                continue
+            namespace = row.lineage_namespace if row.lineage_namespace != models_module.UNKNOWN else row.path
+            group_id = f"watchdog-group:{row.path}"
+            result.append(replace(row, session_id=group_id, lineage_namespace=namespace))
+            child_ids = {child.session_id for child in row.children}
+            for child in row.children:
+                parent_id = (
+                    child.parent_session_id
+                    if child.parent_session_id in child_ids else group_id
+                )
+                result.append(models_module.SessionRow(
+                    key=(row.source, f"{row.path}#session={child.session_id}"),
+                    source=row.source, client=row.client, task=child.task,
+                    model=child.model, effort=child.effort, started=child.started,
+                    last_event=None, quiet_remaining=0.0, path=row.path,
+                    identity_count=0, provenance=row.provenance, holding=False,
+                    agent=child.agent, session_id=child.session_id,
+                    parent_session_id=parent_id, lineage_namespace=namespace,
+                    display_only=True,
+                ))
+        return result
+
+    expanded = expand(rows)
+    return _dashboard_rows_with_ancestors(expanded, expand(display_rows))
+
+
+def _dashboard_rows_with_ancestors(
+    rows: Iterable[models_module.SessionRow],
+    display_rows: Iterable[models_module.SessionRow],
+) -> list[models_module.SessionRow]:
+    """Add only known display rows required to connect the selected rows."""
+    expanded = list(rows)
+    expanded_keys = {row.key for row in expanded}
+    available_by_key = {}
+    for row in display_rows:
+        if row.key not in expanded_keys and row.key not in available_by_key:
+            available_by_key[row.key] = row
+    parents = _dashboard_parent_keys(
+        (*expanded, *available_by_key.values())
+    )
+    ancestor_keys = set()
+    for row in expanded:
+        current = row.key
+        visited = set()
+        while current in parents and current not in visited:
+            visited.add(current)
+            current = parents[current]
+            if current not in expanded_keys:
+                ancestor_keys.add(current)
+    expanded.extend(
+        replace(row, lineage_context_only=True)
+        for key, row in available_by_key.items()
+        if key in ancestor_keys
+    )
     return expanded
 
 
@@ -163,14 +360,39 @@ def dashboard_tree_prefixes(
     return prefixes
 
 
-def visible_dashboard_rows(rows: Iterable[models_module.SessionRow], state: models_module.DashboardState) -> list[models_module.SessionRow]:
+def visible_dashboard_rows(
+    rows: Iterable[models_module.SessionRow],
+    state: models_module.DashboardState,
+    display_rows: Iterable[models_module.SessionRow] = (),
+) -> list[models_module.SessionRow]:
     query = state.query.casefold()
     visible = [row for row in _expanded_dashboard_rows(rows) if (
         state.source_filter is None or row.source == state.source_filter
     ) and (
         not query or query in " ".join((row.source, row.client, row.task, row.model, row.effort)).casefold()
     )]
-    visible.sort(key=lambda row: _dashboard_sort_key(row, state.sort))
+    if state.tree:
+        visible = _dashboard_rows_with_ancestors(
+            visible, _expanded_dashboard_rows(display_rows)
+        )
+    parents = _dashboard_parent_keys(visible)
+    subtree_last_events: dict[tuple[str, str], datetime] = {}
+    for row in visible:
+        if row.last_event is None:
+            continue
+        current = row.key
+        while True:
+            previous = subtree_last_events.get(current)
+            if previous is None or row.last_event > previous:
+                subtree_last_events[current] = row.last_event
+            if current not in parents:
+                break
+            current = parents[current]
+    visible.sort(
+        key=lambda row: _dashboard_sort_key(
+            row, state.sort, subtree_last_events.get(row.key)
+        )
+    )
     if not state.tree:
         return visible
 
@@ -320,13 +542,22 @@ class TerminalDashboard:
         except Exception:
             pass
 
+    def _visible_rows(self) -> list[models_module.SessionRow]:
+        if self.snapshot is None:
+            return []
+        return visible_dashboard_rows(
+            self.snapshot.rows,
+            self.state,
+            display_rows=self.snapshot.display_rows,
+        )
+
     def update(self, snapshot: models_module.DashboardSnapshot) -> None:
         self.snapshot = snapshot
         # Assign before filtering so hiding a row cannot change another label's color.
         for row in snapshot.rows:
             self._label_attr("client", row.client)
             self._label_attr("model", row.model)
-        rows = visible_dashboard_rows(snapshot.rows, self.state)
+        rows = self._visible_rows()
         tree_prefixes = dashboard_tree_prefixes(rows) if self.state.tree else {}
         retain_dashboard_selection(self.state, rows)
         height, width = self.screen.getmaxyx()
@@ -397,7 +628,9 @@ class TerminalDashboard:
                 if current_age is not None else 0.0
             )
             quiet = text_module._duration(displayed_remaining) if row.holding else "quiet"
-            if row.display_only:
+            if row.lineage_context_only:
+                last, quiet = "n/a", "unwatched"
+            elif row.display_only:
                 last = quiet = "group"
             model = row.model if row.effort == models_module.UNKNOWN else f"{row.model} / {row.effort}"
             task_text = tree_prefixes.get(row.key, "") + text_module.sanitize_terminal_text(row.task)
@@ -442,7 +675,12 @@ class TerminalDashboard:
             self._put(footer_y - 2 - len(detail_lines), f"selected: started {started} · event {event} · {row.client}{agent} · {row.model} / {row.effort}")
             parent = f" · parent {row.parent_session_id}" if row.parent_session_id != models_module.UNKNOWN else ""
             identity = f" · session {row.session_id}" if row.session_id != models_module.UNKNOWN else ""
-            scope = " · timing belongs to database guard" if row.display_only else ""
+            if row.lineage_context_only:
+                scope = " · lineage context only · not a watch target"
+            elif row.display_only:
+                scope = " · timing belongs to database guard"
+            else:
+                scope = ""
             self._put(footer_y - 1 - len(detail_lines), f"metadata {row.provenance}{identity}{parent}{scope} · path {row.path}")
             for index, detail in enumerate(detail_lines):
                 self._put(footer_y - len(detail_lines) + index, detail)
@@ -475,7 +713,7 @@ class TerminalDashboard:
                 key = -1
             else:
                 raise
-        rows = visible_dashboard_rows(self.snapshot.rows, self.state) if self.snapshot else []
+        rows = self._visible_rows()
         handle_dashboard_key(self.state, key, len(rows))
         if self.snapshot is not None and key != -1:
             self.update(self.snapshot)
