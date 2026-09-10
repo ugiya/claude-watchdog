@@ -148,9 +148,13 @@ def _process_table(
         started = _parse_ps_clock(parts[2], local_timezone)
         if started is None:
             continue
+        try:
+            started_utc = started.astimezone(timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            continue
         if pid in table:
             return {}
-        table[pid] = (ppid, started.astimezone(timezone.utc))
+        table[pid] = (ppid, started_utc)
     return table
 
 

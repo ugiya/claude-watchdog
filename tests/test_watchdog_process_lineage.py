@@ -264,6 +264,23 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
 
         self.assertEqual(links, ())
 
+    def test_extreme_process_clock_with_explicit_timezone_yields_no_edge(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry, _, _ = _write_provider_evidence(root)
+            links = _discover_registry(
+                registry,
+                runner=lambda *args, **kwargs: _completed(
+                    _ps_output(
+                        (33394, 33393, "Mon Jan  1 00:00:00 0001"),
+                        (33393, 1, "Sat Aug  1 17:17:22 2026"),
+                    )
+                ),
+                local_timezone=timezone(timedelta(hours=5)),
+            )
+
+        self.assertEqual(links, ())
+
     def test_process_clock_timezone_conversion_failures_are_refused(self) -> None:
         for error in (OverflowError("synthetic overflow"), OSError("synthetic zone")):
             with self.subTest(error=type(error).__name__):
