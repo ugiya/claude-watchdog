@@ -258,6 +258,14 @@ sessions recorded by OMX's tracking machinery receive this fallback, and a
 session identified by exact OMX launch evidence as the project's launch root is
 excluded even if the tracking file labels it as a subagent.
 
+When OMX launches a Claude session without persisting a native parent ID, the
+dashboard can also confirm a shallower Claude-to-Codex edge from Claude's exact
+live process registry record, the project's OMX `session.json`, and matching
+process ancestry. The process table verifies those provider-written identities;
+it never invents an identity or uses cwd/time proximity alone. Confirmation is
+bounded, failure-safe, retained for the rest of the run, and display-only: it
+does not add watch targets, extend the `caffeinate` hold, or affect sleep.
+
 Shell-launched cross-provider children do not necessarily record a native
 parent. An optional `~/.config/claude-watchdog/lineage.json` can declare an
 exact relationship for Claude and Codex sessions:
@@ -279,7 +287,8 @@ The registry affects presentation only. Entries must resolve unambiguously
 among metadata-known candidates, and only ancestry required by a watched row is
 rendered; conflicts, ambiguity, unsupported sources, and malformed files are
 ignored. The file is limited to 256 KiB and 256 links. Lineage precedence is
-rollout-embedded parentage, then OMX tracking, then the external registry.
+rollout-embedded parentage, then OMX tracking, then the external registry, then
+process-confirmed lineage.
 
 ## Logs and privacy
 
