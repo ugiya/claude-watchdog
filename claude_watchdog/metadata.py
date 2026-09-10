@@ -10,12 +10,13 @@ import stat
 import time
 from collections.abc import Iterable
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 from . import activity as activity_module
 from . import config as config_module
 from . import models as models_module
+from . import process_lineage as process_lineage_module
 from . import text as text_module
 
 def target_key(item: models_module.ActivityFile) -> tuple[str, str]:
@@ -108,12 +109,11 @@ def _has_omx_launch(session_id: object, cwd: object, started: object) -> bool:
         return (isinstance(value, dict) and value.get("native_session_id") == session_id
                 and isinstance(value.get("session_id"), str) and value["session_id"].startswith("omx-"))
 
-    try:
-        with (root / "state/session.json").open("rb") as handle:
-            if matches(json.loads(handle.read(models_module.READ_CHUNK_BYTES))):
-                return True
-    except (OSError, ValueError, RecursionError):
-        pass
+    session = process_lineage_module.read_bounded_json_object(
+        root / "state/session.json", models_module.MAX_OMX_SESSION_BYTES
+    )
+    if matches(session):
+        return True
     timestamp = activity_module._parse_ts(started) if isinstance(started, str) else None
     if timestamp is None:
         return False
@@ -684,23 +684,28 @@ def apply_omx_tracking_lineage(
 def apply_external_lineage_registry(
     metadata: dict[tuple[str, str], models_module.SessionMetadata],
     registry_path: Path | None = None,
+    *,
+    injected_links: list[process_lineage_module.ExternalLineageLink] | None = None,
 ) -> dict[tuple[str, str], models_module.SessionMetadata]:
     """Apply exact, bounded external parent declarations to loaded metadata."""
     result = dict(metadata)
-    path = registry_path or external_lineage_registry_path()
-    try:
-        if not stat.S_ISREG(path.stat().st_mode):
+    if injected_links is None:
+        path = registry_path or external_lineage_registry_path()
+        try:
+            if not stat.S_ISREG(path.stat().st_mode):
+                return result
+            with path.open("rb") as handle:
+                raw = handle.read(models_module.MAX_EXTERNAL_LINEAGE_BYTES + 1)
+            if len(raw) > models_module.MAX_EXTERNAL_LINEAGE_BYTES:
+                return result
+            document = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeError, ValueError, RecursionError):
             return result
-        with path.open("rb") as handle:
-            raw = handle.read(models_module.MAX_EXTERNAL_LINEAGE_BYTES + 1)
-        if len(raw) > models_module.MAX_EXTERNAL_LINEAGE_BYTES:
+        if not isinstance(document, dict) or document.get("version") != 1:
             return result
-        document = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeError, ValueError, RecursionError):
-        return result
-    if not isinstance(document, dict) or document.get("version") != 1:
-        return result
-    links = document.get("links")
+        links = document.get("links")
+    else:
+        links = injected_links
     if not isinstance(links, list) or len(links) > models_module.MAX_EXTERNAL_LINEAGE_LINKS:
         return result
 
@@ -745,6 +750,7 @@ def apply_external_lineage_registry(
         if (
             child_key == parent_key
             or child_metadata.parent_session_id != models_module.UNKNOWN
+            or child_metadata.external_parent_key is not None
         ):
             continue
         evidence = text_module.sanitize_terminal_text(declared[0][1])
@@ -762,7 +768,13 @@ def apply_external_lineage_registry(
 
 
 def load_dashboard_metadata(
-    watch_set: Iterable[models_module.ActivityFile], task_label: str = "prompt"
+    watch_set: Iterable[models_module.ActivityFile],
+    task_label: str = "prompt",
+    injected_links: list[process_lineage_module.ExternalLineageLink] | None = None,
+    *,
+    process_runner: process_lineage_module.Runner | None = None,
+    process_observed_at: datetime | None = None,
+    process_local_timezone: tzinfo | None = None,
 ) -> dict[tuple[str, str], models_module.SessionMetadata]:
     items = list(watch_set)
     codex_items = [item for item in items if item.source == "codex"]
@@ -789,6 +801,41 @@ def load_dashboard_metadata(
         except Exception:
             values[target_key(item)] = models_module.SessionMetadata()
     fixed_lineage = apply_external_lineage_registry(values)
-    return apply_external_lineage_registry(
+    result = apply_external_lineage_registry(
         apply_omx_tracking_lineage(values, fixed_lineage=fixed_lineage)
     )
+    if injected_links is None:
+        return result
+
+    result = apply_external_lineage_registry(
+        result, injected_links=injected_links
+    )
+    probe_arguments = {
+        "observed_at": process_observed_at,
+        "local_timezone": process_local_timezone,
+    }
+    if process_runner is not None:
+        probe_arguments["runner"] = process_runner
+    discovered = process_lineage_module.discover_process_lineage(
+        result,
+        config_module.claude_sessions_dir(),
+        **probe_arguments,
+    )
+    retained_children = {
+        (link.get("child") or {}).get("session_id")
+        for link in injected_links
+        if isinstance(link, dict) and isinstance(link.get("child"), dict)
+    }
+    new_links = []
+    for link in discovered:
+        child = link.get("child")
+        child_id = child.get("session_id") if isinstance(child, dict) else None
+        if (
+            child_id not in retained_children
+            and len(injected_links)
+            < models_module.MAX_RETAINED_PROCESS_LINEAGE_LINKS
+        ):
+            injected_links.append(link)
+            new_links.append(link)
+            retained_children.add(child_id)
+    return apply_external_lineage_registry(result, injected_links=new_links)

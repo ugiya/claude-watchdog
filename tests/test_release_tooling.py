@@ -30,8 +30,8 @@ release = _load("watchdog_release", ROOT / "scripts" / "build_release.py")
 
 RUNTIME_FILES = (
     "__init__.py", "__main__.py", "models.py", "text.py", "presentation.py",
-    "config.py", "activity.py", "metadata.py", "dashboard.py", "reporting.py",
-    "power.py", "app.py",
+    "config.py", "activity.py", "process_lineage.py", "metadata.py", "dashboard.py",
+    "reporting.py", "power.py", "app.py",
 )
 
 

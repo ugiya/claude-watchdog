@@ -7,13 +7,14 @@ not infer support from a product name or a similar directory layout.
 ## Release evidence
 
 The provider versions used during the development of `v0.1.0` were not recorded
-in a public, reproducible compatibility matrix. The honest version value for
-each provider is therefore **unknown**. The repository contains synthetic
-regression fixtures for the observed formats described below.
+in a public, reproducible compatibility matrix. Those version values remain
+**unknown** unless later compatibility work recorded an exact version. The
+repository contains synthetic regression fixtures for the observed formats
+described below.
 
-| Source | Provider version exercised | Evidence in `v0.1.0` | Confidence |
+| Source | Provider version exercised | Current evidence | Confidence |
 | --- | --- | --- | --- |
-| Claude Code and configured profiles | Unknown | Synthetic JSONL parsing, profile scoping, native child discovery, prompt/title metadata, and tree tests | Experimental |
+| Claude Code and configured profiles | 2.1.266–2.1.267 (observed) | Synthetic JSONL parsing, profile scoping, native child discovery, prompt/title metadata, session-registry process identity, and tree tests | Experimental |
 | Codex CLI/App | Unknown | Synthetic rollout JSONL, optional state database metadata, inherited-identity, and tree tests | Experimental |
 | OMX | 0.21.3 | Synthetic shared-log identity admission, timestamp attribution, and Codex subagent-tracking lineage tests | Experimental |
 | OpenCode | Unknown | Synthetic SQLite root/descendant, activity, current-model, and tree tests | Experimental |
@@ -86,6 +87,31 @@ The parser recognizes top-level JSONL fields including:
 Native child ancestry comes from the directory structure. A session-registry
 lookup may supply an exact name when an explicit title is absent.
 
+Claude Code 2.1.266 and 2.1.267 were observed across long-lived registry
+records and a live `claude -p` child during compatibility verification. Each
+process had a live-process registry record at:
+
+```text
+~/.claude/sessions/<pid>.json
+```
+
+Each observed `<pid>.json` record had a `<pid>.<hash>.key` sibling. The 512-entry
+enumeration bound counts both file types before filtering for JSON, so this
+layout makes the effective bound approximately 256 live sessions. Synthetic
+fixtures preserve the paired-file layout.
+
+Process-confirmed OMX lineage recognizes a record only when `pid` is an
+integer, `sessionId` exactly matches a loaded Claude row, `cwd` is absolute,
+and `procStart` parses in `ps lstart` format. `procStart` is UTC even though
+`/bin/ps` renders `lstart` in local time. The watchdog forces the command's
+locale to `LC_ALL=C` while preserving the rest of its environment so the
+English weekday/month format is stable; both clock values are parsed with
+their explicit zones and compared to the second. The observed `entrypoint` for
+`claude -p` was `sdk-cli`, and its observed `kind` was `interactive`, but
+neither field is used to admit or reject lineage. Registry enumeration stops
+after 512 directory entries and reads at most 2 MiB across candidate files,
+with no recursive search.
+
 ### Codex CLI and App
 
 Discovery recursively scans `$CODEX_HOME/sessions`, or `~/.codex/sessions`, for
@@ -145,7 +171,7 @@ use its own tracking fallback. After all visible rollouts are loaded, tracking
 parents that participate in a cycle are discarded while embedded parents remain
 intact. Leaders are never made their own parent. Conflicting parent declarations
 yield no lineage. Lineage precedence is rollout-embedded parentage, then OMX
-tracking, then the external registry.
+tracking, then the external registry, then process-confirmed lineage.
 
 The file read is limited to 256 KiB, with one extra byte read to detect and
 reject oversized documents. Documents with more than 256 session entries or a
@@ -156,6 +182,51 @@ nested data yields no lineage and does not affect activity or sleep decisions.
 This fallback restores lineage only for sessions recorded by OMX's subagent
 tracking machinery. Sessions launched outside that machinery do not receive
 this fallback.
+
+For a loaded Claude row whose exact live registry record names an absolute
+`cwd`, display lineage may additionally consult:
+
+```text
+<cwd>/.omx/state/session.json
+```
+
+The bounded record must contain an integer `pid`, a non-empty string
+`native_session_id`, and a parseable, timezone-aware `started_at`. The OMX
+version that wrote the observed `session.json` record was not captured. The
+file is rejected if it exceeds 64 KiB. The watchdog then runs one
+`/bin/ps -axo pid=,ppid=,lstart=` command per dashboard poll, with no shell, a
+one-second timeout, and `LC_ALL=C` in the otherwise inherited environment, and
+confirms all of the following before emitting a Claude-to-Codex display edge:
+
+- the registry PID's `ps` start matches UTC `procStart` exactly to the second;
+- the OMX PID's local `ps` start is within 120 seconds of UTC `started_at`;
+- the OMX PID occurs within the bounded parent chain of the Claude PID.
+
+The observed `ps` rows left-pad PID fields, use two spaces before single-digit
+days, and include trailing whitespace after the year. The macOS version that
+produced this output was not captured and is therefore **unknown**. Surrounding
+clock whitespace is ignored, malformed rows are skipped without discarding
+valid rows, and each poll examines at most 65,536 rows. Duplicate PID rows still
+invalidate the process table.
+
+Process ancestry is only a yes/no verifier for the two provider-written files;
+it never supplies either session identity. The parent identity is the same
+record's `native_session_id`, so the rendered edge may be shallower than the
+actual OMX leader relationship, but it is not guessed. A confirmed link is
+retained additively for the rest of the watchdog run and records the PIDs and
+observation time in row details. Retention keeps the first 256 uniquely
+confirmed child links, including links whose parent row is not loaded and
+therefore cannot currently render; those unrendered links still consume a
+retention slot. Once full, existing retained edges continue to render while
+later new confirmations are not retained or rendered by this fallback.
+Missing, ambiguous, oversized, malformed, stale, recycled, over-depth, or
+unavailable evidence yields no edge. A parent row must also be loaded and
+resolve unambiguously. This metadata remains display-only and cannot change
+activity, holding, quietness, or sleep decisions.
+
+This fallback can confirm only a Claude child observed while it is alive. A
+child that exited before the watchdog saw its process registry record is not
+recoverable from the local provider data currently available.
 
 ### OpenCode
 

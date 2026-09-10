@@ -9,6 +9,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- Restore a display-only Claude child edge when OMX did not persist one by
+  confirming Claude and OMX provider records against bounded live process
+  ancestry, then retaining the confirmed relationship for the watchdog run.
 - Keep dashboard trees connected through metadata-known quiet ancestors by
   rendering them as selectable, explicitly unwatched display-only rows. Recent
   sorting ranks those trees by their newest member without changing watch,

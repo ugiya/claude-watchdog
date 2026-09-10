@@ -26,6 +26,7 @@ MODULES = {
     "models",
     "power",
     "presentation",
+    "process_lineage",
     "reporting",
     "text",
 }
@@ -95,10 +96,11 @@ class ModuleBoundaryTests(unittest.TestCase):
             for module in MODULES
         }
         forbidden = {
-            "activity": {"dashboard", "metadata", "reporting"},
-            "config": {"dashboard", "metadata", "reporting"},
+            "activity": {"dashboard", "metadata", "process_lineage", "reporting"},
+            "app": {"process_lineage"},
+            "config": {"dashboard", "metadata", "process_lineage", "reporting"},
             "metadata": {"dashboard", "reporting"},
-            "power": {"dashboard", "metadata", "reporting"},
+            "power": {"dashboard", "metadata", "process_lineage", "reporting"},
             "reporting": {"dashboard"},
         }
         for module, denied in forbidden.items():
@@ -120,6 +122,15 @@ class ModuleBoundaryTests(unittest.TestCase):
 
         for module in graph:
             visit(module)
+
+        self.assertEqual(
+            {
+                module
+                for module, dependencies in graph.items()
+                if "process_lineage" in dependencies
+            },
+            {"metadata"},
+        )
 
     def test_palette_is_shared_below_dashboard_and_reporting(self) -> None:
         presentation = (PACKAGE / "presentation.py").read_text(encoding="utf-8")
@@ -157,6 +168,7 @@ import claude_watchdog.metadata
 import claude_watchdog.models
 import claude_watchdog.power
 import claude_watchdog.presentation
+import claude_watchdog.process_lineage
 import claude_watchdog.reporting
 import claude_watchdog.text
 """
