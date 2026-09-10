@@ -534,17 +534,16 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             mock.patch.object(
                 wd_metadata.process_lineage_module,
                 "discover_process_lineage",
-                side_effect=[(link,) for link in links],
+                side_effect=[(link,) for link in (*links, links[-1])],
             ),
             mock.patch.object(wd_models, "MAX_EXTERNAL_LINEAGE_LINKS", 2),
             mock.patch.object(wd_models, "MAX_RETAINED_PROCESS_LINEAGE_LINKS", 2),
         ):
-            for _ in links:
+            for _ in range(4):
                 result = wd_metadata.load_dashboard_metadata(
                     [*children, *parents], injected_links=retained
                 )
 
-        self.assertEqual(retained, links[:2])
         for index in range(2):
             self.assertEqual(
                 result[wd_metadata.target_key(children[index])].external_parent_key,
@@ -553,6 +552,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         self.assertIsNone(
             result[wd_metadata.target_key(children[2])].external_parent_key
         )
+        self.assertEqual(retained, links[:2])
 
     def test_interactive_claude_in_omx_cwd_is_refused_when_omx_pid_is_not_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
