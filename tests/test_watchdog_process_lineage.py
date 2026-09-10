@@ -9,6 +9,7 @@ import pickle
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -961,6 +962,17 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         self.assertIsNone(baseline.rows[0].external_parent_key)
         self.assertIsNotNone(linked.rows[0].external_parent_key)
         self.assertNotEqual(baseline.rows[0].details, linked.rows[0].details)
+        self.assertEqual(
+            tuple(
+                replace(
+                    linked_row,
+                    external_parent_key=baseline_row.external_parent_key,
+                    details=baseline_row.details,
+                )
+                for baseline_row, linked_row in zip(baseline.rows, linked.rows)
+            ),
+            baseline.rows,
+        )
 
     def test_registry_file_precedes_retained_process_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
