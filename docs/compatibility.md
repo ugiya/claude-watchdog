@@ -194,6 +194,13 @@ Claude-to-Codex display edge:
 - the OMX PID's local `ps` start is within 120 seconds of UTC `started_at`;
 - the OMX PID occurs within the bounded parent chain of the Claude PID.
 
+The observed `ps` rows left-pad PID fields, use two spaces before single-digit
+days, and include trailing whitespace after the year. The macOS version that
+produced this output was not captured and is therefore **unknown**. Surrounding
+clock whitespace is ignored, malformed rows are skipped without discarding
+valid rows, and each poll examines at most 65,536 rows. Duplicate PID rows still
+invalidate the process table.
+
 Process ancestry is only a yes/no verifier for the two provider-written files;
 it never supplies either session identity. The parent identity is the same
 record's `native_session_id`, so the rendered edge may be shallower than the

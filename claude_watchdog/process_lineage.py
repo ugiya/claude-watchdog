@@ -34,7 +34,7 @@ def _parse_ps_clock(value: object, zone: tzinfo | None) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        parsed = datetime.strptime(value, "%a %b %d %H:%M:%S %Y")
+        parsed = datetime.strptime(value.strip(), "%a %b %d %H:%M:%S %Y")
     except ValueError:
         return None
     return parsed.astimezone() if zone is None else parsed.replace(tzinfo=zone)
@@ -125,20 +125,29 @@ def _process_table(
             timeout=models_module.PROCESS_PROBE_TIMEOUT_SECONDS,
             check=False,
         )
-        if completed.returncode != 0:
-            return {}
-        table: dict[int, tuple[int, datetime]] = {}
-        lines = [line for line in completed.stdout.splitlines() if line.strip()]
-        for line in lines:
-            parts = line.split(maxsplit=2)
-            pid, ppid = int(parts[0]), int(parts[1])
-            started = _parse_ps_clock(parts[2], local_timezone)
-            if pid in table:
-                return {}
-            table[pid] = (ppid, started.astimezone(timezone.utc))
-        return table
     except Exception:
         return {}
+    if completed.returncode != 0 or not isinstance(completed.stdout, str):
+        return {}
+
+    table: dict[int, tuple[int, datetime]] = {}
+    for index, line in enumerate(completed.stdout.splitlines()):
+        if index >= models_module.MAX_PROCESS_TABLE_ROWS:
+            break
+        parts = line.split(maxsplit=2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        started = _parse_ps_clock(parts[2], local_timezone)
+        if started is None:
+            continue
+        if pid in table:
+            return {}
+        table[pid] = (ppid, started.astimezone(timezone.utc))
+    return table
 
 
 def _within_tolerance(

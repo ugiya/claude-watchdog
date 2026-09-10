@@ -23,6 +23,11 @@ from claude_watchdog import process_lineage as wd_process_lineage
 
 OBSERVED_AT = datetime(2026, 9, 10, 18, 0, tzinfo=timezone.utc)
 LOCAL_TIMEZONE = timezone(timedelta(hours=3))
+PS_OUTPUT = (
+    "    1     0 Sat Aug  1 19:40:07 2026    \n"
+    "  332     1 Sat Aug  1 19:41:35 2026    \n"
+    " 4242   332 Wed Sep  9 08:47:27 2026    \n"
+)
 
 
 def _metadata() -> dict[tuple[str, str], wd_models.SessionMetadata]:
@@ -39,6 +44,12 @@ def _metadata() -> dict[tuple[str, str], wd_models.SessionMetadata]:
 def _completed(stdout: str) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(
         ["/bin/ps", "-axo", "pid=,ppid=,lstart="], 0, stdout, ""
+    )
+
+
+def _ps_output(*rows: tuple[int, int, str]) -> str:
+    return "".join(
+        f"{pid:5d} {ppid:5d} {started}    \n" for pid, ppid, started in rows
     )
 
 
@@ -75,8 +86,10 @@ def _write_provider_evidence(root: Path) -> tuple[Path, Path, Path]:
 
 def _valid_runner(*args, **kwargs) -> subprocess.CompletedProcess[str]:
     return _completed(
-        "33394 33393 Thu Sep 10 20:05:34 2026\n"
-        "33393 1 Sat Aug  1 17:17:22 2026\n"
+        _ps_output(
+            (33394, 33393, "Thu Sep 10 20:05:34 2026"),
+            (33393, 1, "Sat Aug  1 17:17:22 2026"),
+        )
     )
 
 
@@ -134,6 +147,44 @@ def _write_transcripts(root: Path, project: Path):
 
 
 class ProcessConfirmedLineageTests(unittest.TestCase):
+    def test_process_table_parses_real_ps_whitespace_shape(self) -> None:
+        table = wd_process_lineage._process_table(
+            lambda *args, **kwargs: _completed(PS_OUTPUT), LOCAL_TIMEZONE
+        )
+
+        self.assertTrue(table)
+        self.assertEqual(
+            table[332],
+            (1, datetime(2026, 8, 1, 16, 41, 35, tzinfo=timezone.utc)),
+        )
+
+    def test_process_table_skips_bad_row_and_keeps_valid_rows(self) -> None:
+        stdout = (
+            "    1     0 Sat Aug  1 19:40:07 2026    \n"
+            "malformed provider row    \n"
+            "  332     1 Sat Aug  1 19:41:35 2026    \n"
+        )
+
+        table = wd_process_lineage._process_table(
+            lambda *args, **kwargs: _completed(stdout), LOCAL_TIMEZONE
+        )
+
+        self.assertEqual(
+            table,
+            {
+                1: (0, datetime(2026, 8, 1, 16, 40, 7, tzinfo=timezone.utc)),
+                332: (1, datetime(2026, 8, 1, 16, 41, 35, tzinfo=timezone.utc)),
+            },
+        )
+
+    def test_process_table_stops_at_row_bound(self) -> None:
+        with mock.patch.object(wd_models, "MAX_PROCESS_TABLE_ROWS", 2):
+            table = wd_process_lineage._process_table(
+                lambda *args, **kwargs: _completed(PS_OUTPUT), LOCAL_TIMEZONE
+            )
+
+        self.assertEqual(set(table), {1, 332})
+
     def test_confirms_exact_registry_and_omx_records_across_utc_and_local_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -143,8 +194,10 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             def runner(*args, **kwargs):
                 calls.append((args, kwargs))
                 return _completed(
-                    "33394 33393 Thu Sep 10 20:05:34 2026\n"
-                    "33393 1 Sat Aug  1 17:17:22 2026\n"
+                    _ps_output(
+                        (33394, 33393, "Thu Sep 10 20:05:34 2026"),
+                        (33393, 1, "Sat Aug  1 17:17:22 2026"),
+                    )
                 )
 
             links = wd_process_lineage.discover_process_lineage(
@@ -192,9 +245,11 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 nonlocal calls
                 calls += 1
                 return _completed(
-                    "33394 33393 Thu Sep 10 20:05:34 2026\n"
-                    "33395 33393 Thu Sep 10 20:05:34 2026\n"
-                    "33393 1 Sat Aug  1 17:17:22 2026\n"
+                    _ps_output(
+                        (33394, 33393, "Thu Sep 10 20:05:34 2026"),
+                        (33395, 33393, "Thu Sep 10 20:05:34 2026"),
+                        (33393, 1, "Sat Aug  1 17:17:22 2026"),
+                    )
                 )
 
             links = wd_process_lineage.discover_process_lineage(
@@ -321,9 +376,11 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             links = _discover(
                 Path(temporary),
-                "33394 30000 Thu Sep 10 20:05:34 2026\n"
-                "30000 1 Thu Sep 10 20:05:30 2026\n"
-                "33393 1 Sat Aug  1 17:17:22 2026\n",
+                _ps_output(
+                    (33394, 30000, "Thu Sep 10 20:05:34 2026"),
+                    (30000, 1, "Thu Sep 10 20:05:30 2026"),
+                    (33393, 1, "Sat Aug  1 17:17:22 2026"),
+                ),
             )
         self.assertEqual(links, ())
 
@@ -331,8 +388,10 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             links = _discover(
                 Path(temporary),
-                "33394 33393 Thu Sep 10 20:05:35 2026\n"
-                "33393 1 Sat Aug  1 17:17:22 2026\n",
+                _ps_output(
+                    (33394, 33393, "Thu Sep 10 20:05:35 2026"),
+                    (33393, 1, "Sat Aug  1 17:17:22 2026"),
+                ),
             )
         self.assertEqual(links, ())
 
@@ -340,8 +399,10 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             links = _discover(
                 Path(temporary),
-                "33394 33393 Thu Sep 10 20:05:34 2026\n"
-                "33393 1 Sat Aug  1 17:15:51 2026\n",
+                _ps_output(
+                    (33394, 33393, "Thu Sep 10 20:05:34 2026"),
+                    (33393, 1, "Sat Aug  1 17:15:51 2026"),
+                ),
             )
         self.assertEqual(links, ())
 
@@ -462,8 +523,10 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
 
             def runner(*args, **kwargs):
                 return _completed(
-                    "33394 1 Thu Sep 10 20:05:34 2026\n"
-                    "1 0 Sat Aug  1 17:17:22 2026\n"
+                    _ps_output(
+                        (33394, 1, "Thu Sep 10 20:05:34 2026"),
+                        (1, 0, "Sat Aug  1 17:17:22 2026"),
+                    )
                 )
 
             links = wd_process_lineage.discover_process_lineage(
@@ -490,14 +553,14 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
 
     def test_ancestry_chain_exceeding_hop_bound_is_refused(self) -> None:
         first_parent = 40000
-        rows = ["33394 40000 Thu Sep 10 20:05:34 2026"]
+        rows = [(33394, 40000, "Thu Sep 10 20:05:34 2026")]
         for offset in range(64):
             pid = first_parent + offset
             ppid = 33393 if offset == 63 else pid + 1
-            rows.append(f"{pid} {ppid} Thu Sep 10 20:05:30 2026")
-        rows.append("33393 1 Sat Aug  1 17:17:22 2026")
+            rows.append((pid, ppid, "Thu Sep 10 20:05:30 2026"))
+        rows.append((33393, 1, "Sat Aug  1 17:17:22 2026"))
         with tempfile.TemporaryDirectory() as temporary:
-            links = _discover(Path(temporary), "\n".join(rows) + "\n")
+            links = _discover(Path(temporary), _ps_output(*rows))
         self.assertEqual(links, ())
 
     def test_ambiguous_claude_registry_matches_are_refused(self) -> None:
@@ -558,8 +621,10 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
 
             def runner(*args, **kwargs):
                 return _completed(
-                    "1 33393 Thu Sep 10 20:05:34 2026\n"
-                    "33393 0 Sat Aug  1 17:17:22 2026\n"
+                    _ps_output(
+                        (1, 33393, "Thu Sep 10 20:05:34 2026"),
+                        (33393, 0, "Sat Aug  1 17:17:22 2026"),
+                    )
                 )
 
             links = wd_process_lineage.discover_process_lineage(
@@ -619,23 +684,27 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             links = _discover(
                 Path(temporary),
-                "33394 33393 Thu Sep 10 20:05:33 2026\n"
-                "33394 33393 Thu Sep 10 20:05:34 2026\n"
-                "33393 1 Sat Aug  1 17:17:22 2026\n",
+                _ps_output(
+                    (33394, 33393, "Thu Sep 10 20:05:33 2026"),
+                    (33394, 33393, "Thu Sep 10 20:05:34 2026"),
+                    (33393, 1, "Sat Aug  1 17:17:22 2026"),
+                ),
             )
         self.assertEqual(links, ())
 
     def test_missing_child_process_row_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             links = _discover(
-                Path(temporary), "33393 1 Sat Aug  1 17:17:22 2026\n"
+                Path(temporary),
+                _ps_output((33393, 1, "Sat Aug  1 17:17:22 2026")),
             )
         self.assertEqual(links, ())
 
     def test_missing_omx_process_row_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             links = _discover(
-                Path(temporary), "33394 33393 Thu Sep 10 20:05:34 2026\n"
+                Path(temporary),
+                _ps_output((33394, 33393, "Thu Sep 10 20:05:34 2026")),
             )
         self.assertEqual(links, ())
 
@@ -643,10 +712,12 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             links = _discover(
                 Path(temporary),
-                "33394 40000 Thu Sep 10 20:05:34 2026\n"
-                "40000 40001 Thu Sep 10 20:05:30 2026\n"
-                "40001 40000 Thu Sep 10 20:05:29 2026\n"
-                "33393 1 Sat Aug  1 17:17:22 2026\n",
+                _ps_output(
+                    (33394, 40000, "Thu Sep 10 20:05:34 2026"),
+                    (40000, 40001, "Thu Sep 10 20:05:30 2026"),
+                    (40001, 40000, "Thu Sep 10 20:05:29 2026"),
+                    (33393, 1, "Sat Aug  1 17:17:22 2026"),
+                ),
             )
         self.assertEqual(links, ())
 
@@ -887,7 +958,8 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                     "garbage": lambda *a, **k: _completed("not a process table\n"),
                     "empty": lambda *a, **k: _completed(""),
                     "malformed-row": lambda *a, **k: _completed(
-                        "33394 33393 Thu Sep 10 20:05:34 2026\nbroken\n"
+                        _ps_output((33394, 33393, "Thu Sep 10 20:05:34 2026"))
+                        + "broken\n"
                     ),
                 }
                 for name, runner in runners.items():
