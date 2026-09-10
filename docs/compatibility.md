@@ -14,7 +14,7 @@ described below.
 
 | Source | Provider version exercised | Current evidence | Confidence |
 | --- | --- | --- | --- |
-| Claude Code and configured profiles | 2.1.267 | Synthetic JSONL parsing, profile scoping, native child discovery, prompt/title metadata, session-registry process identity, and tree tests | Experimental |
+| Claude Code and configured profiles | 2.1.266–2.1.267 (observed) | Synthetic JSONL parsing, profile scoping, native child discovery, prompt/title metadata, session-registry process identity, and tree tests | Experimental |
 | Codex CLI/App | Unknown | Synthetic rollout JSONL, optional state database metadata, inherited-identity, and tree tests | Experimental |
 | OMX | 0.21.3 | Synthetic shared-log identity admission, timestamp attribution, and Codex subagent-tracking lineage tests | Experimental |
 | OpenCode | Unknown | Synthetic SQLite root/descendant, activity, current-model, and tree tests | Experimental |
@@ -87,12 +87,18 @@ The parser recognizes top-level JSONL fields including:
 Native child ancestry comes from the directory structure. A session-registry
 lookup may supply an exact name when an explicit title is absent.
 
-Claude Code 2.1.267 was also observed writing one live-process registry record
-per process at:
+Claude Code 2.1.266 and 2.1.267 were observed across long-lived registry
+records and a live `claude -p` child during compatibility verification. Each
+process had a live-process registry record at:
 
 ```text
 ~/.claude/sessions/<pid>.json
 ```
+
+Each observed `<pid>.json` record had a `<pid>.<hash>.key` sibling. The 512-entry
+enumeration bound counts both file types before filtering for JSON, so this
+layout makes the effective bound approximately 256 live sessions. Synthetic
+fixtures preserve the paired-file layout.
 
 Process-confirmed OMX lineage recognizes a record only when `pid` is an
 integer, `sessionId` exactly matches a loaded Claude row, `cwd` is absolute,
@@ -206,10 +212,13 @@ it never supplies either session identity. The parent identity is the same
 record's `native_session_id`, so the rendered edge may be shallower than the
 actual OMX leader relationship, but it is not guessed. A confirmed link is
 retained additively for the rest of the watchdog run and records the PIDs and
-observation time in row details. Missing, ambiguous, oversized, malformed,
-stale, recycled, over-depth, or unavailable evidence yields no edge. A parent
-row must also be loaded and resolve unambiguously. This metadata remains
-display-only and cannot change activity, holding, quietness, or sleep decisions.
+observation time in row details. Retention keeps the first 256 uniquely
+confirmed child links; once full, existing retained edges continue to render
+while later new confirmations are not retained or rendered by this fallback.
+Missing, ambiguous, oversized, malformed, stale, recycled, over-depth, or
+unavailable evidence yields no edge. A parent row must also be loaded and
+resolve unambiguously. This metadata remains display-only and cannot change
+activity, holding, quietness, or sleep decisions.
 
 This fallback can confirm only a Claude child observed while it is alive. A
 child that exited before the watchdog saw its process registry record is not
