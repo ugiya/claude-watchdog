@@ -41,6 +41,9 @@ MAX_PROFILES_BYTES = 64 * 1024
 MAX_CLAUDE_PROFILES = 32
 
 
+MAX_SYNTHESIZED_ANCESTORS = 32
+
+
 EXTERNAL_LINEAGE_SOURCES = ("claude", "codex")
 
 
@@ -203,6 +206,7 @@ class SessionRow:
     lineage_namespace: str = UNKNOWN
     children: tuple[SessionChildMetadata, ...] = ()
     display_only: bool = False
+    lineage_context_only: bool = False
     external_parent_key: tuple[str, str] | None = None
 
 
@@ -220,6 +224,7 @@ class DashboardSnapshot:
     discovery: str
     idle_seconds: float
     admission_notice: str = ""
+    display_rows: tuple[SessionRow, ...] = ()
 
 
 @dataclass

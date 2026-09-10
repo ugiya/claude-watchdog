@@ -677,6 +677,55 @@ class DashboardControllerTests(unittest.TestCase):
                 dashboard.process_input()
                 self.assertEqual(dashboard.state.selected, 0)
 
+    def test_process_input_reaches_last_rendered_row_with_synthesized_ancestor(self):
+        root_item = _item(
+            "rollout-2026-09-09T00-00-00-synthetic-root.jsonl"
+        )
+        child_item = _item(
+            "rollout-2026-09-09T00-00-00-synthetic-child.jsonl"
+        )
+        snapshot = _snapshot(
+            [root_item, child_item],
+            {
+                wd_metadata.target_key(root_item): _metadata(
+                    task="Root",
+                    session_id="synthetic-root",
+                    lineage_namespace="synthetic-lineage",
+                ),
+                wd_metadata.target_key(child_item): _metadata(
+                    task="Child",
+                    session_id="synthetic-child",
+                    parent_session_id="synthetic-leader",
+                    lineage_namespace="synthetic-lineage",
+                ),
+            },
+        )
+        ancestor = replace(
+            snapshot.rows[0],
+            key=("codex", "synthetic-leader.jsonl"),
+            task="Leader",
+            path="synthetic-leader.jsonl",
+            last_event=None,
+            quiet_remaining=0.0,
+            holding=False,
+            session_id="synthetic-leader",
+            parent_session_id="synthetic-root",
+            display_only=True,
+        )
+        snapshot = replace(snapshot, display_rows=(ancestor,))
+        screen = FakeScreen(keys=["j", "j", "j", "j"])
+        dashboard = wd_dashboard.TerminalDashboard(
+            screen, wd_models.Config(no_color=True), mock.Mock(A_REVERSE=1)
+        )
+        dashboard.state.sort = "title"
+
+        dashboard.update(snapshot)
+        for _ in range(4):
+            dashboard.process_input()
+
+        self.assertEqual(dashboard.state.selected, 2)
+        self.assertEqual(dashboard.state.selected_key, snapshot.rows[1].key)
+
     def test_claude_nested_subagent_is_admitted_with_quiet_parent(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1007,6 +1056,232 @@ class ExitReportTests(unittest.TestCase):
         self.assertIs(dashboard.history.snapshot, recorded)
         self.assertEqual(list(dashboard.history.events), events)
 
+    def test_dashboard_poll_builds_ancestor_index_once_across_multiple_scans(self):
+        cfg = wd_models.Config(
+            idle_minutes=30,
+            user_idle_minutes=0,
+            session_discovery="frozen",
+        )
+        watched = _item(
+            "rollout-2026-09-09T00-00-00-synthetic-watched.jsonl"
+        )
+        candidates = [
+            watched,
+            _item("rollout-2026-09-09T00-00-00-synthetic-quiet.jsonl"),
+        ]
+        dashboard = mock.Mock()
+        scans = 0
+
+        def last_activity(item, now):
+            nonlocal scans
+            scans += 1
+            return now if scans == 1 else None
+
+        with (
+            mock.patch.object(
+                wd_dashboard,
+                "index_display_ancestor_candidates",
+                return_value={},
+            ) as index_candidates,
+            mock.patch.object(
+                wd_activity,
+                "_last_activity_for",
+                side_effect=last_activity,
+            ),
+            mock.patch.object(
+                wd_metadata,
+                "load_dashboard_metadata",
+                return_value={},
+            ),
+        ):
+            wd_app.wait_until_quiet(
+                cfg, [watched], dashboard, display_items=candidates
+            )
+
+        self.assertEqual(scans, 2)
+        index_candidates.assert_called_once_with(candidates)
+        dashboard.wait.assert_called_once_with(cfg.poll_seconds)
+
+    def test_dashboard_poll_loads_only_the_missing_ancestor_without_changing_guards(self):
+        cfg = wd_models.Config(
+            idle_minutes=0,
+            user_idle_minutes=0,
+            session_discovery="frozen",
+        )
+        root = _item(
+            "rollout-2026-09-09T00-00-00-synthetic-root.jsonl"
+        )
+        leader = _item(
+            "rollout-2026-09-09T00-00-00-synthetic-leader.jsonl"
+        )
+        child = _item(
+            "rollout-2026-09-09T00-00-00-synthetic-child.jsonl"
+        )
+        unrelated = [
+            _item(
+                "rollout-2026-09-09T00-00-00-"
+                f"synthetic-unrelated-{index:04d}.jsonl"
+            )
+            for index in range(400)
+        ]
+        candidates = [*unrelated, root, leader, child]
+        watched = [root, child]
+        watched_metadata = {
+            wd_metadata.target_key(root): _metadata(
+                task="Root",
+                session_id="synthetic-root",
+                lineage_namespace="synthetic-lineage",
+            ),
+            wd_metadata.target_key(child): _metadata(
+                task="Child",
+                session_id="synthetic-child",
+                parent_session_id="synthetic-leader",
+                lineage_namespace="synthetic-lineage",
+            ),
+        }
+        leader_metadata = {
+            wd_metadata.target_key(leader): _metadata(
+                task="Leader",
+                session_id="synthetic-leader",
+                parent_session_id="synthetic-root",
+                lineage_namespace="synthetic-lineage",
+            )
+        }
+        dashboard = mock.Mock()
+
+        def metadata_for(items, task_label):
+            loaded = list(items)
+            if loaded == watched:
+                return watched_metadata
+            if loaded == [leader]:
+                return leader_metadata
+            self.fail(f"unexpected metadata load: {loaded!r}")
+
+        with (
+            mock.patch.object(wd_activity, "_last_activity_for", return_value=NOW),
+            mock.patch.object(
+                wd_metadata, "load_dashboard_metadata", side_effect=metadata_for
+            ) as load_metadata,
+        ):
+            wd_app.wait_until_quiet(
+                cfg, watched, dashboard, display_items=candidates
+            )
+
+        self.assertEqual(
+            load_metadata.call_args_list,
+            [
+                mock.call(watched, cfg.task_label),
+                mock.call([leader], cfg.task_label),
+            ],
+        )
+        snapshot = dashboard.update.call_args.args[0]
+        visible = wd_dashboard.visible_dashboard_rows(
+            snapshot.rows,
+            wd_models.DashboardState(sort="title"),
+            display_rows=snapshot.display_rows,
+        )
+        self.assertEqual([row.task for row in visible], ["Root", "Leader", "Child"])
+        self.assertEqual((snapshot.watched_count, snapshot.holding_count), (2, 0))
+        self.assertTrue(snapshot.session_quiet)
+        self.assertEqual(snapshot.user_idle, snapshot.user_idle_required)
+        dashboard.wait.assert_not_called()
+
+    def test_dashboard_poll_caps_ancestor_loads_when_metadata_is_invalid(self):
+        cfg = wd_models.Config(
+            idle_minutes=0,
+            user_idle_minutes=0,
+            session_discovery="frozen",
+        )
+        watched = [
+            _item(
+                "rollout-2026-09-09T00-00-00-"
+                f"synthetic-child-{index:02d}.jsonl"
+            )
+            for index in range(5)
+        ]
+        parents = [
+            _item(
+                "rollout-2026-09-09T00-00-00-"
+                f"synthetic-parent-{index:02d}.jsonl"
+            )
+            for index in range(5)
+        ]
+        watched_metadata = {
+            wd_metadata.target_key(item): _metadata(
+                task=f"Child {index}",
+                session_id=f"synthetic-child-{index:02d}",
+                parent_session_id=f"synthetic-parent-{index:02d}",
+                lineage_namespace="synthetic-lineage",
+            )
+            for index, item in enumerate(watched)
+        }
+        dashboard = mock.Mock()
+
+        def metadata_for(items, task_label):
+            loaded = list(items)
+            if loaded == watched:
+                return watched_metadata
+            return {
+                wd_metadata.target_key(item): wd_models.SessionMetadata()
+                for item in loaded
+            }
+
+        with (
+            mock.patch.object(wd_models, "MAX_SYNTHESIZED_ANCESTORS", 3),
+            mock.patch.object(wd_activity, "_last_activity_for", return_value=NOW),
+            mock.patch.object(
+                wd_metadata, "load_dashboard_metadata", side_effect=metadata_for
+            ) as load_metadata,
+        ):
+            wd_app.wait_until_quiet(
+                cfg, watched, dashboard, display_items=[*parents, *watched]
+            )
+
+        self.assertEqual(load_metadata.call_args_list[0], mock.call(watched, "prompt"))
+        extra_items = load_metadata.call_args_list[1].args[0]
+        self.assertEqual(extra_items, parents[:3])
+        self.assertEqual(len(load_metadata.call_args_list), 2)
+        snapshot = dashboard.update.call_args.args[0]
+        self.assertEqual(snapshot.display_rows, ())
+        self.assertEqual(
+            (snapshot.watched_count, snapshot.holding_count, snapshot.session_quiet),
+            (5, 0, True),
+        )
+        dashboard.wait.assert_not_called()
+
+    def test_dashboard_live_refresh_keeps_main_call_shape_with_ancestor_candidates(self):
+        cfg = wd_models.Config(
+            idle_minutes=0,
+            user_idle_minutes=0,
+            session_discovery="live",
+        )
+        watched = [
+            _item("rollout-2026-09-09T00-00-00-synthetic-child.jsonl")
+        ]
+        dashboard = mock.Mock()
+
+        with (
+            mock.patch.object(
+                wd_activity, "refresh_watch_set", return_value=watched
+            ) as refresh,
+            mock.patch.object(wd_activity, "_last_activity_for", return_value=NOW),
+            mock.patch.object(
+                wd_metadata,
+                "load_dashboard_metadata",
+                return_value={
+                    wd_metadata.target_key(watched[0]): _metadata(
+                        session_id="synthetic-child",
+                        lineage_namespace="synthetic-lineage",
+                    )
+                },
+            ),
+        ):
+            wd_app.wait_until_quiet(
+                cfg, watched, dashboard, display_items=watched
+            )
+
+        refresh.assert_called_once_with(cfg, watched, now=mock.ANY)
+
     def test_report_emission_respects_no_color_and_redirected_output(self):
         history = wd_reporting.WatchHistory()
         history.observe(_snapshot())
@@ -1138,7 +1413,7 @@ class DashboardLifecycleTests(unittest.TestCase):
         observed = []
         output = io.StringIO()
         output.flush = lambda: observed.append('flush')
-        def poll(cfg, watch_set, dashboard):
+        def poll(cfg, watch_set, dashboard, display_items):
             dashboard.history.observe(_snapshot())
         item, process, patches = self._main_patches(cfg, curses,
             wait_until_quiet=mock.patch.object(wd_app, 'wait_until_quiet', side_effect=poll))
@@ -1161,7 +1436,7 @@ class DashboardLifecycleTests(unittest.TestCase):
         output = mock.Mock()
         output.isatty.return_value = False
         output.write.side_effect = OSError('output unavailable')
-        def poll(cfg, watch_set, dashboard):
+        def poll(cfg, watch_set, dashboard, display_items):
             dashboard.history.observe(_snapshot())
         item, process, patches = self._main_patches(cfg, curses,
             wait_until_quiet=mock.patch.object(wd_app, 'wait_until_quiet', side_effect=poll))
@@ -1243,6 +1518,28 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertEqual(args[:2], (cfg, [item]))
         self.assertIsInstance(args[2], wd_dashboard.TerminalDashboard)
         curses.endwin.assert_called_once_with()
+        process.terminate.assert_called_once_with()
+
+    def test_main_gives_dashboard_all_candidates_without_watching_quiet_one(self):
+        cfg = wd_models.Config(display="dashboard", dry_run=True)
+        curses = mock.Mock()
+        curses.initscr.return_value = FakeScreen()
+        watched, process, patches = self._main_patches(cfg, curses)
+        quiet = _item("synthetic-quiet.jsonl")
+        patches["activity_files"] = mock.patch.object(
+            wd_activity, "activity_files", return_value=[watched, quiet]
+        )
+
+        with ExitStack() as stack:
+            mocks = {
+                name: stack.enter_context(patch)
+                for name, patch in patches.items()
+            }
+            self.assertEqual(wd_app.main([]), 0)
+
+        args = mocks["wait_until_quiet"].call_args.args
+        self.assertEqual(args[:2], (cfg, [watched]))
+        self.assertEqual(args[3], [watched, quiet])
         process.terminate.assert_called_once_with()
 
     def test_block_sleep_interrupt_restores_dashboard(self):

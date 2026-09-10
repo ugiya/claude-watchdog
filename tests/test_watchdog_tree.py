@@ -1187,6 +1187,504 @@ class AncestryMetadataTests(unittest.TestCase):
 
 
 class TreePresentationTests(unittest.TestCase):
+    def test_candidate_identity_index_uses_discovery_filename_identities(self):
+        claude = wd_models.ActivityFile(
+            Path("synthetic-claude-session.jsonl"), "claude"
+        )
+        claude_agent = wd_models.ActivityFile(
+            Path("synthetic-parent/subagents/agent-synthetic-agent.jsonl"),
+            "claude",
+        )
+        codex = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-codex.jsonl"),
+            "codex",
+        )
+        omx = wd_models.ActivityFile(Path("synthetic-activity.jsonl"), "omx")
+        opencode = wd_models.ActivityFile(
+            Path("synthetic-state.db"), "opencode"
+        )
+
+        indexed = wd_dashboard.index_display_ancestor_candidates(
+            [claude, claude_agent, codex, omx, opencode]
+        )
+
+        self.assertEqual(indexed[("claude", "synthetic-claude-session")], (claude,))
+        self.assertEqual(indexed[("claude", "synthetic-agent")], (claude_agent,))
+        self.assertEqual(indexed[("codex", "synthetic-codex")], (codex,))
+        # Real activity_files() launch candidates carry empty identities for OMX
+        # and OpenCode. Those identities are frozen later, so neither source can
+        # supply a synthesized ancestor candidate today.
+        self.assertFalse(
+            any(source in {"omx", "opencode"} for source, _ in indexed)
+        )
+
+    def test_ancestor_metadata_loading_follows_a_missing_chain(self):
+        child = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-child.jsonl"), "codex"
+        )
+        leader = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-leader.jsonl"),
+            "codex",
+        )
+        root = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-root.jsonl"), "codex"
+        )
+        metadata = {
+            wd_metadata.target_key(child): wd_models.SessionMetadata(
+                task="Child",
+                session_id="synthetic-child",
+                parent_session_id="synthetic-leader",
+                lineage_namespace="synthetic-lineage",
+            )
+        }
+        values = {
+            wd_metadata.target_key(leader): wd_models.SessionMetadata(
+                task="Leader",
+                session_id="synthetic-leader",
+                parent_session_id="synthetic-root",
+                lineage_namespace="synthetic-lineage",
+            ),
+            wd_metadata.target_key(root): wd_models.SessionMetadata(
+                task="Root",
+                session_id="synthetic-root",
+                lineage_namespace="synthetic-lineage",
+            ),
+        }
+
+        def metadata_for(items, task_label):
+            return {
+                wd_metadata.target_key(item): values[wd_metadata.target_key(item)]
+                for item in items
+            }
+
+        with mock.patch.object(
+            wd_metadata, "load_dashboard_metadata", side_effect=metadata_for
+        ) as load_metadata:
+            combined, display_items = wd_dashboard.load_display_ancestor_metadata(
+                metadata,
+                wd_dashboard.index_display_ancestor_candidates(
+                    [root, leader, child]
+                ),
+                "prompt",
+            )
+
+        self.assertEqual(
+            load_metadata.call_args_list,
+            [mock.call([leader], "prompt"), mock.call([root], "prompt")],
+        )
+        self.assertEqual(display_items, (leader, root))
+        self.assertEqual(set(combined), set(metadata) | set(values))
+
+    def test_ambiguous_ancestor_identity_is_not_synthesized(self):
+        child = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-child.jsonl"), "codex"
+        )
+        first = wd_models.ActivityFile(
+            Path(
+                "synthetic-first/"
+                "rollout-2026-09-09T00-00-00-synthetic-parent.jsonl"
+            ),
+            "codex",
+        )
+        second = wd_models.ActivityFile(
+            Path(
+                "synthetic-second/"
+                "rollout-2026-09-09T00-00-00-synthetic-parent.jsonl"
+            ),
+            "codex",
+        )
+        metadata = {
+            wd_metadata.target_key(child): wd_models.SessionMetadata(
+                session_id="synthetic-child",
+                parent_session_id="synthetic-parent",
+                lineage_namespace="synthetic-lineage",
+            )
+        }
+        first_metadata = {
+            wd_metadata.target_key(first): wd_models.SessionMetadata(
+                session_id="synthetic-parent",
+                lineage_namespace="synthetic-lineage",
+            )
+        }
+
+        with mock.patch.object(
+            wd_metadata,
+            "load_dashboard_metadata",
+            return_value=first_metadata,
+        ) as load_metadata:
+            combined, display_items = wd_dashboard.load_display_ancestor_metadata(
+                metadata,
+                wd_dashboard.index_display_ancestor_candidates(
+                    [child, first, second]
+                ),
+                "prompt",
+            )
+
+        self.assertEqual(combined, metadata)
+        self.assertEqual(display_items, ())
+        load_metadata.assert_not_called()
+
+    def test_quiet_missing_parent_connects_tree_without_changing_sleep_guards(self):
+        now = datetime(2026, 9, 9, tzinfo=timezone.utc)
+        root = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-root.jsonl"), "codex"
+        )
+        leader = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-leader.jsonl"),
+            "codex",
+        )
+        child = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-child.jsonl"), "codex"
+        )
+        watched_metadata = {
+            wd_metadata.target_key(root): wd_models.SessionMetadata(
+                client="codex-tui", task="Zulu root",
+                session_id="synthetic-root",
+                lineage_namespace="synthetic-lineage",
+            ),
+            wd_metadata.target_key(child): wd_models.SessionMetadata(
+                client="codex_exec", task="Alpha child",
+                session_id="synthetic-child",
+                parent_session_id="synthetic-leader",
+                lineage_namespace="synthetic-lineage",
+            ),
+        }
+        leader_metadata = {
+            wd_metadata.target_key(leader): wd_models.SessionMetadata(
+                client="codex_exec", task="Middle leader",
+                session_id="synthetic-leader",
+                parent_session_id="synthetic-root",
+                lineage_namespace="synthetic-lineage",
+            )
+        }
+        candidates = wd_dashboard.index_display_ancestor_candidates(
+            [root, leader, child]
+        )
+        with mock.patch.object(
+            wd_metadata,
+            "load_dashboard_metadata",
+            return_value=leader_metadata,
+        ) as load_metadata:
+            snapshot = wd_dashboard.make_dashboard_snapshot(
+                now,
+                wd_models.Config(idle_minutes=30, user_idle_minutes=5),
+                [root, child],
+                [
+                    (root, now - timedelta(hours=1)),
+                    (child, now - timedelta(hours=1)),
+                ],
+                300,
+                10,
+                watched_metadata,
+                ancestor_candidates=candidates,
+            )
+
+        load_metadata.assert_called_once_with([leader], "prompt")
+
+        visible = wd_dashboard.visible_dashboard_rows(
+            snapshot.rows,
+            wd_models.DashboardState(sort="title"),
+            display_rows=snapshot.display_rows,
+        )
+
+        self.assertEqual(
+            [row.task for row in visible],
+            ["Zulu root", "Middle leader", "Alpha child"],
+        )
+        self.assertEqual(
+            list(wd_dashboard.dashboard_tree_prefixes(visible).values()),
+            ["", "└─ ", "   └─ "],
+        )
+        self.assertEqual(
+            [row.display_only for row in visible], [False, True, False]
+        )
+        self.assertEqual(snapshot.watched_count, 2)
+        self.assertEqual(snapshot.holding_count, 0)
+        self.assertTrue(snapshot.session_quiet)
+        self.assertEqual(snapshot.user_idle, snapshot.user_idle_required)
+        self.assertEqual(
+            [row.task for row in snapshot.rows], ["Zulu root", "Alpha child"]
+        )
+        self.assertFalse(any(row.display_only for row in snapshot.rows))
+        self.assertEqual(
+            [row.task for row in snapshot.display_rows], ["Middle leader"]
+        )
+
+    def test_synthesized_ancestor_has_no_activity_or_holding_guard(self):
+        now = datetime(2026, 9, 9, tzinfo=timezone.utc)
+        leader = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-leader.jsonl"),
+            "codex",
+        )
+        child = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-child.jsonl"),
+            "codex",
+        )
+        child_metadata = {
+            wd_metadata.target_key(child): wd_models.SessionMetadata(
+                task="Child",
+                session_id="synthetic-child",
+                parent_session_id="synthetic-leader",
+                lineage_namespace="synthetic-lineage",
+            )
+        }
+        leader_metadata = {
+            wd_metadata.target_key(leader): wd_models.SessionMetadata(
+                task="Leader",
+                session_id="synthetic-leader",
+                lineage_namespace="synthetic-lineage",
+            )
+        }
+        cfg = wd_models.Config(idle_minutes=30)
+        activity = [(child, now), (leader, now)]
+        baseline = wd_dashboard.make_dashboard_snapshot(
+            now, cfg, [child], activity, 0, 10, child_metadata
+        )
+
+        with mock.patch.object(
+            wd_metadata,
+            "load_dashboard_metadata",
+            return_value=leader_metadata,
+        ):
+            with_ancestor = wd_dashboard.make_dashboard_snapshot(
+                now,
+                cfg,
+                [child],
+                activity,
+                0,
+                10,
+                child_metadata,
+                ancestor_candidates=wd_dashboard.index_display_ancestor_candidates(
+                    [leader, child]
+                ),
+            )
+
+        self.assertEqual(len(with_ancestor.display_rows), 1)
+        synthesized = with_ancestor.display_rows[0]
+        self.assertIs(synthesized.holding, False)
+        self.assertIsNone(synthesized.last_event)
+        self.assertEqual(
+            (baseline.holding_count, with_ancestor.holding_count),
+            (1, 1),
+        )
+
+    def test_provider_filter_keeps_required_ancestor_and_sorted_subtree_together(self):
+        parent = replace(
+            _row("Zulu parent", "parent", lineage_namespace="parent-lineage"),
+            key=("claude", "synthetic-parent.jsonl"),
+            source="claude",
+            path="synthetic-parent.jsonl",
+            holding=False,
+            display_only=True,
+        )
+        child = replace(
+            _row("Alpha child", "child", lineage_namespace="child-lineage"),
+            external_parent_key=parent.key,
+        )
+        other = _row("Middle root", "other")
+        state = wd_models.DashboardState(
+            sort="title", source_filter="codex"
+        )
+
+        visible = wd_dashboard.visible_dashboard_rows(
+            [child, other], state, display_rows=[parent]
+        )
+
+        self.assertEqual(
+            [(row.source, row.task) for row in visible],
+            [
+                ("codex", "Middle root"),
+                ("claude", "Zulu parent"),
+                ("codex", "Alpha child"),
+            ],
+        )
+        self.assertEqual(
+            list(wd_dashboard.dashboard_tree_prefixes(visible).values()),
+            ["", "", "└─ "],
+        )
+
+    def test_recent_sort_ranks_synthesized_root_by_its_newest_member(self):
+        recent = datetime(2026, 9, 6, 0, 5, tzinfo=timezone.utc)
+        older = datetime(2026, 9, 6, 0, 1, tzinfo=timezone.utc)
+        parent = replace(
+            _row("Quiet leader", "parent"),
+            last_event=None,
+            holding=False,
+            display_only=True,
+        )
+        child = replace(
+            _row("Recent child", "child", "parent"),
+            last_event=recent,
+        )
+        other = replace(_row("Old other root", "other"), last_event=older)
+
+        visible = wd_dashboard.visible_dashboard_rows(
+            [child, other],
+            wd_models.DashboardState(),
+            display_rows=[parent],
+        )
+
+        self.assertEqual(
+            [row.task for row in visible],
+            ["Quiet leader", "Recent child", "Old other root"],
+        )
+        self.assertEqual(
+            list(wd_dashboard.dashboard_tree_prefixes(visible).values()),
+            ["", "└─ ", ""],
+        )
+
+    def test_missing_parent_metadata_leaves_child_as_root_without_placeholder(self):
+        now = datetime(2026, 9, 9, tzinfo=timezone.utc)
+        parent = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-missing-parent.jsonl"), "codex"
+        )
+        child = wd_models.ActivityFile(
+            Path("rollout-2026-09-09T00-00-00-synthetic-child.jsonl"), "codex"
+        )
+        candidates = wd_dashboard.index_display_ancestor_candidates(
+            [parent, child]
+        )
+        with mock.patch.object(
+            wd_metadata,
+            "load_dashboard_metadata",
+            return_value={wd_metadata.target_key(parent): wd_models.SessionMetadata()},
+        ) as load_metadata:
+            snapshot = wd_dashboard.make_dashboard_snapshot(
+                now,
+                wd_models.Config(),
+                [child],
+                [(child, now)],
+                0,
+                10,
+                {
+                    wd_metadata.target_key(child): wd_models.SessionMetadata(
+                        task="Child", session_id="synthetic-child",
+                        parent_session_id="missing-parent",
+                        lineage_namespace="synthetic-lineage",
+                    )
+                },
+                ancestor_candidates=candidates,
+            )
+
+        load_metadata.assert_called_once_with([parent], "prompt")
+
+        visible = wd_dashboard.visible_dashboard_rows(
+            snapshot.rows,
+            wd_models.DashboardState(sort="title"),
+            display_rows=snapshot.display_rows,
+        )
+
+        self.assertEqual(snapshot.display_rows, ())
+        self.assertEqual([row.task for row in visible], ["Child"])
+        self.assertEqual(
+            wd_dashboard.dashboard_tree_prefixes(visible),
+            {visible[0].key: ""},
+        )
+
+    def test_shared_missing_ancestor_is_synthesized_once(self):
+        parent = replace(
+            _row("Parent", "parent"), holding=False, display_only=True
+        )
+        first = _row("First child", "first", "parent")
+        second = _row("Second child", "second", "parent")
+
+        visible = wd_dashboard.visible_dashboard_rows(
+            [first, second],
+            wd_models.DashboardState(sort="title"),
+            display_rows=[parent, parent],
+        )
+
+        self.assertEqual(
+            [row.task for row in visible],
+            ["Parent", "First child", "Second child"],
+        )
+        self.assertEqual(
+            list(wd_dashboard.dashboard_tree_prefixes(visible).values()),
+            ["", "├─ ", "└─ "],
+        )
+
+    def test_cyclic_display_candidates_produce_a_finite_acyclic_tree(self):
+        ancestor = replace(
+            _row("Ancestor A", "a", "b"), holding=False, display_only=True
+        )
+        cycle_peer = replace(
+            _row("Ancestor B", "b", "a"), holding=False, display_only=True
+        )
+        child = _row("Child", "child", "a")
+
+        visible = wd_dashboard.visible_dashboard_rows(
+            [child],
+            wd_models.DashboardState(sort="title"),
+            display_rows=[ancestor, cycle_peer],
+        )
+        parents = wd_dashboard._dashboard_parent_keys(visible)
+
+        self.assertEqual([row.task for row in visible], ["Ancestor A", "Child"])
+        self.assertEqual(parents, {child.key: ancestor.key})
+        self.assertEqual(
+            list(wd_dashboard.dashboard_tree_prefixes(visible).values()),
+            ["", "└─ "],
+        )
+
+    def test_missing_ancestor_synthesis_is_iterative_and_input_bounded(self):
+        display_rows = [
+            replace(
+                _row(
+                    f"Node {index:04d}",
+                    f"node-{index}",
+                    wd_models.UNKNOWN if index == 0 else f"node-{index - 1}",
+                ),
+                holding=False,
+                display_only=True,
+            )
+            for index in range(1100)
+        ]
+        leaf = _row("Leaf", "leaf", "node-1099")
+
+        visible = wd_dashboard.visible_dashboard_rows(
+            [leaf],
+            wd_models.DashboardState(sort="title"),
+            display_rows=display_rows,
+        )
+
+        self.assertEqual(len(visible), len(display_rows) + 1)
+        self.assertEqual(
+            (visible[0].session_id, visible[-1].session_id),
+            ("node-0", "leaf"),
+        )
+
+    def test_flat_view_does_not_add_display_only_ancestors(self):
+        parent = replace(
+            _row("Parent", "parent"), holding=False, display_only=True
+        )
+        child = _row("Child", "child", "parent")
+        state = wd_models.DashboardState(sort="title", tree=False)
+
+        visible = wd_dashboard.visible_dashboard_rows(
+            [child], state, display_rows=[parent]
+        )
+
+        self.assertEqual(visible, [child])
+
+    def test_available_display_metadata_does_not_change_complete_visible_tree(self):
+        parent = _row("Parent", "parent")
+        child = _row("Child", "child", "parent")
+        unrelated = replace(
+            _row("Unrelated", "unrelated"), holding=False, display_only=True
+        )
+        state = wd_models.DashboardState(sort="title")
+
+        baseline = wd_dashboard.visible_dashboard_rows([child, parent], state)
+        with_display_metadata = wd_dashboard.visible_dashboard_rows(
+            [child, parent], state, display_rows=[unrelated]
+        )
+
+        self.assertEqual(with_display_metadata, baseline)
+        self.assertEqual(
+            list(wd_dashboard.dashboard_tree_prefixes(baseline).values()),
+            ["", "└─ "],
+        )
+
     def test_dashboard_parent_keys_match_legacy_oracle(self):
         def row(
             source,
@@ -1398,6 +1896,44 @@ class TreePresentationTests(unittest.TestCase):
 
 
 class TreeFrameTests(unittest.TestCase):
+    def test_synthesized_ancestor_timing_and_details_say_not_watched(self):
+        now = datetime(2026, 9, 6, tzinfo=timezone.utc)
+        ancestor = replace(
+            _row("Quiet leader", "parent"),
+            last_event=None,
+            holding=False,
+            display_only=True,
+        )
+        child = _row("Recent child", "child", "parent")
+        snapshot = wd_models.DashboardSnapshot(
+            now=now,
+            rows=(child,),
+            watched_count=1,
+            holding_count=1,
+            session_quiet=False,
+            user_idle=None,
+            user_idle_required=300,
+            next_poll_seconds=10,
+            source="all",
+            discovery="frozen",
+            idle_seconds=1800,
+            display_rows=(ancestor,),
+        )
+        screen = FakeScreen()
+        dashboard = wd_dashboard.TerminalDashboard(
+            screen, wd_models.Config(no_color=True)
+        )
+        dashboard.state.details = True
+
+        dashboard.update(snapshot)
+
+        self.assertTrue(screen.lines[3].rstrip().endswith("n/a  unwatched"))
+        self.assertIn(
+            "lineage context only · not a watch target",
+            screen.lines[16],
+        )
+        self.assertNotIn("timing belongs to database guard", screen.lines[16])
+
     def test_nested_prefix_spacing_and_group_timing_survive_full_frame_render(self):
         root = wd_models.SessionChildMetadata(
             "root", task="Build UI", model="muse", effort="high", agent="build"
