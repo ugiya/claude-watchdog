@@ -23,6 +23,7 @@ REQUIRED_RUNTIME_FILES = (
     f"{PACKAGE_NAME}/presentation.py",
     f"{PACKAGE_NAME}/config.py",
     f"{PACKAGE_NAME}/activity.py",
+    f"{PACKAGE_NAME}/process_lineage.py",
     f"{PACKAGE_NAME}/metadata.py",
     f"{PACKAGE_NAME}/dashboard.py",
     f"{PACKAGE_NAME}/reporting.py",

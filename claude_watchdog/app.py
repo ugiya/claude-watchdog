@@ -128,6 +128,7 @@ def wait_until_quiet(
         if dashboard is not None
         else {}
     )
+    process_lineage_links: list[dict[str, object]] = []
     while True:
         now = datetime.now(timezone.utc)
         admission_notice = ""
@@ -163,7 +164,11 @@ def wait_until_quiet(
         )
 
         if dashboard is not None:
-            metadata = metadata_module.load_dashboard_metadata(watch_set, cfg.task_label)
+            metadata = metadata_module.load_dashboard_metadata(
+                watch_set,
+                cfg.task_label,
+                injected_links=process_lineage_links,
+            )
             snapshot = dashboard_module.make_dashboard_snapshot(
                 now, cfg, watch_set, activity, idle, cfg.poll_seconds, metadata,
                 admission_notice, ancestor_candidates,

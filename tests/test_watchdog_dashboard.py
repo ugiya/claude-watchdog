@@ -1092,7 +1092,7 @@ class ExitReportTests(unittest.TestCase):
                 wd_metadata,
                 "load_dashboard_metadata",
                 return_value={},
-            ),
+            ) as load_metadata,
         ):
             wd_app.wait_until_quiet(
                 cfg, [watched], dashboard, display_items=candidates
@@ -1101,6 +1101,11 @@ class ExitReportTests(unittest.TestCase):
         self.assertEqual(scans, 2)
         index_candidates.assert_called_once_with(candidates)
         dashboard.wait.assert_called_once_with(cfg.poll_seconds)
+        self.assertEqual(len(load_metadata.call_args_list), 2)
+        first_links = load_metadata.call_args_list[0].kwargs["injected_links"]
+        second_links = load_metadata.call_args_list[1].kwargs["injected_links"]
+        self.assertIs(first_links, second_links)
+        self.assertEqual(first_links, [])
 
     def test_dashboard_poll_loads_only_the_missing_ancestor_without_changing_guards(self):
         cfg = wd_models.Config(
@@ -1149,10 +1154,12 @@ class ExitReportTests(unittest.TestCase):
         }
         dashboard = mock.Mock()
 
-        def metadata_for(items, task_label):
+        def metadata_for(items, task_label, **kwargs):
             loaded = list(items)
             if loaded == watched:
+                self.assertIn("injected_links", kwargs)
                 return watched_metadata
+            self.assertEqual(kwargs, {})
             if loaded == [leader]:
                 return leader_metadata
             self.fail(f"unexpected metadata load: {loaded!r}")
@@ -1170,7 +1177,7 @@ class ExitReportTests(unittest.TestCase):
         self.assertEqual(
             load_metadata.call_args_list,
             [
-                mock.call(watched, cfg.task_label),
+                mock.call(watched, cfg.task_label, injected_links=mock.ANY),
                 mock.call([leader], cfg.task_label),
             ],
         )
@@ -1217,10 +1224,12 @@ class ExitReportTests(unittest.TestCase):
         }
         dashboard = mock.Mock()
 
-        def metadata_for(items, task_label):
+        def metadata_for(items, task_label, **kwargs):
             loaded = list(items)
             if loaded == watched:
+                self.assertIn("injected_links", kwargs)
                 return watched_metadata
+            self.assertEqual(kwargs, {})
             return {
                 wd_metadata.target_key(item): wd_models.SessionMetadata()
                 for item in loaded
@@ -1237,7 +1246,10 @@ class ExitReportTests(unittest.TestCase):
                 cfg, watched, dashboard, display_items=[*parents, *watched]
             )
 
-        self.assertEqual(load_metadata.call_args_list[0], mock.call(watched, "prompt"))
+        self.assertEqual(
+            load_metadata.call_args_list[0],
+            mock.call(watched, "prompt", injected_links=mock.ANY),
+        )
         extra_items = load_metadata.call_args_list[1].args[0]
         self.assertEqual(extra_items, parents[:3])
         self.assertEqual(len(load_metadata.call_args_list), 2)
