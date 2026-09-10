@@ -262,7 +262,9 @@ When OMX launches a Claude session without persisting a native parent ID, the
 dashboard can also confirm a shallower Claude-to-Codex edge from Claude's exact
 live process registry record, the project's OMX `session.json`, and matching
 process ancestry. The process table verifies those provider-written identities;
-it never invents an identity or uses cwd/time proximity alone. Confirmation is
+it never invents an identity or uses cwd/time proximity alone. The macOS `ps`
+probe preserves the watchdog environment but forces `LC_ALL=C` so localized
+hosts produce the stable clock format the parser expects. Confirmation is
 bounded, failure-safe, retained for the rest of the run, and display-only: it
 does not add watch targets, extend the `caffeinate` hold, or affect sleep.
 
