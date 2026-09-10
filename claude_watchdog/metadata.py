@@ -830,7 +830,11 @@ def load_dashboard_metadata(
     for link in discovered:
         child = link.get("child")
         child_id = child.get("session_id") if isinstance(child, dict) else None
-        if child_id not in retained_children:
+        if (
+            child_id not in retained_children
+            and len(injected_links)
+            < models_module.MAX_RETAINED_PROCESS_LINEAGE_LINKS
+        ):
             injected_links.append(link)
             new_links.append(link)
             retained_children.add(child_id)

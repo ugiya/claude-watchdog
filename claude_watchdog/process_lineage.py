@@ -35,9 +35,9 @@ def _parse_ps_clock(value: object, zone: tzinfo | None) -> datetime | None:
         return None
     try:
         parsed = datetime.strptime(value.strip(), "%a %b %d %H:%M:%S %Y")
-    except ValueError:
+        return parsed.astimezone() if zone is None else parsed.replace(tzinfo=zone)
+    except (ValueError, OverflowError, OSError):
         return None
-    return parsed.astimezone() if zone is None else parsed.replace(tzinfo=zone)
 
 
 def _parse_utc_timestamp(value: object) -> datetime | None:
@@ -45,11 +45,11 @@ def _parse_utc_timestamp(value: object) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError, OSError):
         return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(timezone.utc)
 
 
 def _registry_matches(
@@ -127,7 +127,11 @@ def _process_table(
         )
     except Exception:
         return {}
-    if completed.returncode != 0 or not isinstance(completed.stdout, str):
+    if (
+        not isinstance(completed, subprocess.CompletedProcess)
+        or completed.returncode != 0
+        or not isinstance(completed.stdout, str)
+    ):
         return {}
 
     table: dict[int, tuple[int, datetime]] = {}
@@ -171,10 +175,10 @@ def _has_ancestor(
         if process is None:
             return False
         parent_pid = process[0]
-        if parent_pid == ancestor_pid:
-            return True
         if parent_pid <= 1:
             return False
+        if parent_pid == ancestor_pid:
+            return True
         current = parent_pid
     return False
 

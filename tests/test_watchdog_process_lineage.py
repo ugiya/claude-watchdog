@@ -8,7 +8,9 @@ import os
 import pickle
 import subprocess
 import tempfile
+import time
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,6 +30,21 @@ PS_OUTPUT = (
     "  332     1 Sat Aug  1 19:41:35 2026    \n"
     " 4242   332 Wed Sep  9 08:47:27 2026    \n"
 )
+
+
+@contextmanager
+def _process_timezone(name: str):
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
 
 
 def _metadata() -> dict[tuple[str, str], wd_models.SessionMetadata]:
@@ -71,12 +88,15 @@ def _write_provider_evidence(root: Path) -> tuple[Path, Path, Path]:
         ),
         encoding="utf-8",
     )
+    (registry / "33394.synthetic.key").write_text(
+        "synthetic-registry-key\n", encoding="utf-8"
+    )
     (state / "session.json").write_text(
         json.dumps(
             {
                 "pid": 33393,
                 "native_session_id": "codex-orchestrator",
-                "started_at": "2026-08-01T14:17:52.000Z",
+                "started_at": "2026-08-01T14:17:52.984Z",
             }
         ),
         encoding="utf-8",
@@ -93,6 +113,22 @@ def _valid_runner(*args, **kwargs) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _discover_registry(
+    registry: Path,
+    *,
+    metadata: dict[tuple[str, str], wd_models.SessionMetadata] | None = None,
+    runner=_valid_runner,
+    local_timezone=LOCAL_TIMEZONE,
+):
+    return wd_process_lineage.discover_process_lineage(
+        _metadata() if metadata is None else metadata,
+        registry,
+        runner=runner,
+        observed_at=OBSERVED_AT,
+        local_timezone=local_timezone,
+    )
+
+
 def _discover(
     root: Path,
     stdout: str,
@@ -100,12 +136,10 @@ def _discover(
     metadata: dict[tuple[str, str], wd_models.SessionMetadata] | None = None,
 ):
     registry, _, _ = _write_provider_evidence(root)
-    return wd_process_lineage.discover_process_lineage(
-        metadata or _metadata(),
+    return _discover_registry(
         registry,
+        metadata=metadata,
         runner=lambda *args, **kwargs: _completed(stdout),
-        observed_at=OBSERVED_AT,
-        local_timezone=LOCAL_TIMEZONE,
     )
 
 
@@ -147,6 +181,22 @@ def _write_transcripts(root: Path, project: Path):
 
 
 class ProcessConfirmedLineageTests(unittest.TestCase):
+    def test_provider_fixture_uses_registry_key_pair_and_realistic_omx_fraction(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            registry, registry_file, project = _write_provider_evidence(Path(temporary))
+            key_names = [path.name for path in registry.glob("33394.*.key")]
+            session = json.loads(
+                (project / ".omx" / "state" / "session.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(registry_file.name, "33394.json")
+        self.assertEqual(key_names, ["33394.synthetic.key"])
+        self.assertEqual(session["started_at"], "2026-08-01T14:17:52.984Z")
+
     def test_process_table_parses_real_ps_whitespace_shape(self) -> None:
         table = wd_process_lineage._process_table(
             lambda *args, **kwargs: _completed(PS_OUTPUT), LOCAL_TIMEZONE
@@ -185,6 +235,74 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
 
         self.assertEqual(set(table), {1, 332})
 
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX timezone control")
+    def test_zone_less_process_clocks_use_process_local_time_but_proc_start_is_utc(
+        self,
+    ) -> None:
+        with _process_timezone("Asia/Jerusalem"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry, _, _ = _write_provider_evidence(root)
+            links = _discover_registry(registry, local_timezone=None)
+
+        self.assertEqual(len(links), 1)
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX timezone control")
+    def test_extreme_process_clock_yields_no_edge_without_raising(self) -> None:
+        with _process_timezone("Etc/GMT-5"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry, _, _ = _write_provider_evidence(root)
+            links = _discover_registry(
+                registry,
+                runner=lambda *args, **kwargs: _completed(
+                    _ps_output(
+                        (33394, 33393, "Mon Jan  1 00:00:00 0001"),
+                        (33393, 1, "Sat Aug  1 17:17:22 2026"),
+                    )
+                ),
+                local_timezone=None,
+            )
+
+        self.assertEqual(links, ())
+
+    def test_process_clock_timezone_conversion_failures_are_refused(self) -> None:
+        for error in (OverflowError("synthetic overflow"), OSError("synthetic zone")):
+            with self.subTest(error=type(error).__name__):
+                parsed = mock.Mock()
+                parsed.astimezone.side_effect = error
+                with mock.patch.object(wd_process_lineage, "datetime") as parser:
+                    parser.strptime.return_value = parsed
+                    result = wd_process_lineage._parse_ps_clock(
+                        "Thu Sep 10 20:05:34 2026", None
+                    )
+
+                self.assertIsNone(result)
+
+    def test_extreme_omx_started_at_yields_no_edge_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry, _, project = _write_provider_evidence(root)
+            path = project / ".omx" / "state" / "session.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document["started_at"] = "0001-01-01T00:00:00+05:00"
+            path.write_text(json.dumps(document), encoding="utf-8")
+
+            links = _discover_registry(registry)
+
+        self.assertEqual(links, ())
+
+    def test_utc_timestamp_timezone_conversion_failures_are_refused(self) -> None:
+        for error in (OverflowError("synthetic overflow"), OSError("synthetic zone")):
+            with self.subTest(error=type(error).__name__):
+                parsed = mock.Mock(tzinfo=timezone.utc)
+                parsed.astimezone.side_effect = error
+                with mock.patch.object(wd_process_lineage, "datetime") as parser:
+                    parser.fromisoformat.return_value = parsed
+                    result = wd_process_lineage._parse_utc_timestamp(
+                        "2026-09-10T17:05:34Z"
+                    )
+
+                self.assertIsNone(result)
+
     def test_confirms_exact_registry_and_omx_records_across_utc_and_local_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -200,13 +318,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                     )
                 )
 
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(),
-                registry,
-                runner=runner,
-                observed_at=OBSERVED_AT,
-                local_timezone=LOCAL_TIMEZONE,
-            )
+            links = _discover_registry(registry, runner=runner)
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(
@@ -235,6 +347,9 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             second = json.loads(registry_file.read_text(encoding="utf-8"))
             second.update({"pid": 33395, "sessionId": "claude-second"})
             (registry / "33395.json").write_text(json.dumps(second), encoding="utf-8")
+            (registry / "33395.synthetic.key").write_text(
+                "synthetic-registry-key\n", encoding="utf-8"
+            )
             metadata = _metadata()
             metadata[("claude", "/synthetic/second.jsonl")] = (
                 wd_models.SessionMetadata(session_id="claude-second")
@@ -252,13 +367,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                     )
                 )
 
-            links = wd_process_lineage.discover_process_lineage(
-                metadata,
-                registry,
-                runner=runner,
-                observed_at=OBSERVED_AT,
-                local_timezone=LOCAL_TIMEZONE,
-            )
+            links = _discover_registry(registry, metadata=metadata, runner=runner)
 
         self.assertEqual(calls, 1)
         self.assertEqual(
@@ -372,6 +481,79 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
 
         self.assertEqual(len(retained), 1)
 
+    def test_retention_stops_at_consumer_cap_without_erasing_existing_edges(self) -> None:
+        children = [
+            wd_models.ActivityFile(Path(f"/synthetic/child-{index}.jsonl"), "claude")
+            for index in range(3)
+        ]
+        parents = [
+            wd_models.ActivityFile(Path(f"/synthetic/parent-{index}.jsonl"), "codex")
+            for index in range(3)
+        ]
+        loaded = {
+            **{
+                wd_metadata.target_key(child): wd_models.SessionMetadata(
+                    session_id=f"child-{index}"
+                )
+                for index, child in enumerate(children)
+            },
+            **{
+                wd_metadata.target_key(parent): wd_models.SessionMetadata(
+                    session_id=f"parent-{index}"
+                )
+                for index, parent in enumerate(parents)
+            },
+        }
+        links = [
+            {
+                "child": {"source": "claude", "session_id": f"child-{index}"},
+                "parent": {"source": "codex", "session_id": f"parent-{index}"},
+                "evidence": f"confirmation {index}",
+            }
+            for index in range(3)
+        ]
+        retained: list[dict[str, object]] = []
+
+        with (
+            mock.patch.object(
+                wd_metadata, "external_lineage_registry_path", return_value=Path("/missing")
+            ),
+            mock.patch.object(
+                wd_metadata,
+                "load_session_metadata",
+                side_effect=lambda item, **kwargs: loaded[wd_metadata.target_key(item)],
+            ),
+            mock.patch.object(
+                wd_metadata,
+                "codex_sqlite_metadata_batch",
+                return_value={
+                    wd_metadata.target_key(parent): loaded[wd_metadata.target_key(parent)]
+                    for parent in parents
+                },
+            ),
+            mock.patch.object(
+                wd_metadata.process_lineage_module,
+                "discover_process_lineage",
+                side_effect=[(link,) for link in links],
+            ),
+            mock.patch.object(wd_models, "MAX_EXTERNAL_LINEAGE_LINKS", 2),
+            mock.patch.object(wd_models, "MAX_RETAINED_PROCESS_LINEAGE_LINKS", 2),
+        ):
+            for _ in links:
+                result = wd_metadata.load_dashboard_metadata(
+                    [*children, *parents], injected_links=retained
+                )
+
+        self.assertEqual(retained, links[:2])
+        for index in range(2):
+            self.assertEqual(
+                result[wd_metadata.target_key(children[index])].external_parent_key,
+                wd_metadata.target_key(parents[index]),
+            )
+        self.assertIsNone(
+            result[wd_metadata.target_key(children[2])].external_parent_key
+        )
+
     def test_interactive_claude_in_omx_cwd_is_refused_when_omx_pid_is_not_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             links = _discover(
@@ -419,13 +601,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 return original_open(path, *args, **kwargs)
 
             with mock.patch.object(Path, "open", disappearing_open):
-                links = wd_process_lineage.discover_process_lineage(
-                    _metadata(),
-                    registry,
-                    runner=_valid_runner,
-                    observed_at=OBSERVED_AT,
-                    local_timezone=LOCAL_TIMEZONE,
-                )
+                links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_missing_omx_session_file_is_refused(self) -> None:
@@ -440,9 +616,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 calls += 1
                 return _valid_runner(*args, **kwargs)
 
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=forbidden_runner
-            )
+            links = _discover_registry(registry, runner=forbidden_runner)
         self.assertEqual(links, ())
         self.assertEqual(calls, 0)
 
@@ -455,9 +629,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 path.read_bytes()
                 + b" " * (wd_models.MAX_OMX_SESSION_BYTES + 1)
             )
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=_valid_runner
-            )
+            links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_oversized_omx_session_file_is_not_launch_metadata(self) -> None:
@@ -507,9 +679,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             document = json.loads(path.read_text(encoding="utf-8"))
             document["pid"] = "33393"
             path.write_text(json.dumps(document), encoding="utf-8")
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=_valid_runner
-            )
+            links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_boolean_omx_session_pid_is_refused(self) -> None:
@@ -529,14 +699,20 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                     )
                 )
 
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(),
-                registry,
-                runner=runner,
-                observed_at=OBSERVED_AT,
-                local_timezone=LOCAL_TIMEZONE,
-            )
+            links = _discover_registry(registry, runner=runner)
         self.assertEqual(links, ())
+
+    def test_omx_session_rejects_integer_pid_zero_and_one(self) -> None:
+        for pid in (0, 1):
+            with self.subTest(pid=pid), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                _, _, project = _write_provider_evidence(root)
+                path = project / ".omx" / "state" / "session.json"
+                document = json.loads(path.read_text(encoding="utf-8"))
+                document["pid"] = pid
+                path.write_text(json.dumps(document), encoding="utf-8")
+
+                self.assertIsNone(wd_process_lineage._omx_session(path))
 
     def test_non_string_omx_native_session_id_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -546,9 +722,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             document = json.loads(path.read_text(encoding="utf-8"))
             document["native_session_id"] = 12345
             path.write_text(json.dumps(document), encoding="utf-8")
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=_valid_runner
-            )
+            links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_ancestry_chain_exceeding_hop_bound_is_refused(self) -> None:
@@ -567,10 +741,11 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             registry, registry_file, _ = _write_provider_evidence(root)
-            (registry / "duplicate.json").write_bytes(registry_file.read_bytes())
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=_valid_runner
+            (registry / "33395.json").write_bytes(registry_file.read_bytes())
+            (registry / "33395.synthetic.key").write_text(
+                "synthetic-registry-key\n", encoding="utf-8"
             )
+            links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_relative_registry_cwd_is_refused_even_when_it_contains_valid_omx_state(self) -> None:
@@ -588,13 +763,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             previous = Path.cwd()
             try:
                 os.chdir(root)
-                links = wd_process_lineage.discover_process_lineage(
-                    _metadata(),
-                    registry,
-                    runner=_valid_runner,
-                    observed_at=OBSERVED_AT,
-                    local_timezone=LOCAL_TIMEZONE,
-                )
+                links = _discover_registry(registry)
             finally:
                 os.chdir(previous)
         self.assertEqual(links, ())
@@ -606,9 +775,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             record = json.loads(registry_file.read_text(encoding="utf-8"))
             record["procStart"] = "2026-09-10T17:05:34Z"
             registry_file.write_text(json.dumps(record), encoding="utf-8")
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=_valid_runner
-            )
+            links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_boolean_claude_registry_pid_is_refused(self) -> None:
@@ -627,13 +794,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                     )
                 )
 
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(),
-                registry,
-                runner=runner,
-                observed_at=OBSERVED_AT,
-                local_timezone=LOCAL_TIMEZONE,
-            )
+            links = _discover_registry(registry, runner=runner)
         self.assertEqual(links, ())
 
     def test_empty_omx_native_session_id_is_refused(self) -> None:
@@ -644,9 +805,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             document = json.loads(path.read_text(encoding="utf-8"))
             document["native_session_id"] = ""
             path.write_text(json.dumps(document), encoding="utf-8")
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=_valid_runner
-            )
+            links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_naive_omx_started_at_is_refused(self) -> None:
@@ -657,9 +816,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             document = json.loads(path.read_text(encoding="utf-8"))
             document["started_at"] = "2026-08-01T14:17:52"
             path.write_text(json.dumps(document), encoding="utf-8")
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=_valid_runner
-            )
+            links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_nonzero_ps_result_is_refused_even_with_valid_stdout(self) -> None:
@@ -671,13 +828,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 result = _valid_runner(*args, **kwargs)
                 return subprocess.CompletedProcess(result.args, 1, result.stdout, "denied")
 
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(),
-                registry,
-                runner=runner,
-                observed_at=OBSERVED_AT,
-                local_timezone=LOCAL_TIMEZONE,
-            )
+            links = _discover_registry(registry, runner=runner)
         self.assertEqual(links, ())
 
     def test_duplicate_process_pid_rows_are_refused(self) -> None:
@@ -760,6 +911,15 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         self.assertFalse(wd_process_lineage._has_ancestor(33394, 33393, table))
         self.assertEqual(table.lookups, 1)
 
+    def test_pid_one_is_never_accepted_as_an_ancestor(self) -> None:
+        table = {
+            33394: (33393, OBSERVED_AT),
+            33393: (1, OBSERVED_AT),
+            1: (0, OBSERVED_AT),
+        }
+
+        self.assertFalse(wd_process_lineage._has_ancestor(33394, 1, table))
+
     def test_registry_session_id_must_match_a_loaded_claude_row(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -774,9 +934,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 calls += 1
                 return _valid_runner(*args, **kwargs)
 
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=forbidden_runner
-            )
+            links = _discover_registry(registry, runner=forbidden_runner)
         self.assertEqual(links, ())
         self.assertEqual(calls, 0)
 
@@ -793,13 +951,13 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 "scandir",
                 side_effect=AssertionError("registry scanned without Claude candidate"),
             ):
-                links = wd_process_lineage.discover_process_lineage(
-                    {
+                links = _discover_registry(
+                    registry,
+                    metadata={
                         ("codex", "/synthetic/child.jsonl"): wd_models.SessionMetadata(
                             session_id="claude-child"
                         )
                     },
-                    registry,
                     runner=forbidden_runner,
                 )
         self.assertEqual(links, ())
@@ -828,7 +986,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             registry, registry_file, _ = _write_provider_evidence(root)
-            skipped = [Entry(f"skip-{index}.txt") for index in range(512)]
+            skipped = [Entry(f"{index}.synthetic.key") for index in range(512)]
             bounded_out = Entry("33394.json", registry_file)
             calls = 0
 
@@ -842,9 +1000,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 "scandir",
                 return_value=Scan([*skipped, bounded_out]),
             ):
-                links = wd_process_lineage.discover_process_lineage(
-                    _metadata(), registry, runner=runner
-                )
+                links = _discover_registry(registry, runner=runner)
 
         self.assertEqual(links, ())
         self.assertEqual(bounded_out.stat_calls, 0)
@@ -869,9 +1025,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 mock.patch.object(wd_models, "MAX_CLAUDE_REGISTRY_BYTES", 1),
                 mock.patch.object(Path, "open", recording_open),
             ):
-                links = wd_process_lineage.discover_process_lineage(
-                    _metadata(), registry, runner=_valid_runner
-                )
+                links = _discover_registry(registry)
 
         self.assertEqual(links, ())
         self.assertEqual(opened, [filler])
@@ -884,9 +1038,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                 registry_file.read_bytes()
                 + b" " * (wd_models.MAX_OMX_SESSION_BYTES + 1)
             )
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=_valid_runner
-            )
+            links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_malformed_claude_registry_record_is_refused(self) -> None:
@@ -894,9 +1046,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             root = Path(temporary)
             registry, registry_file, _ = _write_provider_evidence(root)
             registry_file.write_text("{", encoding="utf-8")
-            links = wd_process_lineage.discover_process_lineage(
-                _metadata(), registry, runner=_valid_runner
-            )
+            links = _discover_registry(registry)
         self.assertEqual(links, ())
 
     def test_probe_skips_children_with_higher_precedence_parentage(self) -> None:
@@ -919,14 +1069,14 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                     calls += 1
                     return _valid_runner(*args, **kwargs)
 
-                links = wd_process_lineage.discover_process_lineage(
-                    {
+                links = _discover_registry(
+                    registry,
+                    metadata={
                         ("claude", "/synthetic/claude.jsonl"): child,
                         ("codex", "/synthetic/codex.jsonl"): wd_models.SessionMetadata(
                             session_id="codex-orchestrator"
                         ),
                     },
-                    registry,
                     runner=forbidden_runner,
                 )
                 self.assertEqual(links, ())
@@ -956,6 +1106,7 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
                     "raises": raises,
                     "times-out": times_out,
                     "garbage": lambda *a, **k: _completed("not a process table\n"),
+                    "non-completed-process": lambda *a, **k: object(),
                     "empty": lambda *a, **k: _completed(""),
                     "malformed-row": lambda *a, **k: _completed(
                         _ps_output((33394, 33393, "Thu Sep 10 20:05:34 2026"))
