@@ -124,6 +124,7 @@ def _process_table(
             text=True,
             timeout=models_module.PROCESS_PROBE_TIMEOUT_SECONDS,
             check=False,
+            env={**os.environ, "LC_ALL": "C"},
         )
     except Exception:
         return {}

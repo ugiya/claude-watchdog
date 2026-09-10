@@ -208,6 +208,34 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             (1, datetime(2026, 8, 1, 16, 41, 35, tzinfo=timezone.utc)),
         )
 
+    def test_process_clock_parser_accepts_c_locale_and_refuses_localized_value(
+        self,
+    ) -> None:
+        c_locale = wd_process_lineage._parse_ps_clock(
+            "Sat Aug  1 19:40:07 2026", LOCAL_TIMEZONE
+        )
+        localized = wd_process_lineage._parse_ps_clock(
+            "Sa.  1 Aug. 19:40:07 2026", LOCAL_TIMEZONE
+        )
+
+        self.assertEqual(
+            c_locale,
+            datetime(2026, 8, 1, 19, 40, 7, tzinfo=LOCAL_TIMEZONE),
+        )
+        self.assertIsNone(localized)
+
+    def test_localized_ps_rows_yield_no_edge_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            links = _discover(
+                Path(temporary),
+                _ps_output(
+                    (33394, 33393, "Do. 10 Sept. 20:05:34 2026"),
+                    (33393, 1, "Sa.  1 Aug. 17:17:22 2026"),
+                ),
+            )
+
+        self.assertEqual(links, ())
+
     def test_process_table_skips_bad_row_and_keeps_valid_rows(self) -> None:
         stdout = (
             "    1     0 Sat Aug  1 19:40:07 2026    \n"
@@ -243,6 +271,49 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             root = Path(temporary)
             registry, _, _ = _write_provider_evidence(root)
             links = _discover_registry(registry, local_timezone=None)
+
+        self.assertEqual(len(links), 1)
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX timezone control")
+    def test_zone_less_process_clocks_support_a_non_fixture_offset(self) -> None:
+        with _process_timezone("Etc/GMT+5"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry, _, _ = _write_provider_evidence(root)
+            links = _discover_registry(
+                registry,
+                runner=lambda *args, **kwargs: _completed(
+                    _ps_output(
+                        (33394, 33393, "Thu Sep 10 12:05:34 2026"),
+                        (33393, 1, "Sat Aug  1 09:17:22 2026"),
+                    )
+                ),
+                local_timezone=None,
+            )
+
+        self.assertEqual(len(links), 1)
+
+    @unittest.skipUnless(hasattr(time, "tzset"), "requires POSIX timezone control")
+    def test_zone_less_process_clocks_apply_date_specific_dst_offsets(self) -> None:
+        with _process_timezone("Asia/Jerusalem"), tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry, registry_file, project = _write_provider_evidence(root)
+            record = json.loads(registry_file.read_text(encoding="utf-8"))
+            record["procStart"] = "Fri Jul 10 17:05:34 2026"
+            registry_file.write_text(json.dumps(record), encoding="utf-8")
+            session_path = project / ".omx" / "state" / "session.json"
+            session = json.loads(session_path.read_text(encoding="utf-8"))
+            session["started_at"] = "2026-01-01T14:17:52.984Z"
+            session_path.write_text(json.dumps(session), encoding="utf-8")
+            links = _discover_registry(
+                registry,
+                runner=lambda *args, **kwargs: _completed(
+                    _ps_output(
+                        (33394, 33393, "Fri Jul 10 20:05:34 2026"),
+                        (33393, 1, "Thu Jan  1 16:17:22 2026"),
+                    )
+                ),
+                local_timezone=None,
+            )
 
         self.assertEqual(len(links), 1)
 
@@ -342,8 +413,21 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             calls[0],
             (
                 (["/bin/ps", "-axo", "pid=,ppid=,lstart="],),
-                {"capture_output": True, "text": True, "timeout": 1.0, "check": False},
+                {
+                    "capture_output": True,
+                    "text": True,
+                    "timeout": 1.0,
+                    "check": False,
+                    "env": mock.ANY,
+                },
             ),
+        )
+        environment = calls[0][1]["env"]
+        expected_environment = {**os.environ, "LC_ALL": "C"}
+        self.assertIsInstance(environment, dict)
+        self.assertEqual(set(environment), set(expected_environment))
+        self.assertTrue(
+            all(environment[key] == value for key, value in expected_environment.items())
         )
         self.assertEqual(
             links[0]["child"], {"source": "claude", "session_id": "claude-child"}
@@ -571,6 +655,12 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         )
         self.assertEqual(retained, links[:2])
 
+    def test_retention_bound_does_not_exceed_external_lineage_consumer_cap(self) -> None:
+        self.assertLessEqual(
+            wd_models.MAX_RETAINED_PROCESS_LINEAGE_LINKS,
+            wd_models.MAX_EXTERNAL_LINEAGE_LINKS,
+        )
+
     def test_interactive_claude_in_omx_cwd_is_refused_when_omx_pid_is_not_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             links = _discover(
@@ -620,6 +710,37 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             with mock.patch.object(Path, "open", disappearing_open):
                 links = _discover_registry(registry)
         self.assertEqual(links, ())
+
+    def test_missing_claude_registry_directory_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "missing-sessions"
+
+            links = _discover_registry(
+                missing,
+                runner=lambda *args, **kwargs: self.fail("ps ran without registry evidence"),
+            )
+
+        self.assertEqual(links, ())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO support")
+    def test_claude_registry_fifo_is_never_opened(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry, _, _ = _write_provider_evidence(root)
+            fifo = registry / "newer.json"
+            os.mkfifo(fifo)
+            os.utime(fifo, ns=(2_000_000_000, 2_000_000_000))
+            original_open = Path.open
+
+            def guarded_open(path, *args, **kwargs):
+                if path == fifo:
+                    raise AssertionError("registry FIFO was opened")
+                return original_open(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", guarded_open):
+                links = _discover_registry(registry)
+
+        self.assertEqual(len(links), 1)
 
     def test_missing_omx_session_file_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -814,6 +935,39 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             links = _discover_registry(registry, runner=runner)
         self.assertEqual(links, ())
 
+    def test_non_integer_claude_registry_pid_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry, registry_file, _ = _write_provider_evidence(root)
+            record = json.loads(registry_file.read_text(encoding="utf-8"))
+            record["pid"] = "33394"
+            registry_file.write_text(json.dumps(record), encoding="utf-8")
+
+            links = _discover_registry(registry)
+
+        self.assertEqual(links, ())
+
+    def test_claude_registry_rejects_integer_pid_zero_and_one(self) -> None:
+        for pid in (0, 1):
+            with self.subTest(pid=pid), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry, registry_file, _ = _write_provider_evidence(root)
+                record = json.loads(registry_file.read_text(encoding="utf-8"))
+                record["pid"] = pid
+                registry_file.write_text(json.dumps(record), encoding="utf-8")
+
+                links = _discover_registry(
+                    registry,
+                    runner=lambda *args, **kwargs: _completed(
+                        _ps_output(
+                            (pid, 33393, "Thu Sep 10 20:05:34 2026"),
+                            (33393, 0, "Sat Aug  1 17:17:22 2026"),
+                        )
+                    ),
+                )
+
+                self.assertEqual(links, ())
+
     def test_empty_omx_native_session_id_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -826,6 +980,9 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
         self.assertEqual(links, ())
 
     def test_naive_omx_started_at_is_refused(self) -> None:
+        self.assertIsNone(
+            wd_process_lineage._parse_utc_timestamp("2026-08-01T14:17:52")
+        )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             registry, _, project = _write_provider_evidence(root)
@@ -835,6 +992,17 @@ class ProcessConfirmedLineageTests(unittest.TestCase):
             path.write_text(json.dumps(document), encoding="utf-8")
             links = _discover_registry(registry)
         self.assertEqual(links, ())
+
+    def test_process_table_refuses_completed_process_with_non_string_stdout(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["/bin/ps", "-axo", "pid=,ppid=,lstart="], 0, None, ""
+        )
+
+        table = wd_process_lineage._process_table(
+            lambda *args, **kwargs: completed, LOCAL_TIMEZONE
+        )
+
+        self.assertEqual(table, {})
 
     def test_nonzero_ps_result_is_refused_even_with_valid_stdout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

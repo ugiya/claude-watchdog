@@ -103,8 +103,10 @@ fixtures preserve the paired-file layout.
 Process-confirmed OMX lineage recognizes a record only when `pid` is an
 integer, `sessionId` exactly matches a loaded Claude row, `cwd` is absolute,
 and `procStart` parses in `ps lstart` format. `procStart` is UTC even though
-`/bin/ps` renders `lstart` in local time; both values are parsed with their
-explicit zones and compared to the second. The observed `entrypoint` for
+`/bin/ps` renders `lstart` in local time. The watchdog forces the command's
+locale to `LC_ALL=C` while preserving the rest of its environment so the
+English weekday/month format is stable; both clock values are parsed with
+their explicit zones and compared to the second. The observed `entrypoint` for
 `claude -p` was `sdk-cli`, and its observed `kind` was `interactive`, but
 neither field is used to admit or reject lineage. Registry enumeration stops
 after 512 directory entries and reads at most 2 MiB across candidate files,
@@ -192,9 +194,9 @@ The bounded record must contain an integer `pid`, a non-empty string
 `native_session_id`, and a parseable, timezone-aware `started_at`. The OMX
 version that wrote the observed `session.json` record was not captured. The
 file is rejected if it exceeds 64 KiB. The watchdog then runs one
-`/bin/ps -axo pid=,ppid=,lstart=` command per dashboard poll, with no shell and
-a one-second timeout, and confirms all of the following before emitting a
-Claude-to-Codex display edge:
+`/bin/ps -axo pid=,ppid=,lstart=` command per dashboard poll, with no shell, a
+one-second timeout, and `LC_ALL=C` in the otherwise inherited environment, and
+confirms all of the following before emitting a Claude-to-Codex display edge:
 
 - the registry PID's `ps` start matches UTC `procStart` exactly to the second;
 - the OMX PID's local `ps` start is within 120 seconds of UTC `started_at`;
@@ -213,8 +215,10 @@ record's `native_session_id`, so the rendered edge may be shallower than the
 actual OMX leader relationship, but it is not guessed. A confirmed link is
 retained additively for the rest of the watchdog run and records the PIDs and
 observation time in row details. Retention keeps the first 256 uniquely
-confirmed child links; once full, existing retained edges continue to render
-while later new confirmations are not retained or rendered by this fallback.
+confirmed child links, including links whose parent row is not loaded and
+therefore cannot currently render; those unrendered links still consume a
+retention slot. Once full, existing retained edges continue to render while
+later new confirmations are not retained or rendered by this fallback.
 Missing, ambiguous, oversized, malformed, stale, recycled, over-depth, or
 unavailable evidence yields no edge. A parent row must also be loaded and
 resolve unambiguously. This metadata remains display-only and cannot change
