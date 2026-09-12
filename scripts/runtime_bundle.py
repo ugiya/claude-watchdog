@@ -27,7 +27,14 @@ REQUIRED_RUNTIME_FILES = (
     f"{PACKAGE_NAME}/metadata.py",
     f"{PACKAGE_NAME}/dashboard.py",
     f"{PACKAGE_NAME}/reporting.py",
-    f"{PACKAGE_NAME}/power.py",
+    f"{PACKAGE_NAME}/power/__init__.py",
+    f"{PACKAGE_NAME}/power/_types.py",
+    f"{PACKAGE_NAME}/power/_contracts.py",
+    f"{PACKAGE_NAME}/power/_selection.py",
+    f"{PACKAGE_NAME}/power/_session.py",
+    f"{PACKAGE_NAME}/power/_adapters/__init__.py",
+    f"{PACKAGE_NAME}/power/_adapters/macos.py",
+    f"{PACKAGE_NAME}/power/_adapters/logind.py",
     f"{PACKAGE_NAME}/app.py",
 )
 _FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)

@@ -49,8 +49,10 @@ def make_runtime(root: Path, *, version: str = "0.1.0") -> Path:
         ),
     }
     for relative in bundle.REQUIRED_RUNTIME_FILES:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
         name = Path(relative).name
-        (root / relative).write_text(sources.get(name, f'# {name}\n'), encoding="utf-8")
+        path.write_text(sources.get(name, f'# {name}\n'), encoding="utf-8")
     (root / "VERSION").write_text(f"{version}\n", encoding="utf-8")
     return root
 
@@ -80,7 +82,7 @@ class RuntimeBundleTests(unittest.TestCase):
     def test_bundle_rejects_missing_and_symlinked_required_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = make_runtime(Path(temporary))
-            required = root / "claude_watchdog" / "power.py"
+            required = root / "claude_watchdog" / "power" / "__init__.py"
             required.unlink()
             with self.assertRaisesRegex(bundle.BundleError, "missing required runtime file"):
                 bundle.build_runtime_bundle(root)

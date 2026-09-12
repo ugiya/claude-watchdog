@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import logging
-import signal
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -15,6 +13,7 @@ from . import dashboard as dashboard_module
 from . import metadata as metadata_module
 from . import models as models_module
 from . import power as power_module
+from .power import IdleKind, PowerPolicy
 from . import reporting as reporting_module
 
 def _source_guard_status(
@@ -121,6 +120,8 @@ def wait_until_quiet(
     watch_set: list[models_module.ActivityFile],
     dashboard: dashboard_module.TerminalDashboard | None = None,
     display_items: list[models_module.ActivityFile] | None = None,
+    *,
+    session: power_module.PowerSession | None = None,
 ) -> None:
     """Wait for every watched session to be quiet and for the user to be idle."""
     ancestor_candidates = (
@@ -131,6 +132,8 @@ def wait_until_quiet(
     process_lineage_links: list[dict[str, object]] = []
     while True:
         now = datetime.now(timezone.utc)
+        if session is not None:
+            session.poll(check_user_idle=False)
         admission_notice = ""
         hidden = (
             getattr(dashboard.state, "hidden_paths", None)
@@ -158,11 +161,30 @@ def wait_until_quiet(
         )
         age = activity_module._activity_age(now, freshest) if freshest else None
         sessions_quiet = age is None or age >= cfg.idle_seconds
-        idle = (
-            power_module.user_idle_seconds()
-            if sessions_quiet and cfg.user_idle_seconds > 0
-            else (0.0 if cfg.user_idle_seconds == 0 else None)
-        )
+        if not sessions_quiet:
+            idle = None if cfg.user_idle_seconds > 0 else 0.0
+        elif cfg.user_idle_seconds == 0:
+            idle = 0.0
+        else:
+            if session is None:
+                raise models_module.PresenceCheckError(
+                    "power session is required for the user-idle gate"
+                )
+            observation = session.poll(check_user_idle=True).idle
+            if observation.kind is IdleKind.UNKNOWN:
+                raise models_module.PresenceCheckError(
+                    f"user-idle state is unavailable ({observation.source})"
+                )
+            if observation.kind is IdleKind.DISABLED:
+                idle = 0.0
+            elif observation.kind is IdleKind.READY:
+                idle = (
+                    observation.seconds
+                    if observation.seconds is not None
+                    else cfg.user_idle_seconds
+                )
+            else:
+                idle = observation.seconds if observation.seconds is not None else 0.0
         user_quiet = cfg.user_idle_seconds == 0 or (
             idle is not None and idle >= cfg.user_idle_seconds
         )
@@ -226,49 +248,54 @@ def _run_watch_phase(
     watch_set: list[models_module.ActivityFile],
     dashboard: dashboard_module.TerminalDashboard | None,
     display_items: list[models_module.ActivityFile] | None = None,
-) -> tuple[subprocess.Popen | None, int, tuple[int, str, tuple[object, ...]]]:
+) -> tuple[power_module.PowerSession | None, int, tuple[int, str, tuple[object, ...]]]:
     """Start the wake assertion and run the loop without performing cleanup or logging."""
     try:
-        process = power_module.block_sleep()
+        session = power_module.open_session(
+            PowerPolicy(
+                user_idle_seconds=cfg.user_idle_seconds,
+                dry_run=cfg.dry_run,
+            )
+        )
     except KeyboardInterrupt:
         return None, 130, (
             logging.INFO,
-            "interrupted while starting caffeinate; exiting without sleeping",
+            "interrupted while starting wake assertion; exiting without sleeping",
             (),
         )
-    except OSError as exc:
+    except (OSError, models_module.PowerCommandError) as exc:
         return None, 1, (
             logging.ERROR,
-            "unable to start caffeinate; exiting without sleeping: %s",
+            "unable to start wake assertion; exiting without sleeping: %s",
             (exc,),
         )
 
     try:
         if dashboard is None:
-            wait_until_quiet(cfg, watch_set)
+            wait_until_quiet(cfg, watch_set, session=session)
         else:
-            wait_until_quiet(cfg, watch_set, dashboard, display_items)
+            wait_until_quiet(cfg, watch_set, dashboard, display_items, session=session)
     except KeyboardInterrupt:
-        return process, 130, (
+        return session, 130, (
             logging.INFO,
             "interrupted; wake assertion released without sleeping",
             (),
         )
     except models_module.WatchdogError as exc:
-        return process, 1, (
+        return session, 1, (
             logging.ERROR,
             "watch aborted because activity state is uncertain; wake assertion "
             "released and sleep skipped: %s",
             (exc,),
         )
     except Exception as exc:
-        return process, 1, (
+        return session, 1, (
             logging.ERROR,
             "watch aborted after an unexpected display/runtime error; wake assertion "
             "released and sleep skipped: %s",
             (exc,),
         )
-    return process, 0, (
+    return session, 0, (
         logging.INFO,
         "all guards satisfied; wake assertion released%s",
         ("; dry-run sleep decision follows" if cfg.dry_run else "; sleeping Mac",),
@@ -276,29 +303,29 @@ def _run_watch_phase(
 
 
 def _release_watch_process(
-    process: subprocess.Popen | None,
+    session: power_module.PowerSession | None,
     status: int,
     record: tuple[int, str, tuple[object, ...]],
 ) -> tuple[int, tuple[int, str, tuple[object, ...]]]:
     """Release an owned wake assertion after terminal state has been restored."""
-    if process is None:
+    if session is None:
         return status, record
     try:
-        power_module._stop_caffeinate(process)
+        session.close()
     except KeyboardInterrupt:
         try:
-            power_module._stop_caffeinate(process)
+            session.close()
         except BaseException:
             pass
         return 130, (
             logging.INFO,
-            "interrupted while releasing caffeinate; exiting without sleeping",
+            "interrupted while releasing wake assertion; exiting without sleeping",
             (),
         )
     except Exception as exc:
         return 1, (
             logging.ERROR,
-            "unable to release caffeinate cleanly; exiting without sleeping: %s",
+            "unable to release wake assertion cleanly; exiting without sleeping: %s",
             (exc,),
         )
     return status, record
@@ -359,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
 
     display_mode = dashboard_module.resolve_display(cfg.display)
     finished_dashboard = None
-    process = None
+    session = None
     status = 1
     record: tuple[int, str, tuple[object, ...]] = (
         logging.ERROR,
@@ -370,7 +397,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with dashboard_module.dashboard_context(cfg) as dashboard:
                 finished_dashboard = dashboard
-                process, status, record = _run_watch_phase(
+                session, status, record = _run_watch_phase(
                     cfg, watch_set, dashboard, candidates
                 )
         except KeyboardInterrupt:
@@ -380,10 +407,10 @@ def main(argv: list[str] | None = None) -> int:
                 (),
             )
         except models_module.WatchdogError as exc:
-            if cfg.display == "auto" and process is None and not isinstance(exc, models_module.TerminalRestoreError):
+            if cfg.display == "auto" and session is None and not isinstance(exc, models_module.TerminalRestoreError):
                 models_module.log.warning("%s; continuing with log display", exc)
-                process, status, record = _run_watch_phase(cfg, watch_set, None)
-            elif process is not None:
+                session, status, record = _run_watch_phase(cfg, watch_set, None)
+            elif session is not None:
                 status, record = 1, (
                     logging.ERROR,
                     "dashboard teardown failed; wake assertion released and sleep skipped: %s",
@@ -395,9 +422,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if cfg.display == "auto":
             models_module.log.info("interactive dashboard unavailable on this terminal; using log display")
-        process, status, record = _run_watch_phase(cfg, watch_set, None)
+        session, status, record = _run_watch_phase(cfg, watch_set, None)
 
-    status, record = _release_watch_process(process, status, record)
+    status, record = _release_watch_process(session, status, record)
     if finished_dashboard is not None:
         try:
             reporting_module.emit_exit_report(finished_dashboard.history, cfg, status, record[1] % record[2])
@@ -412,7 +439,9 @@ def main(argv: list[str] | None = None) -> int:
         return status
 
     try:
-        power_module.force_sleep(cfg.dry_run)
+        if session is None:
+            return 1
+        session.request_suspend()
     except models_module.WatchdogError as exc:
         models_module.log.error("sleep command failed: %s", exc)
         return 1

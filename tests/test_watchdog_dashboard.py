@@ -1401,20 +1401,20 @@ class DashboardLifecycleTests(unittest.TestCase):
                 cfg = wd_models.Config(display='dashboard', dry_run=True)
                 curses = mock.Mock()
                 curses.initscr.return_value = FakeScreen()
-                item, process, patches = self._main_patches(cfg, curses)
+                item, session, patches = self._main_patches(cfg, curses)
                 if failure == 'endwin':
                     curses.endwin.side_effect = OSError('restore failed')
                 else:
-                    process.terminate.side_effect = PermissionError('release denied')
+                    session.close.side_effect = PermissionError('release denied')
                 output = io.StringIO()
                 with ExitStack() as stack:
                     mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
                     stack.enter_context(mock.patch.object(sys, 'stdout', output))
                     self.assertEqual(wd_app.main([]), 1)
-                mocks['force_sleep'].assert_not_called()
+                session.request_suspend.assert_not_called()
                 self.assertIn('ERROR', output.getvalue())
                 self.assertNotIn('SLEEP READY', output.getvalue())
-                process.terminate.assert_called_once()
+                session.close.assert_called_once()
 
     def test_failed_restore_during_initialization_cannot_fall_back_to_sleep(self):
         cfg = wd_models.Config(display='auto', dry_run=True)
@@ -1422,12 +1422,12 @@ class DashboardLifecycleTests(unittest.TestCase):
         curses.initscr.return_value = FakeScreen()
         curses.noecho.side_effect = OSError('init failed')
         curses.endwin.side_effect = OSError('restore failed')
-        item, process, patches = self._main_patches(cfg, curses)
+        item, session, patches = self._main_patches(cfg, curses)
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
             self.assertEqual(wd_app.main([]), 1)
-        mocks['block_sleep'].assert_not_called()
-        mocks['force_sleep'].assert_not_called()
+        mocks['open_session'].assert_not_called()
+        session.request_suspend.assert_not_called()
 
     def test_exit_report_is_flushed_after_terminal_restore_and_before_sleep(self):
         cfg = wd_models.Config(display='dashboard', dry_run=True)
@@ -1436,21 +1436,21 @@ class DashboardLifecycleTests(unittest.TestCase):
         observed = []
         output = io.StringIO()
         output.flush = lambda: observed.append('flush')
-        def poll(cfg, watch_set, dashboard, display_items):
+        def poll(cfg, watch_set, dashboard, display_items=None, **kwargs):
             dashboard.history.observe(_snapshot())
-        item, process, patches = self._main_patches(cfg, curses,
+        item, session, patches = self._main_patches(cfg, curses,
             wait_until_quiet=mock.patch.object(wd_app, 'wait_until_quiet', side_effect=poll))
         curses.endwin.side_effect = lambda: observed.append('restored')
-        process.terminate.side_effect = lambda: observed.append('released')
+        session.close.side_effect = lambda: observed.append('released')
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
             stack.enter_context(mock.patch.object(sys, 'stdout', output))
-            def sleep(dry):
+            def sleep():
                 self.assertIn('RUN REPORT', output.getvalue())
                 self.assertEqual(observed[:3], ['restored', 'released', 'flush'])
-            mocks['force_sleep'].side_effect = sleep
+            session.request_suspend.side_effect = sleep
             self.assertEqual(wd_app.main([]), 0)
-        mocks['force_sleep'].assert_called_once_with(True)
+        session.request_suspend.assert_called_once_with()
 
     def test_report_output_failure_cannot_skip_cleanup_or_request_sleep(self):
         cfg = wd_models.Config(display='dashboard', dry_run=True)
@@ -1459,23 +1459,21 @@ class DashboardLifecycleTests(unittest.TestCase):
         output = mock.Mock()
         output.isatty.return_value = False
         output.write.side_effect = OSError('output unavailable')
-        def poll(cfg, watch_set, dashboard, display_items):
+        def poll(cfg, watch_set, dashboard, display_items=None, **kwargs):
             dashboard.history.observe(_snapshot())
-        item, process, patches = self._main_patches(cfg, curses,
+        item, session, patches = self._main_patches(cfg, curses,
             wait_until_quiet=mock.patch.object(wd_app, 'wait_until_quiet', side_effect=poll))
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
             stack.enter_context(mock.patch.object(sys, 'stdout', output))
             self.assertEqual(wd_app.main([]), 1)
-        process.terminate.assert_called_once()
+        session.close.assert_called_once()
         curses.endwin.assert_called_once()
-        mocks['force_sleep'].assert_not_called()
+        session.request_suspend.assert_not_called()
 
     def _main_patches(self, cfg, curses, **extra):
         item = _item()
-        process = mock.Mock()
-        process.poll.return_value = None
-        process.wait.return_value = 0
+        session = mock.Mock()
         patches = {
             "parse_args": mock.patch.object(wd_config, "parse_args", return_value=cfg),
             "setup_logging": mock.patch.object(wd_app, "setup_logging"),
@@ -1483,19 +1481,16 @@ class DashboardLifecycleTests(unittest.TestCase):
             "select_watch_set": mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
             "resolve_display": mock.patch.object(wd_dashboard, "resolve_display", return_value="dashboard"),
             "_import_curses": mock.patch.object(wd_dashboard, "_import_curses", return_value=curses),
-            "block_sleep": mock.patch.object(wd_power, "block_sleep", return_value=process),
+            "open_session": mock.patch.object(wd_power, "open_session", return_value=session),
             "wait_until_quiet": mock.patch.object(wd_app, "wait_until_quiet"),
-            "force_sleep": mock.patch.object(wd_power, "force_sleep"),
         }
         patches.update(extra)
-        return item, process, patches
+        return item, session, patches
 
     def test_auto_falls_back_when_lazy_curses_import_fails(self):
         cfg = wd_models.Config(display="auto", dry_run=True)
         item = _item()
-        process = mock.Mock()
-        process.poll.return_value = None
-        process.wait.return_value = 0
+        session = mock.Mock()
         with (
             mock.patch.object(wd_config, "parse_args", return_value=cfg),
             mock.patch.object(wd_app, "setup_logging"),
@@ -1503,12 +1498,12 @@ class DashboardLifecycleTests(unittest.TestCase):
             mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
             mock.patch.object(wd_dashboard, "resolve_display", return_value="dashboard"),
             mock.patch.object(wd_dashboard, "_import_curses", side_effect=ImportError("no curses")),
-            mock.patch.object(wd_power, "block_sleep", return_value=process),
+            mock.patch.object(wd_power, "open_session", return_value=session),
             mock.patch.object(wd_app, "wait_until_quiet") as wait,
-            mock.patch.object(wd_power, "force_sleep"),
         ):
             self.assertEqual(wd_app.main([]), 0)
-        wait.assert_called_once_with(cfg, [item])
+        self.assertEqual(wait.call_args.args[:2], (cfg, [item]))
+        self.assertIs(wait.call_args.kwargs["session"], session)
 
     def test_explicit_dashboard_import_failure_never_starts_hold(self):
         cfg = wd_models.Config(display="dashboard", dry_run=True)
@@ -1520,20 +1515,18 @@ class DashboardLifecycleTests(unittest.TestCase):
             mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
             mock.patch.object(wd_dashboard, "resolve_display", return_value="dashboard"),
             mock.patch.object(wd_dashboard, "_import_curses", side_effect=ImportError("no curses")),
-            mock.patch.object(wd_power, "block_sleep") as block,
+            mock.patch.object(wd_power, "open_session") as opened,
             mock.patch.object(wd_app, "wait_until_quiet") as wait,
-            mock.patch.object(wd_power, "force_sleep") as sleep,
         ):
             self.assertEqual(wd_app.main([]), 1)
-        block.assert_not_called()
+        opened.assert_not_called()
         wait.assert_not_called()
-        sleep.assert_not_called()
 
     def test_main_passes_yielded_dashboard_to_watch_loop(self):
         cfg = wd_models.Config(display="dashboard", dry_run=True)
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
-        item, process, patches = self._main_patches(cfg, curses)
+        item, session, patches = self._main_patches(cfg, curses)
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
             self.assertEqual(wd_app.main([]), 0)
@@ -1541,13 +1534,13 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertEqual(args[:2], (cfg, [item]))
         self.assertIsInstance(args[2], wd_dashboard.TerminalDashboard)
         curses.endwin.assert_called_once_with()
-        process.terminate.assert_called_once_with()
+        session.close.assert_called_once_with()
 
     def test_main_gives_dashboard_all_candidates_without_watching_quiet_one(self):
         cfg = wd_models.Config(display="dashboard", dry_run=True)
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
-        watched, process, patches = self._main_patches(cfg, curses)
+        watched, session, patches = self._main_patches(cfg, curses)
         quiet = _item("synthetic-quiet.jsonl")
         patches["activity_files"] = mock.patch.object(
             wd_activity, "activity_files", return_value=[watched, quiet]
@@ -1563,15 +1556,15 @@ class DashboardLifecycleTests(unittest.TestCase):
         args = mocks["wait_until_quiet"].call_args.args
         self.assertEqual(args[:2], (cfg, [watched]))
         self.assertEqual(args[3], [watched, quiet])
-        process.terminate.assert_called_once_with()
+        session.close.assert_called_once_with()
 
     def test_block_sleep_interrupt_restores_dashboard(self):
         cfg = wd_models.Config(display="dashboard")
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
-        item, process, patches = self._main_patches(
+        item, session, patches = self._main_patches(
             cfg, curses,
-            block_sleep=mock.patch.object(wd_power, "block_sleep", side_effect=KeyboardInterrupt),
+            open_session=mock.patch.object(wd_power, "open_session", side_effect=KeyboardInterrupt),
         )
         with ExitStack() as stack:
             for patch in patches.values():
@@ -1585,14 +1578,12 @@ class DashboardLifecycleTests(unittest.TestCase):
         curses.initscr.return_value = FakeScreen()
         restored = []
 
-        def interrupted_cleanup(process):
+        def interrupted_cleanup():
             restored.append(curses.endwin.called)
             raise KeyboardInterrupt
 
-        item, process, patches = self._main_patches(
-            cfg, curses,
-            _stop_caffeinate=mock.patch.object(wd_power, "_stop_caffeinate", side_effect=interrupted_cleanup),
-        )
+        item, session, patches = self._main_patches(cfg, curses)
+        session.close.side_effect = interrupted_cleanup
         with ExitStack() as stack:
             for patch in patches.values():
                 stack.enter_context(patch)
@@ -1610,28 +1601,28 @@ class DashboardLifecycleTests(unittest.TestCase):
             mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
             mock.patch.object(wd_dashboard, "resolve_display", return_value="dashboard"),
             mock.patch.object(wd_dashboard, "_import_curses", side_effect=KeyboardInterrupt),
-            mock.patch.object(wd_power, "block_sleep") as block,
+            mock.patch.object(wd_power, "open_session") as opened,
         ):
             self.assertEqual(wd_app.main([]), 130)
-        block.assert_not_called()
+        opened.assert_not_called()
 
     def test_dashboard_exit_interrupt_releases_existing_hold_without_rerun(self):
         cfg = wd_models.Config(display="auto")
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
         curses.endwin.side_effect = KeyboardInterrupt
-        item, process, patches = self._main_patches(cfg, curses)
+        item, session, patches = self._main_patches(cfg, curses)
         with ExitStack() as stack:
             mocks = {name: stack.enter_context(patch) for name, patch in patches.items()}
             self.assertEqual(wd_app.main([]), 130)
-        mocks["block_sleep"].assert_called_once_with()
-        process.terminate.assert_called_once()
+        mocks["open_session"].assert_called_once()
+        session.close.assert_called_once()
 
     def test_unexpected_display_failure_restores_and_aborts_without_sleep(self):
         cfg = wd_models.Config(display="dashboard")
         curses = mock.Mock()
         curses.initscr.return_value = FakeScreen()
-        item, process, patches = self._main_patches(
+        item, session, patches = self._main_patches(
             cfg, curses,
             wait_until_quiet=mock.patch.object(wd_app, "wait_until_quiet", side_effect=RuntimeError("render broke")),
         )
@@ -1640,9 +1631,9 @@ class DashboardLifecycleTests(unittest.TestCase):
             with self.assertLogs(wd_models.log, level="ERROR") as captured:
                 self.assertEqual(wd_app.main([]), 1)
         curses.endwin.assert_called_once_with()
-        process.terminate.assert_called_once_with()
-        mocks["block_sleep"].assert_called_once_with()
-        mocks["force_sleep"].assert_not_called()
+        session.close.assert_called_once_with()
+        mocks["open_session"].assert_called_once()
+        session.request_suspend.assert_not_called()
         self.assertTrue(any("render broke" in line for line in captured.output))
 
 

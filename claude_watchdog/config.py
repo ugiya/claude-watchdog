@@ -195,7 +195,7 @@ def parse_args(argv: list[str] | None = None) -> models_module.Config:
     parser = argparse.ArgumentParser(
         prog="claude-watchdog",
         description=(
-            "Keep the Mac awake while Claude Code, Codex, OMX, or "
+            "Keep the machine awake while Claude Code, Codex, OMX, or "
             "OpenCode works, then sleep."
         )
     )

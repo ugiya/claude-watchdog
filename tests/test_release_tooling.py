@@ -31,7 +31,9 @@ release = _load("watchdog_release", ROOT / "scripts" / "build_release.py")
 RUNTIME_FILES = (
     "__init__.py", "__main__.py", "models.py", "text.py", "presentation.py",
     "config.py", "activity.py", "process_lineage.py", "metadata.py", "dashboard.py",
-    "reporting.py", "power.py", "app.py",
+    "reporting.py", "power/__init__.py", "power/_types.py", "power/_contracts.py",
+    "power/_selection.py", "power/_session.py", "power/_adapters/__init__.py",
+    "power/_adapters/macos.py", "power/_adapters/logind.py", "app.py",
 )
 
 
@@ -49,6 +51,7 @@ class InstallerTests(unittest.TestCase):
         )
         for name in RUNTIME_FILES:
             path = package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
             if not path.exists():
                 path.write_text(f"# {name}\n", encoding="utf-8")
         (root / "VERSION").write_text("0.1.0\n", encoding="utf-8")
@@ -176,7 +179,7 @@ class InstallerTests(unittest.TestCase):
                 manifest_path = prefix / "share" / "claude-watchdog" / "install-manifest.json"
                 installed_before = destination.read_bytes()
                 manifest_before = manifest_path.read_bytes()
-                power = project / "claude_watchdog" / "power.py"
+                power = project / "claude_watchdog" / "power" / "__init__.py"
                 if failure == "missing file":
                     power.unlink()
                 elif failure == "symlink file":
@@ -212,7 +215,9 @@ class ReleaseBuilderTests(unittest.TestCase):
         package.mkdir()
         for name in RUNTIME_FILES:
             value = 'VERSION = "0.1.0"\n' if name == "__init__.py" else f"# {name}\n"
-            (package / name).write_text(value, encoding="utf-8")
+            path = package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value, encoding="utf-8")
         (root / "README.md").write_text("public\n", encoding="utf-8")
         (root / "tests" / "test_release_tooling.py").write_text("pass\n", encoding="utf-8")
         (root / "scripts" / "install.py").write_text("pass\n", encoding="utf-8")
@@ -281,7 +286,7 @@ class ReleaseBuilderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.make_project(root)
-            power = root / "claude_watchdog" / "power.py"
+            power = root / "claude_watchdog" / "power" / "__init__.py"
             power.unlink()
             with self.assertRaisesRegex(release.ReleaseError, "missing required runtime file"):
                 release.build_release(root, root / "out")

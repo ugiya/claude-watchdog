@@ -114,11 +114,11 @@ class ActivityReadError(WatchdogError):
 
 
 class PresenceCheckError(WatchdogError):
-    """The macOS user-idle state could not be determined."""
+    """The user-idle state could not be determined."""
 
 
 class PowerCommandError(WatchdogError):
-    """A macOS power command failed."""
+    """A power command failed."""
 
 
 class TerminalRestoreError(WatchdogError):
