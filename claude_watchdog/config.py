@@ -172,6 +172,15 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _hide_path(value: str) -> Path:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("hide path must be a non-empty path")
+    try:
+        return Path(value).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"unable to resolve hide path {value!r}: {exc}") from exc
+
+
 def _nonnegative_float(value: str) -> float:
     try:
         parsed = float(value)
@@ -270,6 +279,17 @@ def parse_args(argv: list[str] | None = None) -> models_module.Config:
             "sanitized last-prompt fallback (default: prompt)"
         ),
     )
+    parser.add_argument(
+        "--hide",
+        action="append",
+        type=_hide_path,
+        default=[],
+        metavar="PATH",
+        help=(
+            "dismiss this activity file from this run's watch set; repeatable. "
+            "Live discovery will not re-admit it"
+        ),
+    )
     args = parser.parse_args(argv)
     explicit_profiles_file = args.profiles_file is not None
     source_names = _source_names(args.source)
@@ -305,4 +325,5 @@ def parse_args(argv: list[str] | None = None) -> models_module.Config:
         task_label=args.task_label,
         claude_profiles=profiles,
         profiles_file=profiles_file,
+        hidden_paths=frozenset(args.hide),
     )

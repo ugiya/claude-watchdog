@@ -132,6 +132,16 @@ def wait_until_quiet(
     while True:
         now = datetime.now(timezone.utc)
         admission_notice = ""
+        hidden = (
+            getattr(dashboard.state, "hidden_paths", None)
+            if dashboard is not None else None
+        )
+        if isinstance(hidden, (set, frozenset, list, tuple)) and hidden:
+            cfg.hidden_paths = cfg.hidden_paths | frozenset(
+                activity_module.hidden_path_key(path)
+                for path in hidden
+            )
+        watch_set = activity_module.drop_hidden_targets(cfg, watch_set)
         if cfg.session_discovery == "live":
             previous = watch_set
             watch_set = activity_module.refresh_watch_set(cfg, previous, now=now)

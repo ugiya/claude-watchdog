@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Dismiss a watch target for the current run with dashboard `h` or repeatable
+  `--hide PATH`. Live discovery does not re-admit it; restart without `--hide`
+  to watch it again. This does not detect process liveness.
+
 ### Fixed
 
 - Restore a display-only Claude child edge when OMX did not persist one by

@@ -870,6 +870,32 @@ class LiveSessionAdmissionTests(unittest.TestCase):
             self.assertEqual(refreshed, [first, second])
             self.assertEqual(repeated, [first, second])
 
+    def test_hidden_path_is_not_selected_or_readmitted(self):
+        now = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kept_path = root / "rollout-kept.jsonl"
+            hidden_path = root / "rollout-hidden.jsonl"
+            _write_records(kept_path, {"timestamp": now.isoformat()})
+            _write_records(hidden_path, {"timestamp": now.isoformat()})
+            kept = _item(kept_path)
+            hidden = _item(hidden_path)
+            cfg = wd_models.Config(
+                source="codex",
+                select_window_seconds=120,
+                hidden_paths=frozenset({hidden_path.resolve()}),
+            )
+
+            selected = wd_activity.select_watch_set(
+                cfg, [kept, hidden], now=now
+            )
+            refreshed = wd_activity.refresh_watch_set(
+                cfg, [kept, hidden], candidates=[kept, hidden], now=now
+            )
+
+            self.assertEqual([item.path for item in selected], [kept_path])
+            self.assertEqual([item.path for item in refreshed], [kept_path])
+
     def test_refresh_filters_injected_candidates_to_configured_source(self):
         now = datetime(2026, 9, 5, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as tmp:
@@ -1294,6 +1320,19 @@ class CliAndLifecycleTests(unittest.TestCase):
         with mock.patch("sys.stderr", new=io.StringIO()):
             with self.assertRaises(SystemExit) as raised:
                 wd_config.parse_args(["--session-discovery", "unknown"])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_hide_cli_accepts_repeatable_resolved_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = (root / "one.jsonl").resolve()
+            second = (root / "sub" / "two.jsonl").resolve()
+            cfg = wd_config.parse_args(["--hide", str(first), "--hide", str(second)])
+            self.assertEqual(cfg.hidden_paths, frozenset({first, second}))
+        self.assertEqual(wd_config.parse_args([]).hidden_paths, frozenset())
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                wd_config.parse_args(["--hide"])
         self.assertEqual(raised.exception.code, 2)
 
     def test_cli_compatibility_and_source_option(self):

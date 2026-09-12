@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -168,6 +168,7 @@ class Config:
     task_label: str = "prompt"
     claude_profiles: tuple[ClaudeProfile, ...] = ()
     profiles_file: Path | None = None
+    hidden_paths: frozenset[Path] = frozenset()
 
     @property
     def idle_seconds(self) -> float:
@@ -263,3 +264,4 @@ class DashboardState:
     filter_input: bool = False
     query_before_edit: str = ""
     tree: bool = True
+    hidden_paths: set[Path] = field(default_factory=set)
