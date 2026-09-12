@@ -16,6 +16,8 @@ sleep request.
 - Do not equate recent persisted activity with a running process in code, tests,
   documentation, or messages.
 - Filters, sorting, colors, details, and tree layout are display-only.
+- Dashboard `h` and `--hide PATH` dismiss a target from this run's watch set;
+  they do not detect process liveness.
 - Never invoke real `pmset sleepnow` during automated tests, smoke checks, or
   demos.
 - Do not use private transcripts, session IDs, usernames, project names, or

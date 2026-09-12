@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import activity as activity_module
 from . import metadata as metadata_module
@@ -469,6 +470,10 @@ def handle_dashboard_key(state: models_module.DashboardState, key: int | str, ro
         state.sort = models_module.SORT_CHOICES[(models_module.SORT_CHOICES.index(state.sort) + 1) % len(models_module.SORT_CHOICES)]
     elif code == ord("t"):
         state.tree = not state.tree
+    elif code == ord("h"):
+        if state.selected_key is not None:
+            state.hidden_paths.add(Path(state.selected_key[1]))
+            return "hide"
     elif code == ord("c"):
         state.query = ""
         state.source_filter = None
@@ -687,7 +692,7 @@ class TerminalDashboard:
         prompt = (
             f"filter: {self.state.query}_"
             if self.state.filter_input else
-            "q exit safely  / filter  p/f provider  s sort  t tree/flat  ↑↓/jk move  Enter details  c clear"
+            "q exit safely  / filter  p/f provider  s sort  t tree/flat  ↑↓/jk move  Enter details  h hide  c clear"
         )
         self._put(footer_y, prompt)
         provider = self.state.source_filter or "all"
@@ -703,7 +708,7 @@ class TerminalDashboard:
         except Exception:
             pass
 
-    def process_input(self) -> None:
+    def process_input(self) -> str | None:
         get_wch = getattr(self.screen, "get_wch", None)
         try:
             key = get_wch() if get_wch is not None else self.screen.getch()
@@ -714,9 +719,10 @@ class TerminalDashboard:
             else:
                 raise
         rows = self._visible_rows()
-        handle_dashboard_key(self.state, key, len(rows))
+        action = handle_dashboard_key(self.state, key, len(rows))
         if self.snapshot is not None and key != -1:
             self.update(self.snapshot)
+        return action
 
     def wait(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds
@@ -725,7 +731,8 @@ class TerminalDashboard:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
-            self.process_input()
+            if self.process_input() == "hide":
+                return
             second = int(remaining)
             if self.snapshot is not None and second != last_second:
                 self.update(replace(self.snapshot, next_poll_seconds=remaining, now=datetime.now(timezone.utc)))

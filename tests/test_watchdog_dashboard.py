@@ -777,6 +777,17 @@ class DashboardControllerTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             wd_dashboard.handle_dashboard_key(state, ord("q"), 4)
 
+    def test_h_hides_selected_target_and_clear_does_not_restore_it(self):
+        path = Path("/tmp/claude-watchdog-hide-session.jsonl")
+        state = wd_models.DashboardState(selected_key=("claude", str(path)))
+        self.assertEqual(wd_dashboard.handle_dashboard_key(state, ord("h"), 1), "hide")
+        self.assertEqual(state.hidden_paths, {path})
+        wd_dashboard.handle_dashboard_key(state, ord("c"), 1)
+        self.assertEqual(state.hidden_paths, {path})
+        idle = wd_models.DashboardState()
+        self.assertIsNone(wd_dashboard.handle_dashboard_key(idle, ord("h"), 0))
+        self.assertEqual(idle.hidden_paths, set())
+
     def test_selection_is_retained_by_stable_target_key(self):
         a, b = _item("a.jsonl"), _item("b.jsonl")
         state = wd_models.DashboardState(selected_key=wd_metadata.target_key(b))

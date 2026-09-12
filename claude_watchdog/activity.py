@@ -420,6 +420,24 @@ def _freeze_omx_item(item: models_module.ActivityFile, cfg: models_module.Config
     )
 
 
+def hidden_path_key(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return path
+
+
+def is_hidden_path(cfg: models_module.Config, path: Path) -> bool:
+    return hidden_path_key(path) in cfg.hidden_paths
+
+
+def drop_hidden_targets(
+    cfg: models_module.Config,
+    items: Iterable[models_module.ActivityFile],
+) -> list[models_module.ActivityFile]:
+    return [item for item in items if not is_hidden_path(cfg, item.path)]
+
+
 def select_watch_set(
     cfg: models_module.Config,
     candidates: Iterable[models_module.ActivityFile] | None = None,
@@ -439,6 +457,8 @@ def select_watch_set(
     watch: list[models_module.ActivityFile] = []
 
     for item in candidates:
+        if is_hidden_path(cfg, item.path):
+            continue
         if item.source == "opencode":
             frozen_item = _freeze_opencode_item(item, cfg, now)
             if frozen_item is not None:
@@ -491,7 +511,7 @@ def refresh_watch_set(
     except Exception as exc:
         raise models_module.WatchdogError(f"unable to refresh activity targets: {exc}") from exc
 
-    proposed = list(current)
+    proposed = drop_hidden_targets(cfg, current)
     index = {
         (item.source, item.path): position
         for position, item in enumerate(proposed)

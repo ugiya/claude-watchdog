@@ -7,6 +7,20 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-12
+
+Prerelease. Sleep guards still use persisted activity timestamps, not process
+liveness. A killed session can keep holding until its JSONL ages out; `h` and
+`--hide` are an explicit this-run dismiss, not a liveness detector.
+
+### Added
+
+- Dismiss a watch target for the current run with dashboard `h` or repeatable
+  `--hide PATH`. The row leaves the watch set, live discovery will not re-admit
+  it, and it no longer blocks sleep. `c` does not undo hide. Restart without
+  `--hide` to watch it again if the file is still inside the 15-minute select
+  window.
+
 ### Fixed
 
 - Restore a display-only Claude child edge when OMX did not persist one by

@@ -133,6 +133,9 @@ claude-watchdog --session-discovery frozen --display log --dry-run
 
 # Avoid using Claude's last prompt as a fallback dashboard label.
 claude-watchdog --task-label metadata --dry-run
+
+# Dismiss a transcript from this run so it cannot block sleep.
+claude-watchdog --hide /path/to/session.jsonl --dry-run
 ```
 
 Run `claude-watchdog --help` for every option.
@@ -147,11 +150,15 @@ Run `claude-watchdog --help` for every option.
 | `s` | Cycle recent, title, and source sorting |
 | `t` | Toggle tree and flat presentation |
 | `Enter` | Toggle details for the selected row |
+| `h` | Dismiss the selected target from this run |
 | `c` | Clear text and provider filters |
 | `q`, `Ctrl-C` | Exit safely without requesting sleep |
 
-Filters, sorting, and tree presentation change only the display. Hidden rows
-remain in the watch set and continue to affect the sleep decision.
+Filters, sorting, and tree presentation change only the display. Filtered-out
+rows remain in the watch set and continue to affect the sleep decision.
+`h` and `--hide PATH` dismiss a target from this run: the row is removed, live
+discovery will not re-admit it, and it no longer blocks sleep. Restart without
+`--hide` to watch it again if its JSONL is still inside the select window.
 Conversely, tree-only ancestor rows are descriptive: they never join the watch
 set, increase holding counts, or delay the sleep decision.
 
@@ -310,7 +317,9 @@ sanitized to remove control characters, but sanitization is not anonymization.
 
 ## Project status
 
-`v0.1.1` is an experimental public prerelease. The repository has regression
+`v0.1.2` is an experimental public prerelease. Dashboard `h` and `--hide PATH`
+dismiss a watch target for the current run only; recency is still not process
+liveness. The repository has regression
 coverage for parsers, watch-set scoping, power-command ordering, dashboard
 rendering, and isolated lifecycle behavior. That coverage does not establish
 compatibility with every agent release or prove real-world sleep behavior on
