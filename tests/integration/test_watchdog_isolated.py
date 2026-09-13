@@ -116,7 +116,12 @@ def _owned_caffeinate_command(pid: int, watchdog_pid: int) -> tuple[bool, str]:
         value == "-w" and index + 1 < len(argv) and argv[index + 1] == str(watchdog_pid)
         for index, value in enumerate(argv)
     )
-    return bool(argv and argv[0] == "/usr/bin/caffeinate" and owns_watchdog), command
+    is_caffeinate = bool(argv) and (
+        argv[0] == "/usr/bin/caffeinate"
+        or argv[0].endswith("/caffeinate")
+        or (len(argv) >= 2 and argv[0].endswith("/sh") and argv[1].endswith("/caffeinate"))
+    )
+    return bool(is_caffeinate and owns_watchdog), command
 
 
 class _RunningWatchdog:
