@@ -7,12 +7,19 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-13
+
+Prerelease. Sleep guards still use persisted activity timestamps, not process
+liveness. Keep-awake, human idle, and suspend now go through one power session
+that selects private adapters.
+
 ### Added
 
-- A platform-neutral `power` session that selects macOS or systemd-logind
-  adapters for keep-awake, human idle, and suspend. Linux suspend is requested
-  without sudo; human-idle detection is unavailable unless the session reports
-  it or `--user-idle-minutes 0` disables that gate.
+- A platform-neutral `power` session. macOS keeps `caffeinate`, HID idle, and
+  `pmset sleepnow`. systemd Linux uses `systemd-inhibit` and `systemctl
+  --no-ask-password --check-inhibitors=yes suspend` without sudo. Human-idle
+  detection on Linux uses session idle hints when available; otherwise that
+  gate is unavailable unless `--user-idle-minutes 0`.
 
 ## [0.1.2] - 2026-09-12
 
