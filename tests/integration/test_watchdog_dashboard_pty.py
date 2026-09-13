@@ -3,7 +3,7 @@
 
 The suite creates synthetic Codex rollouts and metadata under a temporary home.
 It never reads the caller's sessions, never invokes a real sleep command, and
-signals only the watchdog process it spawned or a recorded caffeinate child
+signals only the watchdog process it spawned or a recorded wake-assertion child
 whose command line proves that it belongs to that watchdog.
 
 Successful and failed runs leave ANSI transcripts plus a compact JSON evidence
@@ -21,6 +21,7 @@ import pty
 import re
 import select
 import shlex
+import shutil
 import signal
 import sqlite3
 import struct
@@ -63,14 +64,6 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
-def _is_caffeinate_argv(argv: list[str]) -> bool:
-    if not argv:
-        return False
-    if argv[0] == "/usr/bin/caffeinate" or argv[0].endswith("/caffeinate"):
-        return True
-    return len(argv) >= 2 and argv[0].endswith("/sh") and argv[1].endswith("/caffeinate")
-
-
 def _process_command(pid: int) -> str:
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "command="],
@@ -81,20 +74,74 @@ def _process_command(pid: int) -> str:
     return result.stdout.strip()
 
 
-def _owned_caffeinate(pid: int, watchdog_pid: int) -> tuple[bool, str]:
-    """Return whether *pid* is caffeinate waiting on our exact watchdog PID."""
+if sys.platform == "darwin":
+    INHIBITOR_SHIM = "caffeinate"
+    INHIBITOR_BINARY = "/usr/bin/caffeinate"
+    SLEEP_SHIMS = ("pmset",)
+    DRY_RUN_SLEEP_LOG = b"[dry-run] would run: pmset sleepnow"
+    # ioreg reports HID idle in nanoseconds; a huge value means "long idle".
+    IDLE_SHIMS = {"ioreg": "printf '%s\\n' '  \"HIDIdleTime\" = 999999999999'\n"}
+elif sys.platform.startswith("linux"):
+    INHIBITOR_SHIM = "systemd-inhibit"
+    INHIBITOR_BINARY = shutil.which("systemd-inhibit") or "/usr/bin/systemd-inhibit"
+    SLEEP_SHIMS = ("systemctl",)
+    DRY_RUN_SLEEP_LOG = (
+        b"[dry-run] would run: systemctl --no-ask-password"
+        b" --check-inhibitors=yes suspend"
+    )
+    # The first presence source is Mutter, which answers in milliseconds.
+    IDLE_SHIMS = {"gdbus": "printf '%s\\n' '(uint64 999999000,)'\n"}
+else:  # pragma: no cover - the checker refuses other platforms first.
+    raise SystemExit(f"integration checks do not support {sys.platform}")
+
+
+def _require_usable_inhibitor() -> None:
+    """Skip cleanly where the platform's inhibitor cannot take a real lock.
+
+    Headless and containerised Linux hosts often have systemd-inhibit installed
+    but no logind to talk to. That is a missing environment, not a defect, so
+    the suite reports and exits successfully instead of failing.
+    """
+    if sys.platform == "darwin":
+        return
+    probe = subprocess.run(
+        [INHIBITOR_BINARY, "--what=idle:sleep", "--who=claude-watchdog",
+         "--why=preflight", "--mode=block", "true"],
+        capture_output=True, text=True, check=False,
+    )
+    if probe.returncode != 0:
+        detail = (probe.stderr or probe.stdout or "").strip()
+        print(
+            f"skipping: {INHIBITOR_BINARY} cannot take a lock on this host"
+            + (f" ({detail[:200]})" if detail else "")
+        )
+        raise SystemExit(0)
+
+
+_require_usable_inhibitor()
+
+
+def _owned_inhibitor(pid: int, watchdog_pid: int) -> tuple[bool, str]:
+    """Return whether *pid* is the wake assertion bound to our watchdog PID."""
     command = _process_command(pid)
     try:
         argv = shlex.split(command)
     except ValueError:
         return False, command
-    waits_on_watchdog = any(
-        arg == "-w"
-        and index + 1 < len(argv)
-        and argv[index + 1] == str(watchdog_pid)
-        for index, arg in enumerate(argv)
-    )
-    return bool(_is_caffeinate_argv(argv) and waits_on_watchdog), command
+    if sys.platform == "darwin":
+        waits_on_watchdog = any(
+            arg == "-w"
+            and index + 1 < len(argv)
+            and argv[index + 1] == str(watchdog_pid)
+            for index, arg in enumerate(argv)
+        )
+    else:
+        waits_on_watchdog = f"(pid {watchdog_pid})" in command
+    return bool(
+        argv
+        and argv[0] == INHIBITOR_BINARY
+        and waits_on_watchdog
+    ), command
 
 
 def _set_pty_size(fd: int, rows: int, columns: int) -> None:
@@ -288,7 +335,7 @@ class _PtyWatchdog:
         process: subprocess.Popen[bytes],
         master_fd: int,
         screen: _AnsiScreen,
-        caffeinate_pid_file: Path,
+        inhibitor_pid_file: Path,
         transcript_path: Path,
         mode: str,
         term: str,
@@ -296,12 +343,12 @@ class _PtyWatchdog:
         self.process = process
         self.master_fd = master_fd
         self.screen = screen
-        self.caffeinate_pid_file = caffeinate_pid_file
+        self.inhibitor_pid_file = inhibitor_pid_file
         self.transcript_path = transcript_path
         self.mode = mode
         self.term = term
         self.transcript = bytearray()
-        self.caffeinate_pid: int | None = None
+        self.inhibitor_pid: int | None = None
         self.closed = False
 
     @property
@@ -365,17 +412,17 @@ class _PtyWatchdog:
         self.screen.resize(rows, columns)
         self.process.send_signal(signal.SIGWINCH)
 
-    def wait_for_caffeinate_pid(self, timeout: float = 3.0) -> int:
+    def wait_for_inhibitor_pid(self, timeout: float = 3.0) -> int:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                pid = int(self.caffeinate_pid_file.read_text(encoding="utf-8").strip())
+                pid = int(self.inhibitor_pid_file.read_text(encoding="utf-8").strip())
             except (FileNotFoundError, OSError, ValueError):
                 time.sleep(0.02)
                 continue
-            self.caffeinate_pid = pid
+            self.inhibitor_pid = pid
             return pid
-        self.fail("caffeinate shim did not record its PID")
+        self.fail(f"{INHIBITOR_SHIM} shim did not record its PID")
 
     def wait(self, timeout: float = WAIT_SECONDS) -> int:
         deadline = time.monotonic() + timeout
@@ -440,7 +487,7 @@ class DashboardPtyTests(unittest.TestCase):
         self.codex_home = self.root / "codex-home"
         self.shims = self.root / "shims"
         self.xdg_data_home = self.root / "xdg-data"
-        self.pmset_attempt_file = self.root / "pmset-attempted"
+        self.sleep_attempt_file = self.root / "sleep-attempted"
         self.running: list[_PtyWatchdog] = []
         for path in (self.home, self.codex_home, self.shims, self.xdg_data_home):
             path.mkdir(parents=True)
@@ -462,47 +509,45 @@ class DashboardPtyTests(unittest.TestCase):
             running.read_available(0)
             running.save_transcript()
             try:
-                self._release_owned_caffeinate(running)
+                self._release_owned_inhibitor(running)
             except AssertionError as exc:
                 errors.append(str(exc))
             running.close()
-        if self.pmset_attempt_file.exists():
+        if self.sleep_attempt_file.exists():
             errors.append(
-                "pmset blocker was invoked: "
-                + self.pmset_attempt_file.read_text(encoding="utf-8", errors="replace")
+                "sleep blocker was invoked: "
+                + self.sleep_attempt_file.read_text(encoding="utf-8", errors="replace")
             )
         self._temporary.cleanup()
         if errors:
             self.fail("; ".join(errors))
 
     def _write_shims(self) -> None:
-        caffeinate = self.shims / "caffeinate"
-        caffeinate.write_text(
+        inhibitor = self.shims / INHIBITOR_SHIM
+        inhibitor.write_text(
             "#!/bin/sh\n"
-            ": \"${WATCHDOG_CAFFEINATE_PID_FILE:?missing PID file}\"\n"
-            "printf '%s\\n' \"$$\" > \"$WATCHDOG_CAFFEINATE_PID_FILE\"\n"
-            "exec /usr/bin/caffeinate \"$@\"\n",
+            ": \"${WATCHDOG_INHIBITOR_PID_FILE:?missing PID file}\"\n"
+            "printf '%s\\n' \"$$\" > \"$WATCHDOG_INHIBITOR_PID_FILE\"\n"
+            f"exec {INHIBITOR_BINARY} \"$@\"\n",
             encoding="utf-8",
         )
-        caffeinate.chmod(0o700)
+        inhibitor.chmod(0o700)
 
-        pmset = self.shims / "pmset"
-        pmset.write_text(
-            "#!/bin/sh\n"
-            ": \"${WATCHDOG_PMSET_ATTEMPT_FILE:?missing sentinel}\"\n"
-            "printf '%s\\n' \"$*\" >> \"$WATCHDOG_PMSET_ATTEMPT_FILE\"\n"
-            "exit 97\n",
-            encoding="utf-8",
-        )
-        pmset.chmod(0o700)
+        for name in SLEEP_SHIMS:
+            blocker = self.shims / name
+            blocker.write_text(
+                "#!/bin/sh\n"
+                ": \"${WATCHDOG_SLEEP_ATTEMPT_FILE:?missing sentinel}\"\n"
+                "printf '%s\\n' \"$*\" >> \"$WATCHDOG_SLEEP_ATTEMPT_FILE\"\n"
+                "exit 97\n",
+                encoding="utf-8",
+            )
+            blocker.chmod(0o700)
 
-        ioreg = self.shims / "ioreg"
-        ioreg.write_text(
-            "#!/bin/sh\n"
-            "printf '%s\\n' '  \"HIDIdleTime\" = 999999999999'\n",
-            encoding="utf-8",
-        )
-        ioreg.chmod(0o700)
+        for name, body in IDLE_SHIMS.items():
+            probe = self.shims / name
+            probe.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+            probe.chmod(0o700)
 
     def _seed_codex_sessions(self) -> None:
         session_dir = self.codex_home / "sessions" / "2026" / "09" / "05"
@@ -634,7 +679,7 @@ class DashboardPtyTests(unittest.TestCase):
         no_color_environment: bool = False,
     ) -> _PtyWatchdog:
         launch_number = len(self.running) + 1
-        pid_file = self.root / f"caffeinate-{launch_number}.pid"
+        pid_file = self.root / f"inhibitor-{launch_number}.pid"
         transcript_path = ARTIFACT_DIR / (
             f"{self._testMethodName}-{launch_number}-{display}-{term}.ansi"
         )
@@ -652,8 +697,8 @@ class DashboardPtyTests(unittest.TestCase):
                 "OPENCODE_DB": str(self.root / "unused-opencode.db"),
                 "PATH": os.pathsep.join((str(self.shims), "/usr/bin", "/bin")),
                 "TERM": term,
-                "WATCHDOG_CAFFEINATE_PID_FILE": str(pid_file),
-                "WATCHDOG_PMSET_ATTEMPT_FILE": str(self.pmset_attempt_file),
+                "WATCHDOG_INHIBITOR_PID_FILE": str(pid_file),
+                "WATCHDOG_SLEEP_ATTEMPT_FILE": str(self.sleep_attempt_file),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "LC_ALL": "C.UTF-8",
             }
@@ -706,17 +751,17 @@ class DashboardPtyTests(unittest.TestCase):
 
     def _assert_alive_with_owned_hold(self, running: _PtyWatchdog) -> int:
         self.assertIsNone(running.process.poll(), running.decoded)
-        pid = running.wait_for_caffeinate_pid()
-        owned, command = _owned_caffeinate(pid, running.process.pid)
-        self.assertTrue(owned, f"unexpected caffeinate command: {command!r}")
-        self.assertTrue(_pid_exists(pid), f"caffeinate PID {pid} is not alive")
+        pid = running.wait_for_inhibitor_pid()
+        owned, command = _owned_inhibitor(pid, running.process.pid)
+        self.assertTrue(owned, f"unexpected wake-assertion command: {command!r}")
+        self.assertTrue(_pid_exists(pid), f"wake-assertion PID {pid} is not alive")
         return pid
 
-    def _release_owned_caffeinate(self, running: _PtyWatchdog) -> None:
-        pid = running.caffeinate_pid
+    def _release_owned_inhibitor(self, running: _PtyWatchdog) -> None:
+        pid = running.inhibitor_pid
         if pid is None:
             try:
-                pid = int(running.caffeinate_pid_file.read_text(encoding="utf-8"))
+                pid = int(running.inhibitor_pid_file.read_text(encoding="utf-8"))
             except (FileNotFoundError, OSError, ValueError):
                 return
         deadline = time.monotonic() + 3
@@ -724,7 +769,7 @@ class DashboardPtyTests(unittest.TestCase):
             time.sleep(0.02)
         if not _pid_exists(pid):
             return
-        owned, command = _owned_caffeinate(pid, running.process.pid)
+        owned, command = _owned_inhibitor(pid, running.process.pid)
         if not owned:
             raise AssertionError(
                 f"refused to signal recorded PID {pid}; ownership mismatch: {command!r}"
@@ -734,22 +779,22 @@ class DashboardPtyTests(unittest.TestCase):
         while _pid_exists(pid) and time.monotonic() < deadline:
             time.sleep(0.02)
         if _pid_exists(pid):
-            owned, command = _owned_caffeinate(pid, running.process.pid)
+            owned, command = _owned_inhibitor(pid, running.process.pid)
             if not owned:
                 raise AssertionError(
                     f"refused SIGKILL for PID {pid}; ownership changed: {command!r}"
                 )
             os.kill(pid, signal.SIGKILL)
 
-    def _assert_caffeinate_released(self, running: _PtyWatchdog) -> None:
-        pid = running.caffeinate_pid
+    def _assert_inhibitor_released(self, running: _PtyWatchdog) -> None:
+        pid = running.inhibitor_pid
         self.assertIsNotNone(pid)
         assert pid is not None
         deadline = time.monotonic() + 3
         while _pid_exists(pid) and time.monotonic() < deadline:
             time.sleep(0.02)
-        self.assertFalse(_pid_exists(pid), f"owned caffeinate PID {pid} survived exit")
-        self.assertFalse(self.pmset_attempt_file.exists(), "pmset blocker was invoked")
+        self.assertFalse(_pid_exists(pid), f"owned {INHIBITOR_SHIM} PID {pid} survived exit")
+        self.assertFalse(self.sleep_attempt_file.exists(), "sleep blocker was invoked")
 
     def _exit_report(self, running: _PtyWatchdog) -> bytes:
         self.assertIn(ALTERNATE_SCREEN_EXIT, running.transcript)
@@ -773,11 +818,11 @@ class DashboardPtyTests(unittest.TestCase):
                 "display": running.mode,
                 "term": running.term,
                 "watchdog_pid": running.process.pid,
-                "caffeinate_pid": running.caffeinate_pid,
+                "inhibitor_pid": running.inhibitor_pid,
                 "return_code": running.process.returncode,
                 "transcript": str(running.transcript_path.relative_to(PROJECT_ROOT)),
                 "transcript_bytes": len(running.transcript),
-                "pmset_invoked": self.pmset_attempt_file.exists(),
+                "sleep_invoked": self.sleep_attempt_file.exists(),
                 **facts,
             }
         )
@@ -806,7 +851,7 @@ class DashboardPtyTests(unittest.TestCase):
             "dashboard task, model, effort, and guard labels",
         )
         self.assertIn("persisted activity", screen.lower())
-        caffeinate_pid = self._assert_alive_with_owned_hold(running)
+        inhibitor_pid = self._assert_alive_with_owned_hold(running)
 
         running.send(b"/Beta dashboard\r")
         filtered = running.wait_for_screen(
@@ -819,7 +864,7 @@ class DashboardPtyTests(unittest.TestCase):
         )
         self.assertIn("Beta dashboard build", filtered)
         self.assertIsNone(running.process.poll(), "filtering changed watchdog lifecycle")
-        self.assertTrue(_pid_exists(caffeinate_pid), "filtering released the sleep hold")
+        self.assertTrue(_pid_exists(inhibitor_pid), "filtering released the sleep hold")
 
         running.send(b"q")
         self.assertEqual(running.wait(), 130, running.decoded)
@@ -833,7 +878,7 @@ class DashboardPtyTests(unittest.TestCase):
         )
         self.assertNotRegex(report, rb"provider\s+all\s+.*sort")
         self.assertIn(b"\x1b[?1049h", running.transcript)
-        self._assert_caffeinate_released(running)
+        self._assert_inhibitor_released(running)
         self._record(
             running,
             dashboard_selected_automatically=True,
@@ -843,7 +888,7 @@ class DashboardPtyTests(unittest.TestCase):
             exit_report_outcome="STOPPED",
             exit_report_colored=True,
             alternate_screen_restored=True,
-            caffeinate_released=True,
+            inhibitor_released=True,
         )
 
     def test_dashboard_controls_do_not_change_hold(self) -> None:
@@ -852,7 +897,7 @@ class DashboardPtyTests(unittest.TestCase):
             lambda text: "Alpha overnight audit" in text and "Beta dashboard build" in text,
             "dashboard before exercising controls",
         )
-        caffeinate_pid = self._assert_alive_with_owned_hold(running)
+        inhibitor_pid = self._assert_alive_with_owned_hold(running)
         running.send(b"t")
         running.wait_for_screen(lambda text: "flat · sort" in text, "tree toggle selects flat view")
         running.send(b"t")
@@ -867,7 +912,7 @@ class DashboardPtyTests(unittest.TestCase):
             "provider alias can produce an empty presentation filter",
         )
         self.assertIsNone(running.process.poll(), "provider filtering exited watchdog")
-        self.assertTrue(_pid_exists(caffeinate_pid), "provider filtering released hold")
+        self.assertTrue(_pid_exists(inhibitor_pid), "provider filtering released hold")
         running.send(b"c")
         running.wait_for_screen(
             lambda text: "Alpha overnight audit" in text and "Beta dashboard build" in text,
@@ -900,7 +945,7 @@ class DashboardPtyTests(unittest.TestCase):
         running.send(b"q")
         self.assertEqual(running.wait(), 130, running.decoded)
         self.assertIn(b"STOPPED", self._exit_report(running))
-        self._assert_caffeinate_released(running)
+        self._assert_inhibitor_released(running)
         self._record(
             running,
             dashboard_selected_automatically=True,
@@ -908,7 +953,7 @@ class DashboardPtyTests(unittest.TestCase):
             filter_display_only=True,
             controls_survived=["c", "s", "f", "down", "enter"],
             alternate_screen_restored=True,
-            caffeinate_released=True,
+            inhibitor_released=True,
         )
 
     def test_successful_dry_run_prints_report_before_sleep_decision(self) -> None:
@@ -920,20 +965,20 @@ class DashboardPtyTests(unittest.TestCase):
         self.assertIn(b"FINAL SESSIONS", report)
         self.assertIn(b"Alpha overnight audit", report)
         self.assertIn(b"Beta dashboard build", report)
-        sleep_log = b"[dry-run] would run: pmset sleepnow"
+        sleep_log = DRY_RUN_SLEEP_LOG
         self.assertIn(sleep_log, report)
         self.assertLess(
             running.decoded.index("CLAUDE WATCHDOG \u2014 RUN REPORT"),
             running.decoded.index(sleep_log.decode()),
         )
-        self.assertFalse(self.pmset_attempt_file.exists(), "pmset blocker was invoked")
+        self.assertFalse(self.sleep_attempt_file.exists(), "sleep blocker was invoked")
         self._record(
             running,
             exit_report_outcome="DRY RUN",
             exit_report_before_force_sleep=True,
             all_final_sessions_visible=True,
-            pmset_invoked=False,
-            caffeinate_released_or_not_yet_execed=True,
+            sleep_invoked=False,
+            inhibitor_released_or_not_yet_execed=True,
         )
 
     def test_dashboard_survives_narrow_resize_and_sigwinch(self) -> None:
@@ -961,7 +1006,7 @@ class DashboardPtyTests(unittest.TestCase):
         running.process.send_signal(signal.SIGTERM)
         self.assertEqual(running.wait(), 130, running.decoded)
         self.assertIn(b"STOPPED", self._exit_report(running))
-        self._assert_caffeinate_released(running)
+        self._assert_inhibitor_released(running)
         self._record(
             running,
             resized_from="120x30",
@@ -969,7 +1014,7 @@ class DashboardPtyTests(unittest.TestCase):
             sigwinch_survived=True,
             selection_and_detail_survived=True,
             sigterm_restored_terminal=True,
-            caffeinate_released=True,
+            inhibitor_released=True,
         )
 
     def test_auto_uses_log_fallback_for_dumb_terminal(self) -> None:
@@ -981,12 +1026,12 @@ class DashboardPtyTests(unittest.TestCase):
         self._assert_alive_with_owned_hold(running)
         running.process.send_signal(signal.SIGINT)
         self.assertEqual(running.wait(), 130, running.decoded)
-        self._assert_caffeinate_released(running)
+        self._assert_inhibitor_released(running)
         self._record(
             running,
             dumb_terminal_log_fallback=True,
             alternate_screen_entered=False,
-            caffeinate_released=True,
+            inhibitor_released=True,
         )
 
     def test_forced_log_and_no_color_dashboard_are_explicit(self) -> None:
@@ -996,12 +1041,12 @@ class DashboardPtyTests(unittest.TestCase):
         self._assert_alive_with_owned_hold(log_run)
         log_run.process.send_signal(signal.SIGINT)
         self.assertEqual(log_run.wait(), 130, log_run.decoded)
-        self._assert_caffeinate_released(log_run)
+        self._assert_inhibitor_released(log_run)
         self._record(
             log_run,
             forced_log_uses_plain_stream=True,
             alternate_screen_entered=False,
-            caffeinate_released=True,
+            inhibitor_released=True,
         )
 
         monochrome = self._launch(
@@ -1025,14 +1070,14 @@ class DashboardPtyTests(unittest.TestCase):
             EXPLICIT_COLOR.search(monochrome_report),
             "--no-color/NO_COLOR colored the exit report",
         )
-        self._assert_caffeinate_released(monochrome)
+        self._assert_inhibitor_released(monochrome)
         self._record(
             monochrome,
             no_color_flag=True,
             no_color_environment=True,
             explicit_color_sequences=False,
             ctrl_c_restored_terminal=True,
-            caffeinate_released=True,
+            inhibitor_released=True,
         )
 
 

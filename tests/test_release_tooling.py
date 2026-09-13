@@ -33,7 +33,8 @@ RUNTIME_FILES = (
     "config.py", "activity.py", "process_lineage.py", "metadata.py", "dashboard.py",
     "reporting.py", "power/__init__.py", "power/_types.py", "power/_contracts.py",
     "power/_selection.py", "power/_session.py", "power/_adapters/__init__.py",
-    "power/_adapters/macos.py", "power/_adapters/logind.py", "app.py",
+    "power/_adapters/desktop.py", "power/_adapters/macos.py",
+    "power/_adapters/logind.py", "app.py",
 )
 
 

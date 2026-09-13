@@ -7,6 +7,34 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- The Linux keep-awake hold passed `--no-ask-password` to `systemd-inhibit`,
+  which does not accept it. On systemd 255 (Ubuntu 24.04 LTS, Pop!_OS 24.04)
+  the inhibitor exited immediately and every run aborted with "keep-awake hold
+  is no longer active", so the machine was never held awake.
+- The Linux keep-awake hold ran `sleep infinity` and relied on `terminate()`.
+  An unclean watchdog exit left the inhibitor running and the machine awake
+  indefinitely. The hold now blocks on a pipe owned by the watchdog, so the
+  kernel releases it even on `SIGKILL` — the guarantee `caffeinate -w <pid>`
+  already gives macOS.
+- `IdleHint=no` was read as "the user is present". wlroots desktops (COSMIC,
+  sway, Hyprland) report idle only over the Wayland `ext-idle-notify-v1`
+  protocol and leave the hint at `no` forever, so the watch held the machine
+  awake indefinitely while logging that the user was active. Unmaintained
+  hints are now reported as no answer.
+
+### Added
+
+- GNOME (`Mutter.IdleMonitor`), KDE/Xfce/Cinnamon
+  (`org.freedesktop.ScreenSaver`), and `xprintidle` idle adapters, tried in
+  that order ahead of logind, so Linux human-idle detection works on the
+  desktops where logind's hint is not maintained.
+- The isolated lifecycle and PTY suites run on Linux, parameterised by platform
+  rather than duplicated. They skip cleanly on hosts with no usable logind.
+- `PresenceCheckError` for an unavailable idle source now names
+  `--user-idle-minutes 0`.
+
 ## [0.1.3] - 2026-09-13
 
 Prerelease. Sleep guards still use persisted activity timestamps, not process

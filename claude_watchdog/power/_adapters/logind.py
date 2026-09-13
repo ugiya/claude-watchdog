@@ -53,23 +53,35 @@ class LogindKeepAwake:
         inhibit = shutil.which("systemd-inhibit")
         if inhibit is None:
             raise models_module.PowerCommandError("systemd-inhibit is not available")
+        # `cat` blocks on a pipe whose write end this process owns, so the
+        # kernel closing that end releases the inhibitor the moment the
+        # watchdog exits -- including on SIGKILL, where no cleanup can run.
+        # `sleep infinity` would outlive an unclean exit and strand the
+        # machine awake. This mirrors what `caffeinate -w <pid>` gives macOS.
         self._process = subprocess.Popen(
             [
                 inhibit,
-                "--no-ask-password",
                 "--what=idle:sleep",
                 "--mode=block",
                 "--who=claude-watchdog",
-                "--why=Watching selected agent activity",
-                "sleep",
-                "infinity",
-            ]
+                f"--why=Watching selected agent activity (pid {os.getpid()})",
+                "cat",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
         )
 
     def release(self) -> None:
         process = self._process
         self._process = None
-        if process is None or process.poll() is not None:
+        if process is None:
+            return
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass  # The child already exited and closed the read end.
+        if process.poll() is not None:
             return
         try:
             process.terminate()
@@ -126,8 +138,15 @@ class LogindIdle:
                 except ValueError:
                     since_us = None
         if hint != "yes" or since_us is None:
+            # `IdleHint=no` is ambiguous: either the user is present, or this
+            # compositor never sets the hint at all. wlroots desktops (COSMIC,
+            # sway, Hyprland) report idle only over the Wayland
+            # ext-idle-notify-v1 protocol and leave the hint at "no" forever,
+            # so reading it as presence holds the machine awake indefinitely
+            # while the log claims the user is active. Report no answer and let
+            # a higher-priority observer, or an explicit error, decide.
             return types_module.IdleObservation(
-                kind=types_module.IdleKind.WAITING, seconds=0.0, source=self.name
+                kind=types_module.IdleKind.UNKNOWN, source=self.name
             )
         age = max(0.0, time.clock_gettime(time.CLOCK_MONOTONIC) - (since_us / 1_000_000))
         kind = (

@@ -126,7 +126,7 @@ Useful examples:
 # Watch only Codex and OMX, with a 20-minute session quiet period.
 claude-watchdog 20 --source codex-omx --dry-run
 
-# Disable the separate macOS user-idle requirement.
+# Disable the separate user-idle requirement.
 claude-watchdog --user-idle-minutes 0 --dry-run
 
 # Keep the launch-time watch set fixed and use plain log output.
@@ -320,8 +320,12 @@ sanitized to remove control characters, but sanitization is not anonymization.
 
 `v0.1.3` is an experimental public prerelease. A power session selects macOS or
 systemd-logind adapters for keep-awake, human idle, and suspend. Linux suspend
-does not use sudo; human-idle detection can be unavailable unless the session
-reports it or `--user-idle-minutes 0`. Dashboard `h` and `--hide PATH` dismiss a
+does not use sudo. Human idle is read from the first source that answers:
+GNOME's `Mutter.IdleMonitor`, `org.freedesktop.ScreenSaver` (KDE, Xfce,
+Cinnamon), `xprintidle` on X11, then logind's session idle hint. wlroots
+desktops such as COSMIC, sway and Hyprland publish idle only over the Wayland
+`ext-idle-notify-v1` protocol and answer none of these, so those sessions need
+`--user-idle-minutes 0`; the run says so and exits rather than guessing. Dashboard `h` and `--hide PATH` dismiss a
 watch target for the current run only; recency is still not process liveness.
 The repository has regression coverage for parsers, watch-set scoping,
 power-command ordering, dashboard rendering, and isolated lifecycle behavior.
