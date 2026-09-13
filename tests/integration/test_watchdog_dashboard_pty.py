@@ -63,6 +63,14 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
+def _is_caffeinate_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    if argv[0] == "/usr/bin/caffeinate" or argv[0].endswith("/caffeinate"):
+        return True
+    return len(argv) >= 2 and argv[0].endswith("/sh") and argv[1].endswith("/caffeinate")
+
+
 def _process_command(pid: int) -> str:
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "command="],
@@ -86,11 +94,7 @@ def _owned_caffeinate(pid: int, watchdog_pid: int) -> tuple[bool, str]:
         and argv[index + 1] == str(watchdog_pid)
         for index, arg in enumerate(argv)
     )
-    return bool(
-        argv
-        and argv[0] == "/usr/bin/caffeinate"
-        and waits_on_watchdog
-    ), command
+    return bool(_is_caffeinate_argv(argv) and waits_on_watchdog), command
 
 
 def _set_pty_size(fd: int, rows: int, columns: int) -> None:

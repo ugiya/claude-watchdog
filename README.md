@@ -20,11 +20,12 @@ The demo uses synthetic data. The accompanying [terminal recording](docs/demo.ca
 can be played with an asciinema-compatible player.
 
 > [!WARNING]
-> A normal run executes `pmset sleepnow` after all configured guards pass.
-> Start with `--dry-run`. The watchdog reads persisted activity timestamps; it
-> does not determine whether a process is alive, whether a task completed, or
-> whether a model is still generating output. It cannot guarantee sleep or wake
-> behavior while a Mac notebook lid is closed.
+> A normal run requests suspend after all configured guards pass (`pmset
+> sleepnow` on macOS, `systemctl suspend` on systemd Linux). Start with
+> `--dry-run`. The watchdog reads persisted activity timestamps; it does not
+> determine whether a process is alive, whether a task completed, or whether a
+> model is still generating output. It cannot guarantee sleep or wake behavior
+> while a Mac notebook lid is closed.
 
 ## Requirements
 
@@ -317,13 +318,15 @@ sanitized to remove control characters, but sanitization is not anonymization.
 
 ## Project status
 
-`v0.1.2` is an experimental public prerelease. Dashboard `h` and `--hide PATH`
-dismiss a watch target for the current run only; recency is still not process
-liveness. The repository has regression
-coverage for parsers, watch-set scoping, power-command ordering, dashboard
-rendering, and isolated lifecycle behavior. That coverage does not establish
-compatibility with every agent release or prove real-world sleep behavior on
-every Mac.
+`v0.1.3` is an experimental public prerelease. A power session selects macOS or
+systemd-logind adapters for keep-awake, human idle, and suspend. Linux suspend
+does not use sudo; human-idle detection can be unavailable unless the session
+reports it or `--user-idle-minutes 0`. Dashboard `h` and `--hide PATH` dismiss a
+watch target for the current run only; recency is still not process liveness.
+The repository has regression coverage for parsers, watch-set scoping,
+power-command ordering, dashboard rendering, and isolated lifecycle behavior.
+That coverage does not establish compatibility with every agent release or prove
+real-world sleep behavior on every machine.
 
 Changes are reviewed through pull requests. Each release gets a new immutable
 version tag, matching runtime version, and updated changelog and README.
