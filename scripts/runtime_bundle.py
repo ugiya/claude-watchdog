@@ -33,6 +33,7 @@ REQUIRED_RUNTIME_FILES = (
     f"{PACKAGE_NAME}/power/_selection.py",
     f"{PACKAGE_NAME}/power/_session.py",
     f"{PACKAGE_NAME}/power/_adapters/__init__.py",
+    f"{PACKAGE_NAME}/power/_adapters/desktop.py",
     f"{PACKAGE_NAME}/power/_adapters/macos.py",
     f"{PACKAGE_NAME}/power/_adapters/logind.py",
     f"{PACKAGE_NAME}/app.py",

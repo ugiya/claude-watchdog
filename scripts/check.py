@@ -36,8 +36,8 @@ def _run_integration(target: Path, environment: dict[str, str]) -> None:
 
 
 def run_checks(*, integration: bool = False) -> None:
-    if integration and platform.system() != "Darwin":
-        raise RuntimeError("--integration requires macOS")
+    if integration and platform.system() not in ("Darwin", "Linux"):
+        raise RuntimeError("--integration requires macOS or Linux")
     python = sys.executable
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -65,7 +65,7 @@ def run_checks(*, integration: bool = False) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--integration", action="store_true", help="run macOS lifecycle and PTY checks")
+    parser.add_argument("--integration", action="store_true", help="run platform lifecycle and PTY checks")
     return parser.parse_args(argv)
 
 

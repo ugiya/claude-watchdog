@@ -35,7 +35,8 @@ class PowerSession:
             idle = self._bundle.idle.observe(self._policy.user_idle_seconds)
             if idle.kind is types_module.IdleKind.UNKNOWN:
                 raise models_module.PresenceCheckError(
-                    f"user-idle state is unavailable ({idle.source})"
+                    f"user-idle state is unavailable ({idle.source}); re-run with "
+                    "--user-idle-minutes 0 to sleep on session quiet alone"
                 )
         return types_module.PowerStatus(
             idle=idle,
