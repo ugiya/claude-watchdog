@@ -19,10 +19,10 @@ described below.
 | OMX | 0.21.3 | Synthetic shared-log identity admission, timestamp attribution, and Codex subagent-tracking lineage tests | Experimental |
 | OpenCode | Unknown | Synthetic SQLite root/descendant, activity, current-model, and tree tests | Experimental |
 
-CI on Linux exercises portable unit behavior. CI on macOS additionally runs
-isolated lifecycle and PTY checks. This does not establish support for every
-macOS release, Mac model, terminal, or agent version, and it does not test a
-real sleep request.
+CI runs portable unit behavior on Linux across every supported Python version,
+and runs the isolated lifecycle and PTY checks on both macOS and Linux. This
+does not establish support for every OS release, machine, desktop environment,
+terminal, or agent version, and it does not test a real sleep request.
 
 ## Observed data contracts
 
@@ -203,8 +203,11 @@ confirms all of the following before emitting a Claude-to-Codex display edge:
 - the OMX PID occurs within the bounded parent chain of the Claude PID.
 
 The observed `ps` rows left-pad PID fields, use two spaces before single-digit
-days, and include trailing whitespace after the year. The macOS version that
-produced this output was not captured and is therefore **unknown**. Surrounding
+days, and include trailing whitespace after the year. macOS `ps` and Linux
+procps-ng `ps` both emit this `lstart` layout and are parsed by the same code;
+`ps` itself is resolved from the absolute allowlist `/bin/ps`, `/usr/bin/ps`
+rather than from `PATH`. The OS version that produced this output was not
+captured and is therefore **unknown**. Surrounding
 clock whitespace is ignored, malformed rows are skipped without discarding
 valid rows, and each poll examines at most 65,536 rows. Duplicate PID rows still
 invalidate the process table.
@@ -264,7 +267,7 @@ failure falls back to a lineage-seed label without changing activity.
 Open a provider compatibility issue and include:
 
 - exact application name and version, or `unknown`;
-- macOS and Python versions;
+- operating system and Python versions;
 - source selection and display mode;
 - expected and observed behavior;
 - a minimal synthetic record reproducing the field layout, if possible.

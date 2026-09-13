@@ -4,8 +4,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Keep your Mac awake while local coding-agent sessions remain active, then let
-it sleep after the sessions and the user have both been quiet.
+Keep your Mac or Linux machine awake while local coding-agent sessions remain
+active, then let it sleep after the sessions and the user have both been quiet.
 
 `claude-watchdog` is an experimental, standard-library-only Python utility for
 Claude Code, configured Claude profiles, Codex CLI/App sessions, OMX logs, and
@@ -20,19 +20,50 @@ The demo uses synthetic data. The accompanying [terminal recording](docs/demo.ca
 can be played with an asciinema-compatible player.
 
 > [!WARNING]
-> A normal run executes `pmset sleepnow` after all configured guards pass.
-> Start with `--dry-run`. The watchdog reads persisted activity timestamps; it
-> does not determine whether a process is alive, whether a task completed, or
-> whether a model is still generating output. It cannot guarantee sleep or wake
-> behavior while a Mac notebook lid is closed.
+> A normal run executes `pmset sleepnow` (macOS) or `systemctl suspend`
+> (Linux) after all configured guards pass. Start with `--dry-run`. The
+> watchdog reads persisted activity timestamps; it does not determine whether a
+> process is alive, whether a task completed, or whether a model is still
+> generating output. It cannot guarantee sleep or wake behavior while a notebook
+> lid is closed.
 
 ## Requirements
 
-- macOS
+- macOS, or Linux with systemd (`systemd-inhibit`, `systemctl`)
 - Python 3.10 or later
 - Local agent session data from at least one [supported source](#supported-sources)
 
 The runtime has no third-party Python dependencies.
+
+### Platform commands
+
+| Step | macOS | Linux |
+| --- | --- | --- |
+| Hold awake | `caffeinate -is -w <pid>` | `systemd-inhibit --what=idle:sleep --mode=block` (falls back to `gnome-session-inhibit`) |
+| Sleep | `pmset sleepnow` | `systemctl suspend` (falls back to `loginctl suspend`) |
+| User idle | `ioreg -c IOHIDSystem` | first desktop source that answers (see below) |
+
+### User presence on Linux
+
+There is no single idle-time API on Linux, so the watchdog tries these in
+order and uses the first that answers:
+
+1. `org.gnome.Mutter.IdleMonitor` — GNOME, on Wayland and X11
+2. `org.freedesktop.ScreenSaver.GetSessionIdleTime` — KDE, Xfce, Cinnamon
+3. `xprintidle` — any X11 session with the package installed
+4. systemd-logind's idle hint — only when a session actually reports idle
+
+Desktops built on wlroots — COSMIC, sway, Hyprland — report idle only over the
+Wayland `ext-idle-notify-v1` protocol, which none of the above expose. On those
+desktops the watchdog says so at startup and you should run with
+`--user-idle-minutes 0`, which sleeps on session quiet alone:
+
+```bash
+claude-watchdog --user-idle-minutes 0
+```
+
+Without that flag the run aborts, releasing the wake assertion without
+sleeping, rather than guessing that you are present or away.
 
 ## Install
 
@@ -109,15 +140,15 @@ By default it:
 
 1. admits sessions with persisted activity from the previous 15 minutes;
 2. discovers additional recently active sessions every 60 seconds;
-3. keeps the Mac awake with an owned `caffeinate` process;
+3. keeps the machine awake with an owned inhibitor process;
 4. waits until all watched sources have had no persisted activity for 30
    minutes;
-5. checks that macOS reports at least five minutes of user inactivity;
-6. releases `caffeinate`, restores the terminal, and prints a final report;
+5. checks that the desktop reports at least five minutes of user inactivity;
+6. releases the wake assertion, restores the terminal, and prints a final report;
 7. logs the sleep request without executing it because `--dry-run` is active.
 
 After you have inspected that behavior, omit `--dry-run` to allow the final
-`pmset sleepnow` request.
+sleep request.
 
 Useful examples:
 
@@ -125,7 +156,7 @@ Useful examples:
 # Watch only Codex and OMX, with a 20-minute session quiet period.
 claude-watchdog 20 --source codex-omx --dry-run
 
-# Disable the separate macOS user-idle requirement.
+# Disable the separate user-idle requirement.
 claude-watchdog --user-idle-minutes 0 --dry-run
 
 # Keep the launch-time watch set fixed and use plain log output.
@@ -178,7 +209,7 @@ assuming a particular agent release is supported.
 ### Claude profiles
 
 Use profiles when more than one Claude-compatible session tree exists on the
-same Mac. The default configuration path is
+same machine. The default configuration path is
 `~/.config/claude-watchdog/profiles.json`:
 
 ```json
@@ -212,7 +243,7 @@ claude-watchdog --profiles-file /path/to/profiles.json --dry-run
 The omitted default file may be absent, which means there are no custom
 profiles. An explicitly selected file must exist. An unreadable file, a file
 larger than 64 KiB, malformed JSON, an unsupported schema version, or an invalid
-profile aborts before `caffeinate` starts so an intended guard cannot be
+profile aborts before the wake assertion starts so an intended guard cannot be
 silently lost. Profile configuration is loaded only when the selected source
 is `auto` or `claude`; using `--profiles-file` with a non-Claude-only source is
 a command-line error.
@@ -241,7 +272,7 @@ descendants of those roots. OMX keeps admitted identities within shared logs.
 
 The dashboard reads extra metadata for labels and hierarchy, but metadata
 failures do not change the activity calculation. The watchdog exits without
-requesting sleep when safety-critical activity or macOS presence cannot be read
+requesting sleep when safety-critical activity or user presence cannot be read
 reliably.
 
 ## Agent trees and external lineage
@@ -269,11 +300,11 @@ When OMX launches a Claude session without persisting a native parent ID, the
 dashboard can also confirm a shallower Claude-to-Codex edge from Claude's exact
 live process registry record, the project's OMX `session.json`, and matching
 process ancestry. The process table verifies those provider-written identities;
-it never invents an identity or uses cwd/time proximity alone. The macOS `ps`
+it never invents an identity or uses cwd/time proximity alone. The `ps`
 probe preserves the watchdog environment but forces `LC_ALL=C` so localized
 hosts produce the stable clock format the parser expects. Confirmation is
 bounded, failure-safe, retained for the rest of the run, and display-only: it
-does not add watch targets, extend the `caffeinate` hold, or affect sleep.
+does not add watch targets, extend the wake assertion, or affect sleep.
 
 Shell-launched cross-provider children do not necessarily record a native
 parent. An optional `~/.config/claude-watchdog/lineage.json` can declare an
@@ -323,7 +354,7 @@ liveness. The repository has regression
 coverage for parsers, watch-set scoping, power-command ordering, dashboard
 rendering, and isolated lifecycle behavior. That coverage does not establish
 compatibility with every agent release or prove real-world sleep behavior on
-every Mac.
+every machine.
 
 Changes are reviewed through pull requests. Each release gets a new immutable
 version tag, matching runtime version, and updated changelog and README.

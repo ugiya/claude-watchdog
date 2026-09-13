@@ -16,6 +16,18 @@ from . import models as models_module
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 ExternalLineageLink = dict[str, object]
 
+#: Absolute ``ps`` locations, in order. macOS and merged-/usr Linux ship
+#: /bin/ps; split-/usr distributions ship only /usr/bin/ps. Resolving from an
+#: allowlist rather than PATH keeps this probe immune to PATH injection.
+PS_CANDIDATES = ("/bin/ps", "/usr/bin/ps")
+
+
+def _ps_executable() -> str | None:
+    for candidate in PS_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
 
 def read_bounded_json_object(path: Path, max_bytes: int) -> dict[str, object] | None:
     """Read one bounded JSON object, rejecting truncation and oversized files."""
@@ -117,9 +129,12 @@ def _omx_session(path: Path) -> tuple[int, str, datetime] | None:
 def _process_table(
     runner: Runner, local_timezone: tzinfo | None
 ) -> dict[int, tuple[int, datetime]]:
+    executable = _ps_executable()
+    if executable is None:
+        return {}
     try:
         completed = runner(
-            ["/bin/ps", "-axo", "pid=,ppid=,lstart="],
+            [executable, "-axo", "pid=,ppid=,lstart="],
             capture_output=True,
             text=True,
             timeout=models_module.PROCESS_PROBE_TIMEOUT_SECONDS,

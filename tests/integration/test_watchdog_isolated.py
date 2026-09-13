@@ -2,8 +2,10 @@
 """Isolated end-to-end checks for live Codex and Claude profile discovery.
 
 This script never uses the caller's home, Codex tree, log file, or power tools.
-It invokes the worktree executable with ``--dry-run`` and places fail-closed
-``pmset`` plus PID-recording ``caffeinate`` shims first on the child PATH.
+It invokes the worktree executable with ``--dry-run`` and places a fail-closed
+sleep shim plus a PID-recording wake-assertion shim first on the child PATH.
+Both shims are named for the platform under test: ``caffeinate``/``pmset`` on
+macOS, ``systemd-inhibit``/``systemctl`` on Linux.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,6 +33,44 @@ IDLE_SECONDS = 1.5
 POLL_SECONDS = 0.1
 PROCESS_TIMEOUT = 8.0
 KEEPALIVE_INTERVAL = 0.05
+if sys.platform == "darwin":
+    INHIBITOR_SHIM = "caffeinate"
+    INHIBITOR_BINARY = "/usr/bin/caffeinate"
+    SLEEP_SHIMS = ("pmset",)
+elif sys.platform.startswith("linux"):
+    INHIBITOR_SHIM = "systemd-inhibit"
+    INHIBITOR_BINARY = shutil.which("systemd-inhibit") or "/usr/bin/systemd-inhibit"
+    # loginctl is shimmed too: force_sleep falls back to it after systemctl.
+    SLEEP_SHIMS = ("systemctl", "loginctl")
+else:  # pragma: no cover - the checker refuses other platforms first.
+    raise SystemExit(f"integration checks do not support {sys.platform}")
+
+def _require_usable_inhibitor() -> None:
+    """Skip cleanly where the platform's inhibitor cannot take a real lock.
+
+    Headless and containerised Linux hosts often have systemd-inhibit installed
+    but no logind to talk to. That is a missing environment, not a defect, so
+    the suite reports and exits successfully instead of failing.
+    """
+    if sys.platform == "darwin":
+        return
+    probe = subprocess.run(
+        [INHIBITOR_BINARY, "--what=idle:sleep", "--who=claude-watchdog",
+         "--why=preflight", "--mode=block", "true"],
+        capture_output=True, text=True, check=False,
+    )
+    if probe.returncode != 0:
+        detail = (probe.stderr or probe.stdout or "").strip()
+        print(
+            f"skipping: {INHIBITOR_BINARY} cannot take a lock on this host"
+            + (f" ({detail[:200]})" if detail else "")
+        )
+        raise SystemExit(0)
+
+
+_require_usable_inhibitor()
+
+
 ADMISSION_PATTERN = re.compile(
     r"(?:(?:admitted|adopted|discovered|added).*\bnew\b.*(?:session|activity target)"
     r"|\bnew\b.*(?:session|activity target).*(?:admitted|adopted|discovered|added))",
@@ -99,8 +140,8 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
-def _owned_caffeinate_command(pid: int, watchdog_pid: int) -> tuple[bool, str]:
-    """Verify a recorded PID is the caffeinate tied to our watchdog process."""
+def _owned_inhibitor_command(pid: int, watchdog_pid: int) -> tuple[bool, str]:
+    """Verify a recorded PID is the wake assertion tied to our watchdog process."""
     result = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "command="],
         check=False,
@@ -112,17 +153,20 @@ def _owned_caffeinate_command(pid: int, watchdog_pid: int) -> tuple[bool, str]:
         argv = shlex.split(command)
     except ValueError:
         return False, command
-    owns_watchdog = any(
-        value == "-w" and index + 1 < len(argv) and argv[index + 1] == str(watchdog_pid)
-        for index, value in enumerate(argv)
-    )
-    return bool(argv and argv[0] == "/usr/bin/caffeinate" and owns_watchdog), command
+    if sys.platform == "darwin":
+        owns_watchdog = any(
+            value == "-w" and index + 1 < len(argv) and argv[index + 1] == str(watchdog_pid)
+            for index, value in enumerate(argv)
+        )
+    else:
+        owns_watchdog = f"(pid {watchdog_pid})" in command
+    return bool(argv and argv[0] == INHIBITOR_BINARY and owns_watchdog), command
 
 
 class _RunningWatchdog:
-    def __init__(self, process: subprocess.Popen[str], caffeinate_pid_file: Path):
+    def __init__(self, process: subprocess.Popen[str], inhibitor_pid_file: Path):
         self.process = process
-        self.caffeinate_pid_file = caffeinate_pid_file
+        self.inhibitor_pid_file = inhibitor_pid_file
         self.lines: list[str] = []
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._reader = threading.Thread(target=self._read_output, daemon=True)
@@ -162,17 +206,17 @@ class _RunningWatchdog:
             if compiled.search(line):
                 return line
 
-    def wait_for_caffeinate_pid(self, timeout: float = 3.0) -> int:
+    def wait_for_inhibitor_pid(self, timeout: float = 3.0) -> int:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                value = self.caffeinate_pid_file.read_text(encoding="utf-8").strip()
+                value = self.inhibitor_pid_file.read_text(encoding="utf-8").strip()
                 pid = int(value)
             except (FileNotFoundError, OSError, ValueError):
                 time.sleep(0.02)
                 continue
             return pid
-        self.fail("caffeinate shim did not record its PID")
+        self.fail(f"{INHIBITOR_SHIM} shim did not record its PID")
 
     def wait(self, timeout: float = PROCESS_TIMEOUT) -> int:
         try:
@@ -205,8 +249,8 @@ class IsolatedWatchdogTests(unittest.TestCase):
         self.xdg_data_home = self.root / "xdg-data"
         self.opencode_db = self.root / "opencode" / "never-used.db"
         self.shims = self.root / "shims"
-        self.caffeinate_pid_file = self.root / "caffeinate.pid"
-        self.pmset_attempt_file = self.root / "pmset-attempted"
+        self.inhibitor_pid_file = self.root / "inhibitor.pid"
+        self.sleep_attempt_file = self.root / "sleep-attempted"
         self.running: list[_RunningWatchdog] = []
         self.keepalives: list[_RolloutKeepalive] = []
         for directory in (self.home, self.codex_home, self.xdg_data_home, self.shims):
@@ -229,11 +273,11 @@ class IsolatedWatchdogTests(unittest.TestCase):
                     running.process.kill()
                     running.process.wait(timeout=3)
             try:
-                pid = int(running.caffeinate_pid_file.read_text(encoding="utf-8"))
+                pid = int(running.inhibitor_pid_file.read_text(encoding="utf-8"))
             except (FileNotFoundError, OSError, ValueError):
                 pid = None
             if pid is not None and _pid_exists(pid):
-                owned, command = _owned_caffeinate_command(pid, running.process.pid)
+                owned, command = _owned_inhibitor_command(pid, running.process.pid)
                 if not owned:
                     if _pid_exists(pid):
                         cleanup_errors.append(
@@ -246,7 +290,7 @@ class IsolatedWatchdogTests(unittest.TestCase):
                     while _pid_exists(pid) and time.monotonic() < deadline:
                         time.sleep(0.02)
                     if _pid_exists(pid):
-                        still_owned, command = _owned_caffeinate_command(
+                        still_owned, command = _owned_inhibitor_command(
                             pid, running.process.pid
                         )
                         if still_owned:
@@ -265,34 +309,35 @@ class IsolatedWatchdogTests(unittest.TestCase):
             self.fail("; ".join(cleanup_errors))
 
     def _write_shims(self) -> None:
-        caffeinate = self.shims / "caffeinate"
-        caffeinate.write_text(
+        inhibitor = self.shims / INHIBITOR_SHIM
+        inhibitor.write_text(
             "#!/bin/sh\n"
-            ": \"${WATCHDOG_CAFFEINATE_PID_FILE:?missing PID file}\"\n"
-            "if [ -n \"${WATCHDOG_CAFFEINATE_START_DELAY:-}\" ]; then\n"
-            "  sleep \"$WATCHDOG_CAFFEINATE_START_DELAY\"\n"
+            ": \"${WATCHDOG_INHIBITOR_PID_FILE:?missing PID file}\"\n"
+            "if [ -n \"${WATCHDOG_INHIBITOR_START_DELAY:-}\" ]; then\n"
+            "  sleep \"$WATCHDOG_INHIBITOR_START_DELAY\"\n"
             "fi\n"
-            "printf '%s\\n' \"$$\" > \"$WATCHDOG_CAFFEINATE_PID_FILE\"\n"
-            "exec /usr/bin/caffeinate \"$@\"\n",
+            "printf '%s\\n' \"$$\" > \"$WATCHDOG_INHIBITOR_PID_FILE\"\n"
+            f"exec {INHIBITOR_BINARY} \"$@\"\n",
             encoding="utf-8",
         )
-        caffeinate.chmod(0o700)
+        inhibitor.chmod(0o700)
 
-        pmset = self.shims / "pmset"
-        pmset.write_text(
-            "#!/bin/sh\n"
-            ": \"${WATCHDOG_PMSET_ATTEMPT_FILE:?missing sentinel file}\"\n"
-            "printf '%s\\n' \"$*\" >> \"$WATCHDOG_PMSET_ATTEMPT_FILE\"\n"
-            "exit 97\n",
-            encoding="utf-8",
-        )
-        pmset.chmod(0o700)
+        for name in SLEEP_SHIMS:
+            blocker = self.shims / name
+            blocker.write_text(
+                "#!/bin/sh\n"
+                ": \"${WATCHDOG_SLEEP_ATTEMPT_FILE:?missing sentinel file}\"\n"
+                "printf '%s\\n' \"$*\" >> \"$WATCHDOG_SLEEP_ATTEMPT_FILE\"\n"
+                "exit 97\n",
+                encoding="utf-8",
+            )
+            blocker.chmod(0o700)
 
     def _launch(
         self,
         discovery: str,
         idle_seconds: float = IDLE_SECONDS,
-        caffeinate_start_delay: float = 0,
+        inhibitor_start_delay: float = 0,
         source: str = "codex",
     ) -> _RunningWatchdog:
         env = os.environ.copy()
@@ -305,9 +350,9 @@ class IsolatedWatchdogTests(unittest.TestCase):
                 "XDG_DATA_HOME": str(self.xdg_data_home),
                 "OPENCODE_DB": str(self.opencode_db),
                 "PATH": os.pathsep.join((str(self.shims), "/usr/bin", "/bin")),
-                "WATCHDOG_CAFFEINATE_PID_FILE": str(self.caffeinate_pid_file),
-                "WATCHDOG_CAFFEINATE_START_DELAY": str(caffeinate_start_delay),
-                "WATCHDOG_PMSET_ATTEMPT_FILE": str(self.pmset_attempt_file),
+                "WATCHDOG_INHIBITOR_PID_FILE": str(self.inhibitor_pid_file),
+                "WATCHDOG_INHIBITOR_START_DELAY": str(inhibitor_start_delay),
+                "WATCHDOG_SLEEP_ATTEMPT_FILE": str(self.sleep_attempt_file),
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
         )
@@ -337,7 +382,7 @@ class IsolatedWatchdogTests(unittest.TestCase):
             text=True,
             bufsize=1,
         )
-        running = _RunningWatchdog(process, self.caffeinate_pid_file)
+        running = _RunningWatchdog(process, self.inhibitor_pid_file)
         self.running.append(running)
         return running
 
@@ -349,36 +394,36 @@ class IsolatedWatchdogTests(unittest.TestCase):
 
     def _wait_for_holding_handshake(self, running: _RunningWatchdog, source: str = "codex") -> int:
         running.wait_for(r"watching 1 .*activity target")
-        caffeinate_pid = running.wait_for_caffeinate_pid()
+        inhibitor_pid = running.wait_for_inhibitor_pid()
         running.wait_for(r"source guards:.*" + re.escape(source) + "=holding")
-        return caffeinate_pid
+        return inhibitor_pid
 
-    def _assert_no_pmset_attempt(self) -> None:
+    def _assert_no_sleep_attempt(self) -> None:
         self.assertFalse(
-            self.pmset_attempt_file.exists(),
-            "dry-run invoked the fail-closed pmset sentinel",
+            self.sleep_attempt_file.exists(),
+            "dry-run invoked the fail-closed sleep sentinel",
         )
 
     def _assert_child_released(self, running: _RunningWatchdog) -> None:
-        pid = running.wait_for_caffeinate_pid()
+        pid = running.wait_for_inhibitor_pid()
         deadline = time.monotonic() + 3
         while _pid_exists(pid) and time.monotonic() < deadline:
             time.sleep(0.02)
-        self.assertFalse(_pid_exists(pid), f"owned caffeinate PID {pid} survived exit")
-        self._assert_no_pmset_attempt()
+        self.assertFalse(_pid_exists(pid), f"owned {INHIBITOR_SHIM} PID {pid} survived exit")
+        self._assert_no_sleep_attempt()
         print(json.dumps({
             "test": self._testMethodName,
             "watchdog_pid": running.process.pid,
-            "caffeinate_pid": pid,
-            "caffeinate_released": True,
-            "pmset_invoked": False,
+            "inhibitor_pid": pid,
+            "inhibitor_released": True,
+            "sleep_invoked": False,
             "admission_lines": [line for line in running.lines if ADMISSION_PATTERN.search(line)],
         }), flush=True)
 
     def test_live_mode_admits_new_rollout_once_and_extends_hold(self) -> None:
         first = self.codex_home / "sessions" / "2026" / "09" / "05" / "rollout-first.jsonl"
         keepalive = self._start_keepalive(first)
-        running = self._launch("live", caffeinate_start_delay=2.0)
+        running = self._launch("live", inhibitor_start_delay=2.0)
         self._wait_for_holding_handshake(running)
         first_written = keepalive.stop()
 
@@ -447,12 +492,12 @@ class IsolatedWatchdogTests(unittest.TestCase):
         self.assertEqual(sum(bool(ADMISSION_PATTERN.search(line)) for line in running.lines), 1)
         self._assert_child_released(running)
 
-    def test_sigterm_releases_only_the_watchdogs_caffeinate_child(self) -> None:
+    def test_sigterm_releases_only_the_watchdogs_inhibitor_child(self) -> None:
         rollout = self.codex_home / "sessions" / "rollout-signal.jsonl"
         _write_rollout(rollout)
         running = self._launch("live", idle_seconds=60)
-        caffeinate_pid = self._wait_for_holding_handshake(running)
-        self.assertTrue(_pid_exists(caffeinate_pid))
+        inhibitor_pid = self._wait_for_holding_handshake(running)
+        self.assertTrue(_pid_exists(inhibitor_pid))
 
         running.process.send_signal(signal.SIGTERM)
         running.process.wait(timeout=3)

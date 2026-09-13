@@ -1378,7 +1378,7 @@ class ExitReportTests(unittest.TestCase):
         self.assertIn('Last recorded activity', plain)
         self.assertNotIn('q exit', plain)
         self.assertNotIn('\x1b', plain)
-        self.assertNotIn('sleeping Mac', plain)
+        self.assertNotIn('sleeping this machine', plain)
         colored = '\n'.join(wd_reporting.exit_report_lines(history, wd_models.Config(), 0, '', color=True))
         self.assertIn('\x1b[', colored)
         self.assertNotIn('\x1b', __import__('re').sub(r'\x1b\[[0-9;]*m', '', colored))
@@ -1591,7 +1591,7 @@ class DashboardLifecycleTests(unittest.TestCase):
 
         item, process, patches = self._main_patches(
             cfg, curses,
-            _stop_caffeinate=mock.patch.object(wd_power, "_stop_caffeinate", side_effect=interrupted_cleanup),
+            _stop_wake_assertion=mock.patch.object(wd_power, "_stop_wake_assertion", side_effect=interrupted_cleanup),
         )
         with ExitStack() as stack:
             for patch in patches.values():

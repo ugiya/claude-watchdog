@@ -7,6 +7,27 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Linux support. The wake assertion is `systemd-inhibit --what=idle:sleep
+  --mode=block` (falling back to `gnome-session-inhibit`) and sleep is
+  `systemctl suspend` (falling back to `loginctl suspend`). The inhibitor holds
+  a pipe owned by the watchdog, so it is released the instant the watchdog
+  exits, including on `SIGKILL`.
+- Linux user presence, tried in order: GNOME `Mutter.IdleMonitor`,
+  `org.freedesktop.ScreenSaver.GetSessionIdleTime`, `xprintidle`, then
+  systemd-logind's idle hint. When no source answers, the run reports that at
+  startup and names `--user-idle-minutes 0` rather than guessing presence.
+- `scripts/check.py --integration` and the isolated lifecycle and PTY suites now
+  run on Linux. They skip cleanly when the host has no usable logind.
+
+### Changed
+
+- `ps` is resolved from the absolute allowlist `/bin/ps`, `/usr/bin/ps` so
+  split-`/usr` distributions work without trusting `PATH`.
+- Log messages and `power._stop_caffeinate` are named for the platform-neutral
+  "wake assertion"; `_stop_caffeinate` remains as an alias.
+
 ## [0.1.2] - 2026-09-12
 
 Prerelease. Sleep guards still use persisted activity timestamps, not process

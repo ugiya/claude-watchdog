@@ -14,10 +14,10 @@ profile configuration + agent JSONL / OpenCode SQLite
   newest persisted timestamps             terminal dashboard
              |
              v
-  session quiet gate -> macOS user-idle gate
+  session quiet gate -> user-idle gate
              |
              v
-  restore terminal -> release caffeinate -> final report -> pmset sleepnow
+  restore terminal -> release wake assertion -> final report -> sleep command
 ```
 
 ## Source and distribution boundaries
@@ -59,7 +59,7 @@ At launch, a run using source `auto` or `claude` loads the built-in Claude
 projects directory and any profiles declared in
 `~/.config/claude-watchdog/profiles.json`, or in the path selected with
 `--profiles-file`. It validates and freezes this set of directories and labels
-before starting `caffeinate`. The omitted default file means zero custom
+before starting the wake assertion. The omitted default file means zero custom
 profiles; an explicitly selected missing file or invalid configuration aborts
 before the wake assertion starts. Non-Claude-only source selections do not load
 the default registry and reject an explicit `--profiles-file`.
@@ -110,24 +110,34 @@ sessions across providers. Registry relationships change presentation only.
 ## Quietness and power sequence
 
 Every watched source must first reach `idle_minutes` without persisted
-activity. Only then does the watchdog query `ioreg -c IOHIDSystem` and compare
+activity. Only then does the watchdog read user idle time and compare
 `HIDIdleTime` with `--user-idle-minutes`. User activity delays the decision; a
 new persisted agent event restarts the session quiet period.
 
 The wake assertion is an owned child process:
 
 ```text
-caffeinate -is -w <watchdog-pid>
+macOS:  caffeinate -is -w <watchdog-pid>
+Linux:  systemd-inhibit --what=idle:sleep --mode=block cat   (stdin is an
+        owned pipe, so the inhibitor is released the instant this process
+        exits, including on SIGKILL)
 ```
 
 On a successful decision, the watchdog restores the terminal, releases the
-owned `caffeinate`, emits a final report, and runs `pmset sleepnow`. `--dry-run`
+owned wake assertion, emits a final report, and runs the platform sleep command
+(`pmset sleepnow` on macOS, `systemctl suspend` on Linux). `--dry-run`
 logs the last step without executing it. Interrupts and failures release the
 wake assertion when possible and skip sleep. A failure to restore the terminal,
-release `caffeinate`, or emit the final report also skips sleep.
+release the wake assertion, or emit the final report also skips sleep.
 
-This sequence does not override macOS lid-closed behavior and does not prove
-that macOS entered sleep after accepting the command.
+This sequence does not override lid-closed behavior and does not prove that the
+machine entered sleep after accepting the command.
+
+Presence sources differ by platform. macOS reads `ioreg -c IOHIDSystem`. Linux
+tries GNOME's Mutter IdleMonitor, `org.freedesktop.ScreenSaver`, `xprintidle`,
+then logind's idle hint, and reports that none answered rather than guessing;
+wlroots desktops such as COSMIC expose idle only over `ext-idle-notify-v1` and
+need `--user-idle-minutes 0`.
 
 ## Display model
 

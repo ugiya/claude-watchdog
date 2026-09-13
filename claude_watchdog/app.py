@@ -191,7 +191,7 @@ def wait_until_quiet(
                 "all source guards quiet (%s), user idle %ds -> %s",
                 source_status,
                 int(idle or 0),
-                "dry-run sleep decision" if cfg.dry_run else "sleeping Mac",
+                "dry-run sleep decision" if cfg.dry_run else "sleeping this machine",
             )
             return
         if sessions_quiet:
@@ -233,13 +233,13 @@ def _run_watch_phase(
     except KeyboardInterrupt:
         return None, 130, (
             logging.INFO,
-            "interrupted while starting caffeinate; exiting without sleeping",
+            "interrupted while starting the wake assertion; exiting without sleeping",
             (),
         )
     except OSError as exc:
         return None, 1, (
             logging.ERROR,
-            "unable to start caffeinate; exiting without sleeping: %s",
+            "unable to start the wake assertion; exiting without sleeping: %s",
             (exc,),
         )
 
@@ -271,7 +271,7 @@ def _run_watch_phase(
     return process, 0, (
         logging.INFO,
         "all guards satisfied; wake assertion released%s",
-        ("; dry-run sleep decision follows" if cfg.dry_run else "; sleeping Mac",),
+        ("; dry-run sleep decision follows" if cfg.dry_run else "; sleeping this machine",),
     )
 
 
@@ -284,21 +284,21 @@ def _release_watch_process(
     if process is None:
         return status, record
     try:
-        power_module._stop_caffeinate(process)
+        power_module._stop_wake_assertion(process)
     except KeyboardInterrupt:
         try:
-            power_module._stop_caffeinate(process)
+            power_module._stop_wake_assertion(process)
         except BaseException:
             pass
         return 130, (
             logging.INFO,
-            "interrupted while releasing caffeinate; exiting without sleeping",
+            "interrupted while releasing the wake assertion; exiting without sleeping",
             (),
         )
     except Exception as exc:
         return 1, (
             logging.ERROR,
-            "unable to release caffeinate cleanly; exiting without sleeping: %s",
+            "unable to release the wake assertion cleanly; exiting without sleeping: %s",
             (exc,),
         )
     return status, record
@@ -327,6 +327,16 @@ def main(argv: list[str] | None = None) -> int:
         cfg.poll_seconds,
         " [dry-run]" if cfg.dry_run else "",
     )
+    if cfg.user_idle_seconds > 0:
+        source = power_module.presence_source()
+        if source is None:
+            models_module.log.warning(
+                "no user-presence source is available on this desktop; the watch will "
+                "abort instead of sleeping once sessions go quiet. Re-run with "
+                "--user-idle-minutes 0 to sleep on session quiet alone"
+            )
+        else:
+            models_module.log.info("user-presence source: %s", source)
 
     try:
         candidates = (

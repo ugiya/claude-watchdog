@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1128,7 +1129,7 @@ class QuietnessAndPowerTests(unittest.TestCase):
         with mock.patch.object(
             wd_power.subprocess, "Popen", return_value=process
         ) as popen:
-            self.assertIs(wd_power.block_sleep(), process)
+            self.assertIs(wd_power._darwin_block_sleep(), process)
         popen.assert_called_once_with(
             ["caffeinate", "-is", "-w", str(os.getpid())]
         )
@@ -1141,7 +1142,7 @@ class QuietnessAndPowerTests(unittest.TestCase):
             0,
         ]
 
-        wd_power._stop_caffeinate(process)
+        wd_power._stop_wake_assertion(process)
 
         process.terminate.assert_called_once_with()
         process.kill.assert_called_once_with()
@@ -1292,7 +1293,7 @@ class QuietnessAndPowerTests(unittest.TestCase):
             side_effect=OSError("ioreg unavailable"),
         ):
             with self.assertRaises(wd_models.PresenceCheckError):
-                wd_power.user_idle_seconds()
+                wd_power._darwin_user_idle_seconds()
 
     def test_dry_run_never_invokes_pmset(self):
         with mock.patch.object(wd_power.subprocess, "run") as run:
@@ -1305,7 +1306,9 @@ class QuietnessAndPowerTests(unittest.TestCase):
             ["pmset", "sleepnow"],
             stderr="not permitted",
         )
-        with mock.patch.object(wd_power.subprocess, "run", side_effect=failure):
+        with mock.patch.object(
+            wd_power, "sleep_commands", return_value=(["pmset", "sleepnow"],)
+        ), mock.patch.object(wd_power.subprocess, "run", side_effect=failure):
             with self.assertRaisesRegex(wd_models.PowerCommandError, "not permitted"):
                 wd_power.force_sleep(False)
 
@@ -1559,6 +1562,189 @@ class CliAndLifecycleTests(unittest.TestCase):
         process.terminate.assert_called_once_with()
         process.wait.assert_called_once_with(timeout=5)
         force_sleep.assert_not_called()
+
+
+class LinuxPowerBackendTests(unittest.TestCase):
+    """The Linux backend is exercised on every platform, macOS included."""
+
+    def test_gdbus_scalar_parsing_accepts_typed_tuples_and_rejects_noise(self):
+        cases = {
+            "(uint64 90210,)\n": 90210,
+            "(uint32 12,)": 12,
+            "(0,)": 0,
+            "(int64 7,)\n": 7,
+        }
+        for output, expected in cases.items():
+            with self.subTest(output=output):
+                self.assertEqual(wd_power._gdbus_unsigned(output), expected)
+        for output in (None, "", "()", "(-5,)", "nope", "(uint64 x,)"):
+            with self.subTest(output=output):
+                self.assertIsNone(wd_power._gdbus_unsigned(output))
+
+    def test_mutter_and_xprintidle_convert_milliseconds_to_seconds(self):
+        with mock.patch.object(wd_power, "_probe", return_value="(uint64 2500,)"):
+            self.assertEqual(wd_power._idle_from_mutter(), 2.5)
+        with mock.patch.object(wd_power, "_probe", return_value="4200\n"):
+            self.assertEqual(wd_power._idle_from_xprintidle(), 4.2)
+
+    def test_screensaver_reports_whole_seconds(self):
+        with mock.patch.object(wd_power, "_probe", return_value="(uint32 61,)"):
+            self.assertEqual(wd_power._idle_from_screensaver(), 61.0)
+
+    def test_unanswered_probes_yield_no_reading(self):
+        with mock.patch.object(wd_power, "_probe", return_value=None):
+            self.assertIsNone(wd_power._idle_from_mutter())
+            self.assertIsNone(wd_power._idle_from_screensaver())
+            self.assertIsNone(wd_power._idle_from_xprintidle())
+
+    def test_logind_idle_hint_of_no_is_treated_as_no_answer(self):
+        """wlroots desktops never set the hint; 'no' must not mean 'user here'."""
+        output = "IdleHint=no\nIdleSinceHintMonotonic=0\n"
+        with mock.patch.object(wd_power, "_logind_session_id", return_value="3"), \
+             mock.patch.object(wd_power, "_probe", return_value=output):
+            self.assertIsNone(wd_power._idle_from_logind())
+
+    def test_logind_idle_hint_of_yes_measures_elapsed_monotonic_time(self):
+        now = time.clock_gettime(time.CLOCK_MONOTONIC)
+        since = int((now - 42) * 1_000_000)
+        output = f"IdleHint=yes\nIdleSinceHintMonotonic={since}\n"
+        with mock.patch.object(wd_power, "_logind_session_id", return_value="3"), \
+             mock.patch.object(wd_power, "_probe", return_value=output):
+            self.assertAlmostEqual(wd_power._idle_from_logind(), 42, delta=5)
+
+    def test_first_answering_source_wins(self):
+        with mock.patch.object(wd_power, "LINUX_PRESENCE_SOURCES", (
+            ("silent", lambda: None),
+            ("answers", lambda: 12.5),
+            ("never reached", lambda: 99.0),
+        )):
+            self.assertEqual(wd_power._linux_user_idle_seconds(), 12.5)
+
+    def test_no_idle_source_names_the_escape_hatch(self):
+        with mock.patch.object(wd_power, "LINUX_PRESENCE_SOURCES", (
+            ("silent", lambda: None),
+        )):
+            with self.assertRaisesRegex(
+                wd_models.PresenceCheckError, "--user-idle-minutes 0"
+            ):
+                wd_power._linux_user_idle_seconds()
+
+    def test_systemd_inhibit_blocks_idle_and_sleep_and_owns_a_lifetime_pipe(self):
+        process = mock.Mock()
+        with mock.patch.object(wd_power.shutil, "which", side_effect=lambda name: (
+            "/usr/bin/systemd-inhibit" if name == "systemd-inhibit" else None
+        )), mock.patch.object(
+            wd_power.subprocess, "Popen", return_value=process
+        ) as popen:
+            self.assertIs(wd_power._linux_block_sleep(), process)
+        argv, kwargs = popen.call_args.args[0], popen.call_args.kwargs
+        self.assertEqual(argv[0], "/usr/bin/systemd-inhibit")
+        self.assertIn("--what=idle:sleep", argv)
+        self.assertIn("--mode=block", argv)
+        self.assertEqual(argv[-1], "cat")
+        self.assertTrue(any(f"pid {os.getpid()}" in part for part in argv))
+        self.assertIs(kwargs["stdin"], wd_power.subprocess.PIPE)
+
+    def test_gnome_session_inhibit_is_the_fallback(self):
+        with mock.patch.object(wd_power.shutil, "which", side_effect=lambda name: (
+            "/usr/bin/gnome-session-inhibit" if name == "gnome-session-inhibit" else None
+        )), mock.patch.object(wd_power.subprocess, "Popen") as popen:
+            wd_power._linux_block_sleep()
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], "/usr/bin/gnome-session-inhibit")
+        self.assertIn("suspend:idle", argv)
+        self.assertEqual(argv[-1], "cat")
+
+    def test_missing_inhibitor_raises_oserror_so_the_watch_exits_cleanly(self):
+        with mock.patch.object(wd_power.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(OSError, "systemd-inhibit"):
+                wd_power._linux_block_sleep()
+
+    def test_releasing_a_wake_assertion_closes_the_pipe_before_signalling(self):
+        order = []
+        process = mock.Mock()
+        process.stdin.close.side_effect = lambda: order.append("close")
+        process.terminate.side_effect = lambda: order.append("terminate")
+        process.poll.return_value = None
+        process.wait.return_value = 0
+
+        wd_power._stop_wake_assertion(process)
+
+        self.assertEqual(order, ["close", "terminate"])
+
+    def test_already_exited_child_is_not_signalled(self):
+        process = mock.Mock()
+        process.stdin = None
+        process.poll.return_value = 0
+        wd_power._stop_wake_assertion(process)
+        process.terminate.assert_not_called()
+
+    def test_linux_sleep_falls_back_from_systemctl_to_loginctl(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if argv[0] == "systemctl":
+                raise subprocess.CalledProcessError(1, argv, stderr="refused")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(wd_power, "_backend", return_value=wd_power.LINUX), \
+             mock.patch.object(wd_power.subprocess, "run", side_effect=run):
+            wd_power.force_sleep(False)
+        self.assertEqual(calls, [["systemctl", "suspend"], ["loginctl", "suspend"]])
+
+    def test_every_linux_sleep_failure_is_reported_together(self):
+        def run(argv, **kwargs):
+            raise subprocess.CalledProcessError(1, argv, stderr=f"{argv[0]} denied")
+
+        with mock.patch.object(wd_power, "_backend", return_value=wd_power.LINUX), \
+             mock.patch.object(wd_power.subprocess, "run", side_effect=run):
+            with self.assertRaises(wd_models.PowerCommandError) as raised:
+                wd_power.force_sleep(False)
+        self.assertIn("systemctl denied", str(raised.exception))
+        self.assertIn("loginctl denied", str(raised.exception))
+
+    def test_linux_dry_run_names_systemctl_without_running_it(self):
+        with mock.patch.object(wd_power, "_backend", return_value=wd_power.LINUX), \
+             mock.patch.object(wd_power.subprocess, "run") as run:
+            wd_power.force_sleep(True)
+        run.assert_not_called()
+
+    def test_dispatch_routes_each_platform_to_its_own_backend(self):
+        for backend, idle, block in (
+            (wd_power.DARWIN, "_darwin_user_idle_seconds", "_darwin_block_sleep"),
+            (wd_power.LINUX, "_linux_user_idle_seconds", "_linux_block_sleep"),
+        ):
+            with self.subTest(backend=backend):
+                with mock.patch.object(wd_power, "_backend", return_value=backend), \
+                     mock.patch.object(wd_power, idle, return_value=7.0) as idle_mock, \
+                     mock.patch.object(wd_power, block) as block_mock:
+                    self.assertEqual(wd_power.user_idle_seconds(), 7.0)
+                    wd_power.block_sleep()
+                idle_mock.assert_called_once_with()
+                block_mock.assert_called_once_with()
+
+    def test_unsupported_platform_is_refused_rather_than_guessed(self):
+        with mock.patch.object(wd_power, "_backend", return_value=None):
+            with self.assertRaises(wd_models.PresenceCheckError):
+                wd_power.user_idle_seconds()
+            with self.assertRaises(OSError):
+                wd_power.block_sleep()
+            with self.assertRaises(wd_models.PowerCommandError):
+                wd_power.force_sleep(False)
+            self.assertIsNone(wd_power.presence_source())
+
+    def test_presence_source_reports_the_first_available_reader(self):
+        with mock.patch.object(wd_power, "_backend", return_value=wd_power.LINUX), \
+             mock.patch.object(wd_power, "LINUX_PRESENCE_SOURCES", (
+                 ("silent", lambda: None), ("logind", lambda: 3.0),
+             )):
+            self.assertEqual(wd_power.presence_source(), "logind")
+        with mock.patch.object(wd_power, "_backend", return_value=wd_power.LINUX), \
+             mock.patch.object(wd_power, "LINUX_PRESENCE_SOURCES", (
+                 ("silent", lambda: None),
+             )):
+            self.assertIsNone(wd_power.presence_source())
 
 
 if __name__ == "__main__":
