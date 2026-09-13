@@ -1,11 +1,13 @@
-"""macOS presence and owned power-management commands."""
+"""macOS keep-awake, HID idle, and suspend adapters."""
 
 from __future__ import annotations
 
 import os
 import subprocess
 
-from . import models as models_module
+from ... import models as models_module
+from .. import _types as types_module
+
 
 def user_idle_seconds() -> float:
     """Return HID idle seconds, or raise when macOS presence is unavailable."""
@@ -46,7 +48,7 @@ def _stop_caffeinate(process: subprocess.Popen) -> None:
         process.kill()
         process.wait()
     except ProcessLookupError:
-        pass  # The owned child exited between poll() and terminate().
+        pass
 
 
 def force_sleep(dry_run: bool) -> None:
@@ -69,3 +71,42 @@ def force_sleep(dry_run: bool) -> None:
         raise models_module.PowerCommandError(
             f"pmset sleepnow failed with exit status {exc.returncode}{suffix}"
         ) from exc
+
+
+class MacKeepAwake:
+    name = "macos"
+
+    def __init__(self) -> None:
+        self._process: subprocess.Popen | None = None
+
+    def acquire(self) -> None:
+        self._process = block_sleep()
+
+    def release(self) -> None:
+        process = self._process
+        self._process = None
+        if process is not None:
+            _stop_caffeinate(process)
+
+    def healthy(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+
+class MacIdle:
+    name = "macos"
+
+    def observe(self, threshold_seconds: float) -> types_module.IdleObservation:
+        seconds = user_idle_seconds()
+        kind = (
+            types_module.IdleKind.READY
+            if seconds >= threshold_seconds
+            else types_module.IdleKind.WAITING
+        )
+        return types_module.IdleObservation(kind=kind, seconds=seconds, source=self.name)
+
+
+class MacSuspend:
+    name = "macos"
+
+    def request(self, *, dry_run: bool) -> None:
+        force_sleep(dry_run)

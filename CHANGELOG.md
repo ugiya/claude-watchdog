@@ -7,6 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- A platform-neutral `power` session that selects macOS or systemd-logind
+  adapters for keep-awake, human idle, and suspend. Linux suspend is requested
+  without sudo; human-idle detection is unavailable unless the session reports
+  it or `--user-idle-minutes 0` disables that gate.
+
 ## [0.1.2] - 2026-09-12
 
 Prerelease. Sleep guards still use persisted activity timestamps, not process

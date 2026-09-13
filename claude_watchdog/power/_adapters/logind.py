@@ -1,0 +1,169 @@
+"""systemd-logind keep-awake, session idle, and suspend adapters."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import time
+
+from ... import models as models_module
+from .. import _types as types_module
+
+
+def logind_tools_available() -> bool:
+    return shutil.which("systemd-inhibit") is not None and shutil.which("systemctl") is not None
+
+
+def can_suspend() -> str:
+    busctl = shutil.which("busctl")
+    if busctl is None:
+        return "unknown"
+    try:
+        output = subprocess.check_output(
+            [
+                busctl,
+                "--system",
+                "--allow-interactive-authorization=no",
+                "--timeout=5s",
+                "call",
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                "CanSuspend",
+            ],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    text = output.strip().strip('"')
+    if text.startswith("s "):
+        text = text[2:].strip().strip('"')
+    return text or "unknown"
+
+
+class LogindKeepAwake:
+    name = "logind"
+
+    def __init__(self) -> None:
+        self._process: subprocess.Popen | None = None
+
+    def acquire(self) -> None:
+        inhibit = shutil.which("systemd-inhibit")
+        if inhibit is None:
+            raise models_module.PowerCommandError("systemd-inhibit is not available")
+        self._process = subprocess.Popen(
+            [
+                inhibit,
+                "--no-ask-password",
+                "--what=idle:sleep",
+                "--mode=block",
+                "--who=claude-watchdog",
+                "--why=Watching selected agent activity",
+                "sleep",
+                "infinity",
+            ]
+        )
+
+    def release(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None or process.poll() is not None:
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        except ProcessLookupError:
+            pass
+
+    def healthy(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+
+class LogindIdle:
+    name = "logind-session"
+
+    def observe(self, threshold_seconds: float) -> types_module.IdleObservation:
+        session = os.environ.get("XDG_SESSION_ID", "").strip()
+        loginctl = shutil.which("loginctl")
+        if not session or loginctl is None:
+            return types_module.IdleObservation(
+                kind=types_module.IdleKind.UNKNOWN, source=self.name
+            )
+        try:
+            output = subprocess.check_output(
+                [
+                    loginctl,
+                    "show-session",
+                    session,
+                    "-p",
+                    "IdleHint",
+                    "-p",
+                    "IdleSinceHintMonotonic",
+                ],
+                text=True,
+                stderr=subprocess.STDOUT,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return types_module.IdleObservation(
+                kind=types_module.IdleKind.UNKNOWN, source=self.name
+            )
+        hint = None
+        since_us = None
+        for line in output.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key == "IdleHint":
+                hint = value.strip().lower()
+            elif key == "IdleSinceHintMonotonic":
+                try:
+                    since_us = int(value.strip())
+                except ValueError:
+                    since_us = None
+        if hint != "yes" or since_us is None:
+            return types_module.IdleObservation(
+                kind=types_module.IdleKind.WAITING, seconds=0.0, source=self.name
+            )
+        age = max(0.0, time.clock_gettime(time.CLOCK_MONOTONIC) - (since_us / 1_000_000))
+        kind = (
+            types_module.IdleKind.READY
+            if age >= threshold_seconds
+            else types_module.IdleKind.WAITING
+        )
+        return types_module.IdleObservation(kind=kind, seconds=age, source=self.name)
+
+
+class LogindSuspend:
+    name = "logind"
+
+    def request(self, *, dry_run: bool) -> None:
+        if dry_run:
+            models_module.log.info(
+                "[dry-run] would run: systemctl --no-ask-password --check-inhibitors=yes suspend"
+            )
+            return
+        systemctl = shutil.which("systemctl")
+        if systemctl is None:
+            raise models_module.PowerCommandError("systemctl is not available")
+        try:
+            subprocess.run(
+                [systemctl, "--no-ask-password", "--check-inhibitors=yes", "suspend"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise models_module.PowerCommandError(
+                f"unable to run systemctl suspend: {exc}"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip()
+            suffix = f": {detail[:300]}" if detail else ""
+            raise models_module.PowerCommandError(
+                f"systemctl suspend failed with exit status {exc.returncode}{suffix}"
+            ) from exc

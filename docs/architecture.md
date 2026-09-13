@@ -14,10 +14,10 @@ profile configuration + agent JSONL / OpenCode SQLite
   newest persisted timestamps             terminal dashboard
              |
              v
-  session quiet gate -> macOS user-idle gate
+   session quiet gate -> user-idle gate
              |
              v
-  restore terminal -> release caffeinate -> final report -> pmset sleepnow
+   restore terminal -> release keep-awake hold -> final report -> suspend request
 ```
 
 ## Source and distribution boundaries
@@ -36,7 +36,7 @@ Runtime responsibilities are separated into ordinary Python modules:
 | `metadata` | Observational provider metadata and lineage |
 | `dashboard` | Terminal rendering, navigation, and restoration |
 | `reporting` | Bounded poll history and final reports |
-| `power` | User presence and owned power-command operations |
+| `power` | Platform-neutral keep-awake, human-idle, and suspend session |
 | `app` | Polling and lifecycle orchestration |
 
 Imports are acyclic. Configuration, activity, and power do not depend on metadata,
@@ -59,7 +59,7 @@ At launch, a run using source `auto` or `claude` loads the built-in Claude
 projects directory and any profiles declared in
 `~/.config/claude-watchdog/profiles.json`, or in the path selected with
 `--profiles-file`. It validates and freezes this set of directories and labels
-before starting `caffeinate`. The omitted default file means zero custom
+before starting the keep-awake hold. The omitted default file means zero custom
 profiles; an explicitly selected missing file or invalid configuration aborts
 before the wake assertion starts. Non-Claude-only source selections do not load
 the default registry and reject an explicit `--profiles-file`.
@@ -110,21 +110,28 @@ sessions across providers. Registry relationships change presentation only.
 ## Quietness and power sequence
 
 Every watched source must first reach `idle_minutes` without persisted
-activity. Only then does the watchdog query `ioreg -c IOHIDSystem` and compare
-`HIDIdleTime` with `--user-idle-minutes`. User activity delays the decision; a
-new persisted agent event restarts the session quiet period.
+activity. Only then does the watchdog query the selected human-idle adapter
+  and compare it with `--user-idle-minutes`. User activity delays the decision; a
+  new persisted agent event restarts the session quiet period.
 
-The wake assertion is an owned child process:
+The wake assertion is an owned keep-awake hold selected by the `power` module.
+On macOS that hold is:
 
 ```text
 caffeinate -is -w <watchdog-pid>
 ```
 
+On systemd Linux it is a `systemd-inhibit` idle:sleep block. Human-idle
+observation is adapter-specific: macOS uses HID idle seconds; Linux uses
+session idle hints when available, otherwise reports the user-idle state as
+unavailable unless `--user-idle-minutes 0`.
+
 On a successful decision, the watchdog restores the terminal, releases the
-owned `caffeinate`, emits a final report, and runs `pmset sleepnow`. `--dry-run`
+owned hold, emits a final report, and requests suspend (`pmset sleepnow` or
+`systemctl --no-ask-password --check-inhibitors=yes suspend`). `--dry-run`
 logs the last step without executing it. Interrupts and failures release the
 wake assertion when possible and skip sleep. A failure to restore the terminal,
-release `caffeinate`, or emit the final report also skips sleep.
+release the hold, or emit the final report also skips sleep.
 
 This sequence does not override macOS lid-closed behavior and does not prove
 that macOS entered sleep after accepting the command.

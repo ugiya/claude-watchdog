@@ -1398,13 +1398,13 @@ class CliAndLifecycleTests(unittest.TestCase):
             path.write_text("{", encoding="utf-8")
             stderr = io.StringIO()
             with (
-                mock.patch.object(wd_power, "block_sleep") as block_sleep,
+                mock.patch.object(wd_power, "open_session") as open_session,
                 mock.patch("sys.stderr", new=stderr),
             ):
                 self.assertEqual(
                     wd_app.main(["--profiles-file", str(path)]), 1
                 )
-            block_sleep.assert_not_called()
+            open_session.assert_not_called()
             self.assertIn("not valid JSON", stderr.getvalue())
 
     def test_cli_rejects_invalid_timing_values(self):
@@ -1428,10 +1428,10 @@ class CliAndLifecycleTests(unittest.TestCase):
             mock.patch.object(wd_config, "parse_args", return_value=cfg),
             mock.patch.object(wd_app, "setup_logging"),
             mock.patch.object(wd_activity, "activity_files", return_value=[]),
-            mock.patch.object(wd_power, "block_sleep") as block_sleep,
+            mock.patch.object(wd_power, "open_session") as open_session,
         ):
             self.assertEqual(wd_app.main([]), 1)
-        block_sleep.assert_not_called()
+        open_session.assert_not_called()
 
     def test_opencode_selection_error_exits_without_caffeinate(self):
         cfg = wd_models.Config(source="opencode")
@@ -1443,10 +1443,10 @@ class CliAndLifecycleTests(unittest.TestCase):
                 mock.patch.object(wd_config, "parse_args", return_value=cfg),
                 mock.patch.object(wd_app, "setup_logging"),
                 mock.patch.object(wd_activity, "activity_files", return_value=[item]),
-                mock.patch.object(wd_power, "block_sleep") as block_sleep,
+                mock.patch.object(wd_power, "open_session") as open_session,
             ):
                 self.assertEqual(wd_app.main([]), 1)
-            block_sleep.assert_not_called()
+            open_session.assert_not_called()
 
     def test_opencode_lineage_schema_is_validated_before_caffeinate(self):
         launch = datetime.now(timezone.utc)
@@ -1472,79 +1472,69 @@ class CliAndLifecycleTests(unittest.TestCase):
                 mock.patch.object(wd_config, "parse_args", return_value=cfg),
                 mock.patch.object(wd_app, "setup_logging"),
                 mock.patch.object(wd_activity, "activity_files", return_value=[item]),
-                mock.patch.object(wd_power, "block_sleep") as block_sleep,
+                mock.patch.object(wd_power, "open_session") as open_session,
             ):
                 self.assertEqual(wd_app.main([]), 1)
-            block_sleep.assert_not_called()
+            open_session.assert_not_called()
 
     def test_successful_dry_run_releases_caffeinate_then_skips_sleep(self):
         cfg = wd_models.Config(source="codex", dry_run=True, display="log")
         item = wd_models.ActivityFile(Path("rollout.jsonl"), "codex")
-        process = mock.Mock()
-        process.poll.return_value = None
-        process.wait.return_value = 0
+        session = mock.Mock()
         with (
             mock.patch.object(wd_config, "parse_args", return_value=cfg),
             mock.patch.object(wd_app, "setup_logging"),
             mock.patch.object(wd_activity, "activity_files", return_value=[item]),
             mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
-            mock.patch.object(wd_power, "block_sleep", return_value=process),
+            mock.patch.object(wd_power, "open_session", return_value=session),
             mock.patch.object(wd_app, "wait_until_quiet") as wait_until_quiet,
-            mock.patch.object(wd_power, "force_sleep") as force_sleep,
         ):
             self.assertEqual(wd_app.main([]), 0)
 
-        wait_until_quiet.assert_called_once_with(cfg, [item])
-        process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=5)
-        force_sleep.assert_called_once_with(True)
+        wait_until_quiet.assert_called_once()
+        self.assertEqual(wait_until_quiet.call_args.args[:2], (cfg, [item]))
+        self.assertIs(wait_until_quiet.call_args.kwargs["session"], session)
+        session.close.assert_called_once_with()
+        session.request_suspend.assert_called_once_with()
 
     def test_interrupt_releases_caffeinate_without_sleep(self):
         cfg = wd_models.Config(source="codex", dry_run=True, display="log")
         item = wd_models.ActivityFile(Path("rollout.jsonl"), "codex")
-        process = mock.Mock()
-        process.poll.return_value = None
-        process.wait.return_value = 0
+        session = mock.Mock()
         with (
             mock.patch.object(wd_config, "parse_args", return_value=cfg),
             mock.patch.object(wd_app, "setup_logging"),
             mock.patch.object(wd_activity, "activity_files", return_value=[item]),
             mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
-            mock.patch.object(wd_power, "block_sleep", return_value=process),
+            mock.patch.object(wd_power, "open_session", return_value=session),
             mock.patch.object(wd_app, "wait_until_quiet", side_effect=KeyboardInterrupt),
-            mock.patch.object(wd_power, "force_sleep") as force_sleep,
         ):
             self.assertEqual(wd_app.main([]), 130)
-        process.terminate.assert_called_once()
-        force_sleep.assert_not_called()
+        session.close.assert_called_once()
+        session.request_suspend.assert_not_called()
 
     def test_presence_error_releases_caffeinate_without_sleep(self):
         cfg = wd_models.Config(source="codex", display="log")
         item = wd_models.ActivityFile(Path("rollout.jsonl"), "codex")
-        process = mock.Mock()
-        process.poll.return_value = None
-        process.wait.return_value = 0
+        session = mock.Mock()
         with (
             mock.patch.object(wd_config, "parse_args", return_value=cfg),
             mock.patch.object(wd_app, "setup_logging"),
             mock.patch.object(wd_activity, "activity_files", return_value=[item]),
             mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
-            mock.patch.object(wd_power, "block_sleep", return_value=process),
+            mock.patch.object(wd_power, "open_session", return_value=session),
             mock.patch.object(wd_app, "wait_until_quiet",
                 side_effect=wd_models.PresenceCheckError("unavailable"),
             ),
-            mock.patch.object(wd_power, "force_sleep") as force_sleep,
         ):
             self.assertEqual(wd_app.main([]), 1)
-        process.terminate.assert_called_once()
-        force_sleep.assert_not_called()
+        session.close.assert_called_once()
+        session.request_suspend.assert_not_called()
 
     def test_refresh_error_releases_caffeinate_without_sleep(self):
         cfg = wd_models.Config(source="codex", session_discovery="live", display="log")
         item = wd_models.ActivityFile(Path("rollout.jsonl"), "codex")
-        process = mock.Mock()
-        process.poll.return_value = None
-        process.wait.return_value = 0
+        session = mock.Mock()
         with (
             mock.patch.object(wd_config, "parse_args", return_value=cfg),
             mock.patch.object(wd_app, "setup_logging"),
@@ -1552,13 +1542,11 @@ class CliAndLifecycleTests(unittest.TestCase):
                 side_effect=([item], wd_models.ActivityReadError("refresh denied")),
             ),
             mock.patch.object(wd_activity, "select_watch_set", return_value=[item]),
-            mock.patch.object(wd_power, "block_sleep", return_value=process),
-            mock.patch.object(wd_power, "force_sleep") as force_sleep,
+            mock.patch.object(wd_power, "open_session", return_value=session),
         ):
             self.assertEqual(wd_app.main([]), 1)
-        process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=5)
-        force_sleep.assert_not_called()
+        session.close.assert_called_once_with()
+        session.request_suspend.assert_not_called()
 
 
 if __name__ == "__main__":

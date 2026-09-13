@@ -29,10 +29,12 @@ experimental prerelease.
 
 ## Security boundaries
 
-`claude-watchdog` reads local agent state, starts `caffeinate`, queries macOS
-user-idle state with `ioreg`, and can execute `pmset sleepnow`. It does not
-provide sandboxing, authentication, remote access, or isolation from other
-software running as the same user.
+`claude-watchdog` reads local agent state, starts an owned keep-awake hold,
+queries user-idle state, and can request suspend. On macOS that uses
+`caffeinate`, `ioreg`, and `pmset sleepnow`. On systemd Linux that uses
+`systemd-inhibit` and `systemctl suspend`. It does not provide sandboxing,
+authentication, remote access, or isolation from other software running as
+the same user. It never uses sudo.
 
 Dashboard metadata is sanitized before terminal display, and supported SQLite
 sources are opened read-only. Session content remains sensitive even after

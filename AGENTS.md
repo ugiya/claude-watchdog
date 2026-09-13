@@ -1,8 +1,8 @@
 # Contributor guidance
 
-`claude-watchdog` is a Python 3.10+ macOS utility for observing persisted local
-agent activity and controlling an owned `caffeinate` process before an optional
-sleep request.
+`claude-watchdog` is a Python 3.10+ utility for observing persisted local
+agent activity and controlling an owned keep-awake hold before an optional
+sleep request. macOS and systemd Linux are supported.
 
 ## Working agreements
 
@@ -18,8 +18,8 @@ sleep request.
 - Filters, sorting, colors, details, and tree layout are display-only.
 - Dashboard `h` and `--hide PATH` dismiss a target from this run's watch set;
   they do not detect process liveness.
-- Never invoke real `pmset sleepnow` during automated tests, smoke checks, or
-  demos.
+- Never invoke real `pmset sleepnow` or `systemctl suspend` during automated
+  tests, smoke checks, or demos.
 - Do not use private transcripts, session IDs, usernames, project names, or
   absolute home-directory paths in fixtures, documentation, screenshots, or
   artifacts.

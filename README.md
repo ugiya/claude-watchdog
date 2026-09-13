@@ -4,8 +4,8 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Keep your Mac awake while local coding-agent sessions remain active, then let
-it sleep after the sessions and the user have both been quiet.
+Keep the machine awake while local coding-agent sessions remain active, then
+let it sleep after the sessions and the user have both been quiet.
 
 `claude-watchdog` is an experimental, standard-library-only Python utility for
 Claude Code, configured Claude profiles, Codex CLI/App sessions, OMX logs, and
@@ -28,7 +28,7 @@ can be played with an asciinema-compatible player.
 
 ## Requirements
 
-- macOS
+- macOS, or systemd Linux with `systemd-inhibit` and `systemctl`
 - Python 3.10 or later
 - Local agent session data from at least one [supported source](#supported-sources)
 

@@ -36,7 +36,7 @@ def _package_imports(path: Path) -> set[str]:
     imports: set[str] = set()
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.level == 1:
+        if isinstance(node, ast.ImportFrom) and node.level >= 1:
             if node.module:
                 imports.add(node.module.split(".", 1)[0])
             else:
@@ -71,7 +71,15 @@ class ModuleBoundaryTests(unittest.TestCase):
 
     def test_runtime_package_has_exact_approved_modules(self) -> None:
         self.assertTrue(PACKAGE.is_dir())
-        self.assertEqual({path.stem for path in PACKAGE.glob("*.py")}, MODULES)
+        top = set()
+        for path in PACKAGE.iterdir():
+            if path.name == "__pycache__" or path.name.startswith("."):
+                continue
+            if path.suffix == ".py":
+                top.add(path.stem)
+            elif path.is_dir() and (path / "__init__.py").is_file():
+                top.add(path.name)
+        self.assertEqual(top, MODULES)
 
     def test_entrypoints_are_thin_and_explicit(self) -> None:
         launcher = ROOT / "claude-watchdog"
@@ -91,8 +99,16 @@ class ModuleBoundaryTests(unittest.TestCase):
         self.assertIsInstance(assignment.value.value, str)
 
     def test_package_import_graph_is_acyclic_and_respects_boundaries(self) -> None:
+        def module_sources(module: str) -> list[Path]:
+            file = PACKAGE / f"{module}.py"
+            if file.is_file():
+                return [file]
+            return sorted((PACKAGE / module).rglob("*.py"))
+
         graph = {
-            module: _package_imports(PACKAGE / f"{module}.py") & MODULES
+            module: set().union(
+                *(_package_imports(path) & MODULES for path in module_sources(module))
+            )
             for module in MODULES
         }
         forbidden = {
